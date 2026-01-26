@@ -1,0 +1,955 @@
+//! Configuration file loading and management.
+//!
+//! This module handles loading the TOML configuration file from the `.velor` directory
+//! in the git repository root.
+
+use color_eyre::eyre::WrapErr;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// Global persistence configuration (shared by multiple commands).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ConversationDbConfig {
+	/// Path to the shared SQLite database (relative to git root).
+	pub path: String,
+
+	/// Enable encryption for stored message content.
+	pub encrypt_content: bool,
+
+	/// Environment variable containing a 32-byte key (base64) for encryption.
+	/// Only used when encrypt_content = true.
+	pub encryption_key_env: String,
+
+	/// Optional retention: delete sessions older than N days (0 = disabled).
+	pub retention_days: u32,
+}
+
+impl Default for ConversationDbConfig {
+	fn default() -> Self {
+		Self {
+			path: ".velor/conversations.db".to_string(),
+			encrypt_content: false,
+			encryption_key_env: "VELOR_CONVERSATIONS_KEY".to_string(),
+			retention_days: 0,
+		}
+	}
+}
+
+/// Configuration for the plan subcommand.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PlanConfig {
+	/// Directory for spec files (relative to git root).
+	pub specs_dir: String,
+
+	/// Maximum review iterations.
+	pub plan_max_iterations: u32,
+
+	/// Environment variable name for OpenAI API key.
+	pub openai_api_key_env: String,
+
+	/// OpenAI model to use for reviews.
+	pub openai_model: String,
+
+	/// OpenAI base URL (optional, for custom endpoints).
+	pub openai_base_url: Option<String>,
+}
+
+impl Default for PlanConfig {
+	fn default() -> Self {
+		Self {
+			specs_dir: "specs".to_string(),
+			plan_max_iterations: 10,
+			openai_api_key_env: "OPENAI_API_KEY".to_string(),
+			openai_model: "gpt-4o".to_string(),
+			openai_base_url: None,
+		}
+	}
+}
+
+/// Configuration loaded from the TOML file.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FileConfig {
+	/// Default values for CLI options.
+	#[serde(default)]
+	pub defaults: Defaults,
+
+	/// Global variables available to all prompt templates.
+	#[serde(default)]
+	pub vars: BTreeMap<String, String>,
+
+	/// Named prompt templates.
+	#[serde(default)]
+	pub prompts: BTreeMap<String, PromptDef>,
+
+	/// Shared conversation database configuration.
+	#[serde(default)]
+	pub conversation_db: ConversationDbConfig,
+
+	/// Plan subcommand configuration.
+	#[serde(default)]
+	pub plan: PlanConfig,
+}
+
+/// Default values that can be overridden by CLI arguments.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Defaults {
+	/// Default permission mode for Claude (e.g. "acceptEdits").
+	pub permission_mode: Option<String>,
+
+	/// Default path to the PRD file.
+	pub prd_path: Option<String>,
+
+	/// Default path to the progress file.
+	pub progress_path: Option<String>,
+
+	/// Default number of iterations for auto-mode.
+	pub iterations: Option<u32>,
+
+	/// Default prompt name to use.
+	pub prompt: Option<String>,
+
+	/// Default completion token that signals PRD completion.
+	pub complete_token: Option<String>,
+
+	/// Default Claude binary to use (e.g. "claude" or "claude-glm").
+	#[serde(default = "default_binary")]
+	pub binary: String,
+
+	/// Maximum retry attempts per auto-loop iteration.
+	#[serde(default = "default_max_retries")]
+	pub max_retries: u32,
+
+	/// Base backoff duration in milliseconds for exponential backoff.
+	#[serde(default = "default_base_backoff_ms")]
+	pub base_backoff_ms: u32,
+
+	/// Absolute timeout for all retries combined in milliseconds.
+	#[serde(default = "default_absolute_timeout_ms")]
+	pub absolute_timeout_ms: u32,
+}
+
+/// Default value for the binary field.
+fn default_binary() -> String {
+	"claude-glm".to_string()
+}
+
+/// Default value for max_retries field.
+fn default_max_retries() -> u32 {
+	5
+}
+
+/// Default value for base_backoff_ms field.
+fn default_base_backoff_ms() -> u32 {
+	100
+}
+
+/// Default value for absolute_timeout_ms field (5 hours in milliseconds).
+fn default_absolute_timeout_ms() -> u32 {
+	5 * 60 * 60 * 1000 // 5 hours
+}
+
+/// A named prompt template definition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PromptDef {
+	/// Inline string format: `prompt = "template string"`
+	Inline(String),
+	/// Table format with optional complete_token override.
+	#[allow(dead_code)]
+	Table {
+		/// The MiniJinja template string.
+		template: String,
+		/// Optional override of the completion token for this prompt.
+		#[serde(default)]
+		complete_token: Option<String>,
+	},
+}
+
+impl PromptDef {
+	/// Returns the template string.
+	#[must_use]
+	pub fn template(&self) -> &str {
+		match self {
+			Self::Inline(s) => s,
+			Self::Table { template, .. } => template,
+		}
+	}
+
+	/// Returns the optional completion token override.
+	#[must_use]
+	#[allow(dead_code)]
+	pub fn complete_token(&self) -> Option<&String> {
+		match self {
+			Self::Inline(_) => None,
+			Self::Table { complete_token, .. } => complete_token.as_ref(),
+		}
+	}
+}
+
+impl Defaults {
+	/// Merges two Defaults, with `overlay` taking precedence.
+	///
+	/// For each field, if `overlay` has a `Some` value, it is used;
+	/// otherwise, the value from `self` (base) is used.
+	#[must_use]
+	pub fn merge(self, overlay: Self) -> Self {
+		Self {
+			permission_mode: overlay.permission_mode.or(self.permission_mode),
+			prd_path: overlay.prd_path.or(self.prd_path),
+			progress_path: overlay.progress_path.or(self.progress_path),
+			iterations: overlay.iterations.or(self.iterations),
+			prompt: overlay.prompt.or(self.prompt),
+			complete_token: overlay.complete_token.or(self.complete_token),
+			binary: overlay.binary,
+			max_retries: overlay.max_retries,
+			base_backoff_ms: overlay.base_backoff_ms,
+			absolute_timeout_ms: overlay.absolute_timeout_ms,
+		}
+	}
+}
+
+/// Merges two BTreeMaps of vars, with `overlay` taking precedence.
+///
+/// Keys present in `overlay` replace those in `base`; keys only in `base`
+/// are preserved.
+#[must_use]
+fn merge_vars(
+	base: &BTreeMap<String, String>,
+	overlay: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+	let mut result = base.clone();
+	for (k, v) in overlay {
+		result.insert(k.clone(), v.clone());
+	}
+	result
+}
+
+/// Merges two BTreeMaps of prompts, with `overlay` taking precedence.
+///
+/// Keys present in `overlay` replace those in `base`; keys only in `base`
+/// are preserved.
+#[must_use]
+fn merge_prompts(
+	base: &BTreeMap<String, PromptDef>,
+	overlay: &BTreeMap<String, PromptDef>,
+) -> BTreeMap<String, PromptDef> {
+	let mut result = base.clone();
+	for (k, v) in overlay {
+		result.insert(k.clone(), v.clone());
+	}
+	result
+}
+
+impl FileConfig {
+	/// Merges two configs, with `overlay` taking precedence over `base`.
+	///
+	/// For each field:
+	/// - `defaults`: overlay values replace base values via `Defaults::merge`
+	/// - `vars`: overlay vars extend and replace base vars
+	/// - `prompts`: overlay prompts extend and replace base prompts
+	/// - `conversation_db`: overlay config takes precedence
+	/// - `plan`: overlay config takes precedence
+	#[must_use]
+	pub fn merge(base: Self, overlay: Self) -> Self {
+		Self {
+			defaults: base.defaults.merge(overlay.defaults),
+			vars: merge_vars(&base.vars, &overlay.vars),
+			prompts: merge_prompts(&base.prompts, &overlay.prompts),
+			conversation_db: overlay.conversation_db,
+			plan: overlay.plan,
+		}
+	}
+
+	/// Returns the global config path in the user's home directory.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the home directory cannot be determined.
+	pub fn home_config_path() -> color_eyre::eyre::Result<std::path::PathBuf> {
+		let home = std::env::var("HOME")
+			.or_else(|_| std::env::var("USERPROFILE"))
+			.wrap_err("failed to determine home directory")?;
+		Ok(
+			std::path::PathBuf::from(home)
+				.join(".velor")
+				.join("agent-cli.toml"),
+		)
+	}
+
+	/// Loads configuration from the given path if it exists.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the file exists but cannot be read or parsed.
+	#[tracing::instrument(level = "debug", ret)]
+	pub fn load_if_exists(path: &Path) -> color_eyre::eyre::Result<Option<Self>> {
+		if !path.exists() {
+			return Ok(None);
+		}
+		let raw = std::fs::read_to_string(path)?;
+		let parsed: Self = toml::from_str(&raw)?;
+		Ok(Some(parsed))
+	}
+
+	/// Returns the default configuration path for a given git root.
+	#[must_use]
+	pub fn default_config_path(git_root: &Path) -> std::path::PathBuf {
+		git_root.join(".velor").join("agent-cli.toml")
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Defaults::merge tests
+	#[test]
+	fn test_defaults_merge_overlay_takes_precedence() {
+		let base = Defaults {
+			permission_mode: Some("base_mode".to_string()),
+			prd_path: Some("base_prd".to_string()),
+			progress_path: Some("base_progress".to_string()),
+			iterations: Some(10),
+			prompt: Some("base_prompt".to_string()),
+			complete_token: Some("base_token".to_string()),
+			binary: "base_binary".to_string(),
+			max_retries: 3,
+			base_backoff_ms: 50,
+			absolute_timeout_ms: 3600000, // 1 hour
+		};
+
+		let overlay = Defaults {
+			permission_mode: Some("overlay_mode".to_string()),
+			prd_path: None, // Keep base value
+			progress_path: Some("overlay_progress".to_string()),
+			iterations: Some(5),
+			prompt: None,
+			complete_token: None,
+			binary: "overlay_binary".to_string(),
+			max_retries: 7,
+			base_backoff_ms: 200,
+			absolute_timeout_ms: 7200000, // 2 hours
+		};
+
+		let result = base.clone().merge(overlay);
+
+		assert_eq!(result.permission_mode, Some("overlay_mode".to_string()));
+		assert_eq!(result.prd_path, Some("base_prd".to_string())); // base preserved
+		assert_eq!(result.progress_path, Some("overlay_progress".to_string()));
+		assert_eq!(result.iterations, Some(5));
+		assert_eq!(result.prompt, Some("base_prompt".to_string()));
+		assert_eq!(result.complete_token, Some("base_token".to_string()));
+		assert_eq!(result.binary, "overlay_binary".to_string()); // overlay wins
+		assert_eq!(result.max_retries, 7); // overlay wins
+		assert_eq!(result.base_backoff_ms, 200); // overlay wins
+		assert_eq!(result.absolute_timeout_ms, 7200000); // overlay wins
+	}
+
+	#[test]
+	fn test_defaults_merge_base_only() {
+		let base = Defaults {
+			permission_mode: Some("mode".to_string()),
+			..Default::default()
+		};
+
+		let result = base.clone().merge(Defaults::default());
+
+		assert_eq!(result.permission_mode, Some("mode".to_string()));
+	}
+
+	#[test]
+	fn test_defaults_merge_overlay_only() {
+		let overlay = Defaults {
+			permission_mode: Some("mode".to_string()),
+			..Default::default()
+		};
+
+		let result = Defaults::default().merge(overlay);
+
+		assert_eq!(result.permission_mode, Some("mode".to_string()));
+	}
+
+	// merge_vars tests
+	#[test]
+	fn test_merge_vars_overlay_overwrites_base() {
+		let mut base = BTreeMap::new();
+		base.insert("a".to_string(), "base_a".to_string());
+		base.insert("b".to_string(), "base_b".to_string());
+
+		let mut overlay = BTreeMap::new();
+		overlay.insert("a".to_string(), "overlay_a".to_string());
+		overlay.insert("c".to_string(), "overlay_c".to_string());
+
+		let result = merge_vars(&base, &overlay);
+
+		assert_eq!(result.get("a"), Some(&"overlay_a".to_string()));
+		assert_eq!(result.get("b"), Some(&"base_b".to_string()));
+		assert_eq!(result.get("c"), Some(&"overlay_c".to_string()));
+		assert_eq!(result.len(), 3);
+	}
+
+	#[test]
+	fn test_merge_vars_empty_base() {
+		let base = BTreeMap::new();
+		let mut overlay = BTreeMap::new();
+		overlay.insert("key".to_string(), "value".to_string());
+
+		let result = merge_vars(&base, &overlay);
+
+		assert_eq!(result.get("key"), Some(&"value".to_string()));
+		assert_eq!(result.len(), 1);
+	}
+
+	#[test]
+	fn test_merge_vars_empty_overlay() {
+		let mut base = BTreeMap::new();
+		base.insert("key".to_string(), "value".to_string());
+		let overlay = BTreeMap::new();
+
+		let result = merge_vars(&base, &overlay);
+
+		assert_eq!(result.get("key"), Some(&"value".to_string()));
+		assert_eq!(result.len(), 1);
+	}
+
+	// merge_prompts tests
+	#[test]
+	fn test_merge_prompts_overlay_overwrites_base() {
+		let mut base = BTreeMap::new();
+		base.insert(
+			"prompt1".to_string(),
+			PromptDef::Inline("base_template".to_string()),
+		);
+
+		let mut overlay = BTreeMap::new();
+		overlay.insert(
+			"prompt1".to_string(),
+			PromptDef::Table {
+				template: "overlay_template".to_string(),
+				complete_token: Some("token".to_string()),
+			},
+		);
+		overlay.insert(
+			"prompt2".to_string(),
+			PromptDef::Inline("new_template".to_string()),
+		);
+
+		let result = merge_prompts(&base, &overlay);
+
+		assert_eq!(
+			result
+				.get("prompt1")
+				.expect("prompt1 should exist")
+				.template(),
+			"overlay_template"
+		);
+		assert_eq!(
+			result
+				.get("prompt2")
+				.expect("prompt2 should exist")
+				.template(),
+			"new_template"
+		);
+		assert_eq!(result.len(), 2);
+	}
+
+	// FileConfig::merge tests
+	#[test]
+	fn test_file_config_merge_full() {
+		let base = FileConfig {
+			defaults: Defaults {
+				permission_mode: Some("acceptEdits".to_string()),
+				iterations: Some(10),
+				..Default::default()
+			},
+			vars: {
+				let mut vars = BTreeMap::new();
+				vars.insert("base_var".to_string(), "base_value".to_string());
+				vars.insert("shared_var".to_string(), "base_shared".to_string());
+				vars
+			},
+			prompts: {
+				let mut prompts = BTreeMap::new();
+				prompts.insert(
+					"base_prompt".to_string(),
+					PromptDef::Inline("base template".to_string()),
+				);
+				prompts
+			},
+			conversation_db: ConversationDbConfig {
+				path: ".velor/base.db".to_string(),
+				encrypt_content: false,
+				encryption_key_env: "BASE_KEY".to_string(),
+				retention_days: 30,
+			},
+			plan: PlanConfig {
+				specs_dir: "base-specs".to_string(),
+				plan_max_iterations: 5,
+				..Default::default()
+			},
+		};
+
+		let overlay = FileConfig {
+			defaults: Defaults {
+				iterations: Some(5),
+				..Default::default()
+			},
+			vars: {
+				let mut vars = BTreeMap::new();
+				vars.insert("shared_var".to_string(), "overlay_shared".to_string());
+				vars.insert("overlay_var".to_string(), "overlay_value".to_string());
+				vars
+			},
+			prompts: {
+				let mut prompts = BTreeMap::new();
+				prompts.insert(
+					"overlay_prompt".to_string(),
+					PromptDef::Inline("overlay template".to_string()),
+				);
+				prompts
+			},
+			conversation_db: ConversationDbConfig {
+				path: ".velor/overlay.db".to_string(),
+				..Default::default()
+			},
+			plan: PlanConfig {
+				openai_model: "gpt-4o-mini".to_string(),
+				..Default::default()
+			},
+		};
+
+		let result = FileConfig::merge(base, overlay);
+
+		// Check defaults merge
+		assert_eq!(
+			result.defaults.permission_mode,
+			Some("acceptEdits".to_string())
+		);
+		assert_eq!(result.defaults.iterations, Some(5));
+
+		// Check vars merge
+		assert_eq!(result.vars.get("base_var"), Some(&"base_value".to_string()));
+		assert_eq!(
+			result.vars.get("shared_var"),
+			Some(&"overlay_shared".to_string())
+		);
+		assert_eq!(
+			result.vars.get("overlay_var"),
+			Some(&"overlay_value".to_string())
+		);
+
+		// Check prompts merge
+		assert_eq!(
+			result
+				.prompts
+				.get("base_prompt")
+				.expect("base_prompt should exist")
+				.template(),
+			"base template"
+		);
+		assert_eq!(
+			result
+				.prompts
+				.get("overlay_prompt")
+				.expect("overlay_prompt should exist")
+				.template(),
+			"overlay template"
+		);
+
+		// Check conversation_db overlay wins
+		assert_eq!(result.conversation_db.path, ".velor/overlay.db".to_string());
+
+		// Check plan overlay wins
+		assert_eq!(result.plan.openai_model, "gpt-4o-mini".to_string());
+	}
+
+	// home_config_path test
+	#[test]
+	fn test_home_config_path() {
+		let path = FileConfig::home_config_path();
+		assert!(path.is_ok());
+		let path = path.expect("home_config_path should return Ok");
+		assert!(path.ends_with(".velor/agent-cli.toml") || path.ends_with(".velor\\agent-cli.toml"));
+	}
+
+	// Integration test with tempfile
+	#[test]
+	fn test_load_and_merge_configs() {
+		let temp_dir = tempfile::TempDir::new().expect("tempdir should be created");
+		let home_dir = temp_dir.path().join("home");
+		let repo_dir = temp_dir.path().join("repo");
+		std::fs::create_dir_all(&home_dir).expect("home_dir should be created");
+		std::fs::create_dir_all(&repo_dir).expect("repo_dir should be created");
+
+		let home_config = home_dir.join(".velor").join("agent-cli.toml");
+		let repo_config = repo_dir.join(".velor").join("agent-cli.toml");
+		std::fs::create_dir_all(
+			home_config
+				.parent()
+				.expect("home_config should have parent"),
+		)
+		.expect("home_config parent dir should be created");
+		std::fs::create_dir_all(
+			repo_config
+				.parent()
+				.expect("repo_config should have parent"),
+		)
+		.expect("repo_config parent dir should be created");
+
+		// Write home config
+		std::fs::write(
+			&home_config,
+			r#"
+        [vars]
+        home_var = "from_home"
+        shared = "home_shared"
+
+        [defaults]
+        permission_mode = "acceptEdits"
+        iterations = 10
+    "#,
+		)
+		.expect("home config should be written");
+
+		// Write repo config
+		std::fs::write(
+			&repo_config,
+			r#"
+        [vars]
+        repo_var = "from_repo"
+        shared = "repo_shared"
+
+        [defaults]
+        iterations = 5
+    "#,
+		)
+		.expect("repo config should be written");
+
+		// Load and merge
+		let home_cfg = FileConfig::load_if_exists(&home_config)
+			.expect("home config should load")
+			.expect("home config should exist");
+		let repo_cfg = FileConfig::load_if_exists(&repo_config)
+			.expect("repo config should load")
+			.expect("repo config should exist");
+		let merged = FileConfig::merge(home_cfg, repo_cfg);
+
+		// Verify merge results
+		assert_eq!(merged.vars.get("home_var"), Some(&"from_home".to_string()));
+		assert_eq!(merged.vars.get("repo_var"), Some(&"from_repo".to_string()));
+		assert_eq!(merged.vars.get("shared"), Some(&"repo_shared".to_string()));
+		assert_eq!(
+			merged.defaults.permission_mode,
+			Some("acceptEdits".to_string())
+		);
+		assert_eq!(merged.defaults.iterations, Some(5));
+	}
+
+	// ConversationDbConfig tests
+	#[test]
+	fn test_conversation_db_config_default() {
+		let config = ConversationDbConfig::default();
+		assert_eq!(config.path, ".velor/conversations.db");
+		assert!(!config.encrypt_content);
+		assert_eq!(config.encryption_key_env, "VELOR_CONVERSATIONS_KEY");
+		assert_eq!(config.retention_days, 0);
+	}
+
+	#[test]
+	fn test_conversation_db_config_full() {
+		let config = ConversationDbConfig {
+			path: ".velor/custom.db".to_string(),
+			encrypt_content: true,
+			encryption_key_env: "CUSTOM_KEY".to_string(),
+			retention_days: 90,
+		};
+		assert_eq!(config.path, ".velor/custom.db");
+		assert!(config.encrypt_content);
+		assert_eq!(config.encryption_key_env, "CUSTOM_KEY");
+		assert_eq!(config.retention_days, 90);
+	}
+
+	// PlanConfig tests
+	#[test]
+	fn test_plan_config_default() {
+		let config = PlanConfig::default();
+		assert_eq!(config.specs_dir, "specs");
+		assert_eq!(config.plan_max_iterations, 10);
+		assert_eq!(config.openai_api_key_env, "OPENAI_API_KEY");
+		assert_eq!(config.openai_model, "gpt-4o");
+		assert!(config.openai_base_url.is_none());
+	}
+
+	#[test]
+	fn test_plan_config_custom() {
+		let config = PlanConfig {
+			specs_dir: "custom-specs".to_string(),
+			plan_max_iterations: 20,
+			openai_api_key_env: "CUSTOM_API_KEY".to_string(),
+			openai_model: "gpt-4o-mini".to_string(),
+			openai_base_url: Some("https://api.example.com".to_string()),
+		};
+		assert_eq!(config.specs_dir, "custom-specs");
+		assert_eq!(config.plan_max_iterations, 20);
+		assert_eq!(config.openai_api_key_env, "CUSTOM_API_KEY");
+		assert_eq!(config.openai_model, "gpt-4o-mini");
+		assert_eq!(
+			config.openai_base_url,
+			Some("https://api.example.com".to_string())
+		);
+	}
+
+	// Test loading TOML with new sections
+	#[test]
+	fn test_load_full_config_with_new_sections() {
+		let temp_dir = tempfile::TempDir::new().expect("tempdir should be created");
+		let config_path = temp_dir.path().join("test.toml");
+
+		std::fs::write(
+			&config_path,
+			r#"
+[conversation_db]
+path = ".velor/test.db"
+encrypt_content = true
+encryption_key_env = "TEST_KEY"
+retention_days = 60
+
+[plan]
+specs_dir = "test-specs"
+plan_max_iterations = 15
+openai_api_key_env = "TEST_OPENAI_KEY"
+openai_model = "gpt-4o-mini"
+openai_base_url = "https://test.example.com"
+
+[defaults]
+iterations = 5
+
+[vars]
+test_var = "test_value"
+"#,
+		)
+		.expect("config should be written");
+
+		let config = FileConfig::load_if_exists(&config_path)
+			.expect("config should load")
+			.expect("config should exist");
+
+		// Verify conversation_db section
+		assert_eq!(config.conversation_db.path, ".velor/test.db");
+		assert!(config.conversation_db.encrypt_content);
+		assert_eq!(config.conversation_db.encryption_key_env, "TEST_KEY");
+		assert_eq!(config.conversation_db.retention_days, 60);
+
+		// Verify plan section
+		assert_eq!(config.plan.specs_dir, "test-specs");
+		assert_eq!(config.plan.plan_max_iterations, 15);
+		assert_eq!(config.plan.openai_api_key_env, "TEST_OPENAI_KEY");
+		assert_eq!(config.plan.openai_model, "gpt-4o-mini");
+		assert_eq!(
+			config.plan.openai_base_url,
+			Some("https://test.example.com".to_string())
+		);
+
+		// Verify other sections still work
+		assert_eq!(config.defaults.iterations, Some(5));
+		assert_eq!(config.vars.get("test_var"), Some(&"test_value".to_string()));
+	}
+
+	// Test merging configs with new sections
+	#[test]
+	fn test_merge_new_config_sections() {
+		let base = FileConfig {
+			conversation_db: ConversationDbConfig {
+				path: ".velor/base.db".to_string(),
+				..Default::default()
+			},
+			plan: PlanConfig {
+				specs_dir: "base-specs".to_string(),
+				..Default::default()
+			},
+			..Default::default()
+		};
+
+		let overlay = FileConfig {
+			conversation_db: ConversationDbConfig {
+				path: ".velor/overlay.db".to_string(),
+				encrypt_content: true,
+				..Default::default()
+			},
+			plan: PlanConfig {
+				plan_max_iterations: 20,
+				..Default::default()
+			},
+			..Default::default()
+		};
+
+		let result = FileConfig::merge(base, overlay);
+
+		// Overlay should win for conversation_db
+		assert_eq!(result.conversation_db.path, ".velor/overlay.db");
+		assert!(result.conversation_db.encrypt_content);
+
+		// Overlay should win for plan
+		assert_eq!(result.plan.plan_max_iterations, 20);
+		// Base values should be lost (overlay wins completely)
+		assert_eq!(result.plan.specs_dir, "specs"); // default
+	}
+}
+
+#[cfg(test)]
+mod proptest_tests {
+	use super::*;
+	use proptest::prelude::*;
+
+	proptest! {
+			fn test_merge_vars_idempotent(
+					base_vars in prop::collection::btree_map(".*", ".*", 0..10),
+					overlay_vars in prop::collection::btree_map(".*", ".*", 0..10)
+			) {
+					let merged1 = merge_vars(&base_vars, &overlay_vars);
+					let merged2 = merge_vars(&merged1, &BTreeMap::new());
+
+					prop_assert_eq!(merged1, merged2);
+			}
+
+			fn test_merge_vars_overlay_wins(
+					base_vars in prop::collection::btree_map(".*", ".*", 0..10),
+					mut overlay_vars in prop::collection::btree_map(".*", ".*", 0..10)
+			) {
+					// Ensure at least one common key
+					if !base_vars.is_empty() && !overlay_vars.is_empty() {
+							let common_key = base_vars
+									.keys()
+									.next()
+									.expect("base_vars should have at least one key")
+									.clone();
+							overlay_vars.insert(common_key, "overlay_value".to_string());
+					}
+
+					let merged = merge_vars(&base_vars, &overlay_vars);
+
+					// All overlay keys should be in result
+					for (k, v) in &overlay_vars {
+							prop_assert_eq!(merged.get(k), Some(v));
+					}
+					// Base-only keys should be preserved
+					for (k, v) in &base_vars {
+							if !overlay_vars.contains_key(k) {
+									prop_assert_eq!(merged.get(k), Some(v));
+							}
+					}
+			}
+
+			fn test_defaults_merge_preserves_somes(
+					base_mode in prop::option::of(".*"),
+					overlay_mode in prop::option::of(".*")
+			) {
+					let base = Defaults {
+							permission_mode: base_mode.clone(),
+							..Default::default()
+					};
+					let overlay = Defaults {
+							permission_mode: overlay_mode.clone(),
+							..Default::default()
+					};
+
+					let result = base.merge(overlay);
+
+					// Overlay Some should win, base Some should be used if overlay is None
+					prop_assert_eq!(result.permission_mode, overlay_mode.or(base_mode));
+			}
+
+			fn test_conversation_db_config_roundtrip(
+					path in "[a-zA-Z0-9_/\\.-]+",
+					encrypt_content in prop::bool::ANY,
+					encryption_key_env in "[A-Z_]+",
+					retention_days in 0u32..3650,
+			) {
+					let config = ConversationDbConfig {
+							path: path.clone(),
+							encrypt_content,
+							encryption_key_env: encryption_key_env.clone(),
+							retention_days,
+					};
+
+					// Verify fields match
+					prop_assert_eq!(config.path, path);
+					prop_assert_eq!(config.encrypt_content, encrypt_content);
+					prop_assert_eq!(config.encryption_key_env, encryption_key_env);
+					prop_assert_eq!(config.retention_days, retention_days);
+			}
+
+			fn test_plan_config_roundtrip(
+					specs_dir in "[a-zA-Z0-9_/\\-]+",
+					plan_max_iterations in 1u32..100,
+					openai_api_key_env in "[A-Z_]+",
+					openai_model in "[a-z0-9-\\.]+",
+			) {
+					let config = PlanConfig {
+							specs_dir: specs_dir.clone(),
+							plan_max_iterations,
+							openai_api_key_env: openai_api_key_env.clone(),
+							openai_model: openai_model.clone(),
+							openai_base_url: None, // Keep it simple for prop test
+					};
+
+					// Verify fields match
+					prop_assert_eq!(config.specs_dir, specs_dir);
+					prop_assert_eq!(config.plan_max_iterations, plan_max_iterations);
+					prop_assert_eq!(config.openai_api_key_env, openai_api_key_env);
+					prop_assert_eq!(config.openai_model, openai_model);
+					prop_assert!(config.openai_base_url.is_none());
+			}
+
+			fn test_file_config_merge_preserves_defaults_merge_semantics(
+					base_iterations in prop::option::of(1u32..100),
+					overlay_iterations in prop::option::of(1u32..100),
+			) {
+					let base = FileConfig {
+							defaults: Defaults {
+									iterations: base_iterations,
+									..Default::default()
+							},
+							..Default::default()
+					};
+
+					let overlay = FileConfig {
+							defaults: Defaults {
+									iterations: overlay_iterations,
+									..Default::default()
+							},
+							..Default::default()
+					};
+
+					let result = FileConfig::merge(base, overlay);
+
+					// Should follow Defaults::merge semantics
+					prop_assert_eq!(
+							result.defaults.iterations,
+							overlay_iterations.or(base_iterations)
+					);
+			}
+	}
+
+	// Unit tests that don't require property testing
+	#[test]
+	fn test_conversation_db_config_default_is_valid() {
+		let config = ConversationDbConfig::default();
+		// Verify all defaults are sensible
+		assert!(!config.path.is_empty());
+		// retention_days is u64, so always >= 0
+	}
+
+	#[test]
+	fn test_plan_config_default_is_valid() {
+		let config = PlanConfig::default();
+		// Verify all defaults are sensible
+		assert!(!config.specs_dir.is_empty());
+		assert!(config.plan_max_iterations > 0);
+		assert!(!config.openai_api_key_env.is_empty());
+		assert!(!config.openai_model.is_empty());
+	}
+}
