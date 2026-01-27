@@ -198,7 +198,7 @@ IMPORTANT:
 [conversation_db]
 path = ".velor/conversations.db"
 encrypt_content = false
-encryption_key_env = "VELO R_CONVERSATIONS_KEY"
+encryption_key_env = "VELOR_CONVERSATIONS_KEY"
 retention_days = 0
 
 [plan]
@@ -212,6 +212,7 @@ openai_model = "gpt-4o"
 ///
 /// Creates the `.velor` directory and a default `velor.toml` configuration file.
 /// Automatically migrates existing `agent-cli.toml` to `velor.toml` if found.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
 fn run_init(git_root: std::path::PathBuf) -> color_eyre::eyre::Result<()> {
     let velor_dir = git_root.join(".velor");
     let config_path = velor_dir.join("velor.toml");
@@ -295,6 +296,7 @@ enum RunMode {
 }
 
 /// Runs the `once` subcommand.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display(), cwd = %cwd.display()))]
 fn run_once(
     args: OnceArgs,
     home_cfg: FileConfig,
@@ -378,6 +380,7 @@ fn run_once(
 }
 
 /// Runs the `auto` subcommand.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display(), cwd = %cwd.display()))]
 fn run_auto(
     args: AutoArgs,
     home_cfg: FileConfig,
@@ -502,6 +505,7 @@ fn run_auto(
 /// # Errors
 ///
 /// Returns an error if the named prompt is not found in the config.
+#[tracing::instrument(level = "debug", ret, err, fields(prompt_name))]
 fn resolve_prompt_template(
     args: &CommonArgs,
     cfg: &FileConfig,
@@ -523,6 +527,7 @@ fn resolve_prompt_template(
 
 /// Builds runtime variables available to templates.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "trace", ret, fields(git_root = %git_root.display(), cwd = %cwd.display(), prompt_name, mode = ?mode))]
 fn build_runtime_vars(
     git_root: &Path,
     cwd: &Path,
