@@ -151,6 +151,7 @@ impl std::error::Error for RetryError {}
 /// // attempt 5: 1600ms
 /// // attempt 6+: 1600ms (capped at max)
 /// ```
+#[tracing::instrument(level = "trace", ret)]
 pub fn calculate_backoff(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
     let delay_ms = (base_ms * 2_u64.pow(attempt.saturating_sub(1))).min(max_ms);
     Duration::from_millis(delay_ms)
@@ -163,6 +164,7 @@ pub fn calculate_backoff(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
 /// - Permission denied
 /// - Invalid configuration
 /// - Template parsing errors
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_permanent_error(error: &Error) -> bool {
     let error_msg = error.to_string().to_lowercase();
 
@@ -171,7 +173,7 @@ pub fn is_permanent_error(error: &Error) -> bool {
         || error_msg.contains("permission denied")
         || error_msg.contains("invalid config")
         || error_msg.contains("failed to parse template")
-        || error_msg.contains("prompt.*not found")
+        || (error_msg.contains("prompt") && error_msg.contains("not found"))
 }
 
 #[cfg(test)]
@@ -271,11 +273,104 @@ mod tests {
     #[test]
     fn test_retry_error_display() {
         let err = RetryError::Retryable("temporary failure".to_string());
-        assert!(err.to_string().contains("retryable"));
-        assert!(err.to_string().contains("temporary failure"));
+        assert!(
+            err.to_string().contains("retryable"),
+            "error should contain 'retryable'"
+        );
+        assert!(
+            err.to_string().contains("temporary failure"),
+            "error should contain message"
+        );
 
         let err = RetryError::Permanent("config error".to_string());
-        assert!(err.to_string().contains("permanent"));
-        assert!(err.to_string().contains("config error"));
+        assert!(
+            err.to_string().contains("permanent"),
+            "error should contain 'permanent'"
+        );
+        assert!(
+            err.to_string().contains("config error"),
+            "error should contain message"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_binary_not_found() {
+        let err = color_eyre::eyre::eyre!("claude-glm not found on PATH");
+        assert!(
+            is_permanent_error(&err),
+            "binary not found should be permanent"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_no_such_file() {
+        let err = color_eyre::eyre::eyre!("No such file or directory");
+        assert!(is_permanent_error(&err), "no such file should be permanent");
+    }
+
+    #[test]
+    fn test_is_permanent_error_permission_denied() {
+        let err = color_eyre::eyre::eyre!("Permission denied");
+        assert!(
+            is_permanent_error(&err),
+            "permission denied should be permanent"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_invalid_config() {
+        let err = color_eyre::eyre::eyre!("invalid config at line 42");
+        assert!(
+            is_permanent_error(&err),
+            "invalid config should be permanent"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_failed_to_parse_template() {
+        let err = color_eyre::eyre::eyre!("failed to parse template: unexpected end of input");
+        assert!(
+            is_permanent_error(&err),
+            "template parse error should be permanent"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_prompt_not_found() {
+        let err = color_eyre::eyre::eyre!("prompt 'my-prompt' not found in config");
+        assert!(
+            is_permanent_error(&err),
+            "prompt 'name' not found should be permanent"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_case_insensitive() {
+        let err = color_eyre::eyre::eyre!("Binary NOT FOUND on path");
+        assert!(
+            is_permanent_error(&err),
+            "matching should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_retryable_error() {
+        let err = color_eyre::eyre::eyre!("connection timeout");
+        assert!(!is_permanent_error(&err), "timeout should be retryable");
+    }
+
+    #[test]
+    fn test_is_permanent_error_temporary_failure() {
+        let err = color_eyre::eyre::eyre!("temporary network error");
+        assert!(
+            !is_permanent_error(&err),
+            "temporary network error should be retryable"
+        );
+    }
+
+    #[test]
+    fn test_is_permanent_error_api_rate_limit() {
+        let err = color_eyre::eyre::eyre!("API rate limit exceeded");
+        assert!(!is_permanent_error(&err), "rate limit should be retryable");
     }
 }

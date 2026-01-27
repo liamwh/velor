@@ -37,6 +37,7 @@ pub fn render_template(
 /// 2. Runtime variables
 /// 3. File config variables
 #[must_use]
+#[tracing::instrument(level = "trace", ret)]
 pub fn merge_vars(
     base: &BTreeMap<String, String>,
     overrides: &[(String, String)],
