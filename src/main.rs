@@ -12,11 +12,13 @@ use std::path::Path;
 mod claude;
 mod config;
 mod git;
+mod plan;
 mod retry;
 mod template;
 
 use claude::{require_claude_on_path, run_claude};
 use config::FileConfig;
+use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
 
 /// Velor Agent CLI - Run autonomous agents with Claude AI.
@@ -37,6 +39,9 @@ enum Commands {
 
     /// Initialise a new repository with a .velor directory and velor.toml config
     Init,
+
+    /// Generate an implementation plan from spec files using OpenAI
+    Plan(PlanArgs),
 }
 
 /// Arguments common to both subcommands
@@ -103,6 +108,38 @@ struct AutoArgs {
     /// Base backoff in milliseconds for exponential backoff (default: 100).
     #[arg(long)]
     base_backoff_ms: Option<u64>,
+}
+
+/// Arguments for the `plan` subcommand
+#[derive(Debug, Args)]
+struct PlanArgs {
+    /// Override config path (defaults to {git_root}/.velor/velor.toml).
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+
+    /// Specs directory path (relative to git root).
+    #[arg(long)]
+    specs_dir: Option<String>,
+
+    /// Maximum refinement iterations.
+    #[arg(long)]
+    max_iterations: Option<u32>,
+
+    /// OpenAI API key (overrides environment variable).
+    #[arg(long)]
+    openai_api_key: Option<String>,
+
+    /// OpenAI model to use.
+    #[arg(long)]
+    openai_model: Option<String>,
+
+    /// OpenAI base URL (for custom endpoints).
+    #[arg(long)]
+    openai_base_url: Option<String>,
+
+    /// Print the plan prompt without calling the API.
+    #[arg(long, action = ArgAction::SetTrue)]
+    dry_run: bool,
 }
 
 /// Parses a key=value pair for the `--set` argument.
@@ -266,6 +303,86 @@ fn run_init(git_root: std::path::PathBuf) -> color_eyre::eyre::Result<()> {
     Ok(())
 }
 
+/// Runs the `plan` subcommand to generate an implementation plan from spec files.
+///
+/// # Errors
+///
+/// Returns an error if spec files are not found, API key is missing, or the API call fails.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
+fn run_plan(
+    args: PlanArgs,
+    home_cfg: FileConfig,
+    git_root: std::path::PathBuf,
+) -> color_eyre::eyre::Result<()> {
+    // Load git repo config (optional, may not exist)
+    let config_path = args
+        .config
+        .unwrap_or_else(|| FileConfig::default_config_path(&git_root));
+    let repo_cfg = FileConfig::load_if_exists(&config_path)
+        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
+        .unwrap_or_default();
+
+    // Merge: home config as base, repo config as overlay
+    let file_cfg = FileConfig::merge(home_cfg, repo_cfg);
+
+    let plan_cfg = file_cfg.plan;
+
+    // Resolve specs directory
+    let specs_dir = args.specs_dir.unwrap_or_else(|| plan_cfg.specs_dir.clone());
+
+    let specs_dir = git_root.join(&specs_dir);
+
+    // Resolve max iterations
+    let max_iterations = args.max_iterations.unwrap_or(plan_cfg.plan_max_iterations);
+
+    // Resolve OpenAI API key
+    let api_key_env = plan_cfg.openai_api_key_env.clone();
+    let api_key = if let Some(key) = args.openai_api_key {
+        key
+    } else {
+        std::env::var(&api_key_env).wrap_err_with(|| {
+            format!(
+                "OpenAI API key not found. Set the {} environment variable or use --openai-api-key.",
+                api_key_env
+            )
+        })?
+    };
+
+    // Resolve OpenAI model
+    let openai_model = args
+        .openai_model
+        .unwrap_or_else(|| plan_cfg.openai_model.clone());
+
+    // Resolve OpenAI base URL
+    let openai_base_url = args.openai_base_url.or(plan_cfg.openai_base_url);
+
+    let config = PlanRunConfig {
+        specs_dir,
+        max_iterations,
+        api_key,
+        model: openai_model,
+        base_url: openai_base_url,
+        dry_run: args.dry_run,
+    };
+
+    println!(
+        "🔍 Scanning for spec files in {}...",
+        config.specs_dir.display()
+    );
+    println!("🤖 Generating plan with {}...\n", config.model);
+
+    let result = run_plan_generation(&config)?;
+
+    println!("════════════════════════════════════════");
+    println!("📋 Generated Plan");
+    println!("════════════════════════════════════════\n");
+    println!("{}", result.content);
+    println!("════════════════════════════════════════");
+    println!("✅ Plan generation complete!");
+
+    Ok(())
+}
+
 fn main() -> color_eyre::eyre::Result<()> {
     // Install color-eyre for better error reports
     color_eyre::install()?;
@@ -283,6 +400,7 @@ fn main() -> color_eyre::eyre::Result<()> {
         Commands::Once(args) => run_once(args, home_cfg, git_root, cwd),
         Commands::Auto(args) => run_auto(args, home_cfg, git_root, cwd),
         Commands::Init => run_init(git_root),
+        Commands::Plan(args) => run_plan(args, home_cfg, git_root),
     }
 }
 
