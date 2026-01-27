@@ -195,6 +195,7 @@ impl Defaults {
     /// For each field, if `overlay` has a `Some` value, it is used;
     /// otherwise, the value from `self` (base) is used.
     #[must_use]
+    #[tracing::instrument(level = "debug", ret)]
     pub fn merge(self, overlay: Self) -> Self {
         Self {
             permission_mode: overlay.permission_mode.or(self.permission_mode),
@@ -253,6 +254,7 @@ impl FileConfig {
     /// - `conversation_db`: overlay config takes precedence
     /// - `plan`: overlay config takes precedence
     #[must_use]
+    #[tracing::instrument(level = "debug", ret)]
     pub fn merge(base: Self, overlay: Self) -> Self {
         Self {
             defaults: base.defaults.merge(overlay.defaults),
@@ -270,6 +272,7 @@ impl FileConfig {
     /// # Errors
     ///
     /// Returns an error if the home directory cannot be determined.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn home_config_path() -> color_eyre::eyre::Result<std::path::PathBuf> {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -306,6 +309,7 @@ impl FileConfig {
     ///
     /// Checks for `velor.toml` first, then falls back to `agent-cli.toml` for backward compatibility.
     #[must_use]
+    #[tracing::instrument(level = "trace", ret)]
     pub fn default_config_path(git_root: &Path) -> std::path::PathBuf {
         let velor_toml = git_root.join(".velor").join("velor.toml");
         let agent_cli_toml = git_root.join(".velor").join("agent-cli.toml");
@@ -588,9 +592,17 @@ mod tests {
     #[test]
     fn test_home_config_path() {
         let path = FileConfig::home_config_path();
-        assert!(path.is_ok());
+        assert!(path.is_ok(), "home_config_path should return Ok");
         let path = path.expect("home_config_path should return Ok");
-        assert!(path.ends_with(".velor/velor.toml") || path.ends_with(".velor\\velor.toml"));
+        // The function returns velor.toml if it exists, otherwise agent-cli.toml for backward compatibility
+        assert!(
+            path.ends_with(".velor/velor.toml")
+                || path.ends_with(".velor\\velor.toml")
+                || path.ends_with(".velor/agent-cli.toml")
+                || path.ends_with(".velor\\agent-cli.toml"),
+            "path should end with .velor/velor.toml or .velor/agent-cli.toml, got: {}",
+            path.display()
+        );
     }
 
     // Integration test with tempfile
