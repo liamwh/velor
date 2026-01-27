@@ -78,13 +78,17 @@ watch:
 custom *args:
     cargo build -q && ./target/debug/velor {{args}}
 
+# Initialise velor in the current repository
+init:
+    cargo build -q && ./target/debug/velor init
+
 # Open the config file in $EDITOR
 edit-config:
-    ${EDITOR:-vim} .velor/agent-cli.toml
+    ${EDITOR:-vim} .velor/velor.toml
 
 # Show available prompts from config
 show-prompts:
-    @grep -E '^\[prompts\.' .velor/agent-cli.toml | sed 's/\[prompts\.//g' | sed 's/\]//g'
+    @grep -E '^\[prompts\.' .velor/velor.toml | sed 's/\[prompts\.//g' | sed 's/\]//g'
 
 # List all justfile recipes
 default:
