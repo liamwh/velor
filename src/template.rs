@@ -4,6 +4,7 @@
 //! the MiniJinja templating engine, with support for variable substitution.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 /// Renders a template string using the provided variables.
 ///
@@ -25,9 +26,113 @@ pub fn render_template(
         .map_err(|e| color_eyre::eyre::eyre!("missing template: {e}"))?;
     let rendered = tmpl
         .render(vars)
-        .map_err(|e| color_eyre::eyre::eyre!("failed to render template: {e}"))?;
+        .map_err(|e| enhance_template_error(e, template, vars))?;
 
     Ok(rendered)
+}
+
+/// Enhances a MiniJinja template error with detailed diagnostic information.
+///
+/// Extracts the undefined variable name, line information, and
+/// formats a helpful error message showing available variables and
+/// suggestions for fixing the issue.
+fn enhance_template_error(
+    err: minijinja::Error,
+    template: &str,
+    vars: &BTreeMap<String, String>,
+) -> color_eyre::eyre::Error {
+    use minijinja::ErrorKind;
+
+    let mut report = String::from("Template rendering failed\n\n");
+
+    // Extract error details based on error kind
+    let (missing_var, line_info, detail) = match err.kind() {
+        ErrorKind::UndefinedError => {
+            let line = err
+                .line()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            // Try to extract variable name from template using range information
+            let var_name = if let (Some(range), Some(_src)) = (err.range(), err.template_source()) {
+                // Extract the variable name from the template source
+                let bytes = template.as_bytes();
+                if range.end <= bytes.len() {
+                    let error_span = &bytes[range.start..range.end];
+                    // Try to extract a variable identifier (alphanumeric and underscore)
+                    String::from_utf8_lossy(error_span)
+                        .chars()
+                        .filter(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                } else {
+                    "<unknown>".to_string()
+                }
+            } else {
+                "<unknown>".to_string()
+            };
+            (Some(var_name), format!("line {line}"), "undefined variable")
+        }
+        _ => {
+            let line = err
+                .line()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            (
+                None,
+                format!("line {line}"),
+                err.detail().unwrap_or("rendering error"),
+            )
+        }
+    };
+
+    // Header section
+    writeln!(report, "  Error location: {line_info}").unwrap();
+    writeln!(report, "  Error kind: {detail}").unwrap();
+
+    // Missing variable section
+    if let Some(var_name) = &missing_var {
+        writeln!(report).unwrap();
+        writeln!(report, "  Missing variable: `{var_name}`").unwrap();
+    }
+
+    // Available variables section
+    writeln!(report).unwrap();
+    writeln!(report, "  Available variables ({}):", vars.len()).unwrap();
+    if vars.is_empty() {
+        writeln!(report, "    (none)").unwrap();
+    } else {
+        for key in vars.keys() {
+            writeln!(report, "    - {key}").unwrap();
+        }
+    }
+
+    // Context section with template snippet
+    if let Some(line_num) = err.line() {
+        writeln!(report).unwrap();
+        writeln!(report, "  Template context (line {line_num}):").unwrap();
+        let template_lines: Vec<&str> = template.lines().collect();
+        if let Some(line_content) = template_lines.get(line_num.saturating_sub(1)) {
+            writeln!(report, "    {}", line_content.trim()).unwrap();
+        }
+    }
+
+    // Suggestion section
+    writeln!(report).unwrap();
+    writeln!(report, "  Suggestion:").unwrap();
+    if let Some(var_name) = &missing_var {
+        writeln!(
+            report,
+            "    Add `{var_name}` to the [vars] section in .velor/velor.toml"
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            report,
+            "    Check the template at the error location for syntax issues"
+        )
+        .unwrap();
+    }
+
+    color_eyre::eyre::eyre!("{report}\n\n  Original error: {err}")
 }
 
 /// Merges variables from multiple sources, with later sources taking precedence.
@@ -118,6 +223,63 @@ mod tests {
 
         let result = merge_vars(&base, &overrides, &runtime);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_error_message_includes_missing_var_name() {
+        let vars = BTreeMap::new();
+        let result = render_template("Hello, {{ missing_var }}!", &vars);
+        let err = result.expect_err("should fail with undefined variable");
+
+        let err_msg = err.to_string();
+        // Error message should contain the missing variable name
+        assert!(
+            err_msg.contains("missing_var"),
+            "error should mention 'missing_var'"
+        );
+        // Error message should show available variables count
+        assert!(
+            err_msg.contains("Available variables (0)"),
+            "should show 0 available variables"
+        );
+        // Error message should include helpful suggestion
+        assert!(
+            err_msg.contains("Add `missing_var`"),
+            "should suggest adding the missing variable"
+        );
+    }
+
+    #[test]
+    fn test_render_error_message_lists_available_vars() {
+        let mut vars = BTreeMap::new();
+        vars.insert("foo".to_string(), "bar".to_string());
+        vars.insert("baz".to_string(), "qux".to_string());
+
+        let result = render_template("Use {{ undefined }} here", &vars);
+        let err = result.expect_err("should fail with undefined variable");
+
+        let err_msg = err.to_string();
+        // Should list the available variables
+        assert!(err_msg.contains("- foo"), "should list 'foo' variable");
+        assert!(err_msg.contains("- baz"), "should list 'baz' variable");
+        assert!(
+            err_msg.contains("Available variables (2)"),
+            "should show 2 available variables"
+        );
+    }
+
+    #[test]
+    fn test_render_error_message_includes_line_info() {
+        let vars = BTreeMap::new();
+        let result = render_template("\n\nLine 3: {{ undefined }}", &vars);
+        let err = result.expect_err("should fail with undefined variable");
+
+        let err_msg = err.to_string();
+        // Should include line information
+        assert!(
+            err_msg.contains("line 3"),
+            "should mention line 3 where error occurred"
+        );
     }
 }
 
