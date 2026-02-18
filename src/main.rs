@@ -80,6 +80,10 @@ struct CommonArgs {
     #[arg(long = "set", value_parser = parse_kv, action = ArgAction::Append)]
     set_vars: Vec<(String, String)>,
 
+    /// Override the Claude binary to use (e.g. "claude" or "claude-glm")
+    #[arg(short, long, visible_alias = "bin", global = true)]
+    pub binary: Option<String>,
+
     /// Print the final rendered prompt and exit (no Claude call).
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
@@ -175,6 +179,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "openai-api-key",
     "openai-model",
     "openai-base-url",
+    "binary",
+    "bin",
 ];
 
 /// Checks if a string is a valid variable name (lowercase, underscores).
@@ -503,6 +509,7 @@ fn run_interactive_menu(
                     prd_path: None,
                     progress_path: None,
                     complete_token: None,
+                    binary: None,
                     set_vars: vec![],
                     dry_run: false,
                 },
@@ -522,6 +529,7 @@ fn run_interactive_menu(
                     prd_path: None,
                     progress_path: None,
                     complete_token: None,
+                    binary: None,
                     set_vars: vec![],
                     dry_run: false,
                 },
@@ -589,7 +597,10 @@ fn run_once(
         .clone()
         .or_else(|| file_cfg.defaults.permission_mode.clone())
         .unwrap_or_else(|| "acceptEdits".to_string());
-    let binary = file_cfg.defaults.binary.clone();
+    let binary = common
+        .binary
+        .clone()
+        .unwrap_or_else(|| file_cfg.defaults.binary.clone());
 
     let prd_path = common
         .prd_path
@@ -675,7 +686,10 @@ fn run_auto(
         .clone()
         .or_else(|| file_cfg.defaults.permission_mode.clone())
         .unwrap_or_else(|| "acceptEdits".to_string());
-    let binary = file_cfg.defaults.binary.clone();
+    let binary = common
+        .binary
+        .clone()
+        .unwrap_or_else(|| file_cfg.defaults.binary.clone());
 
     let prd_path = common
         .prd_path
@@ -1050,10 +1064,7 @@ mod var_override_tests {
                 "docs/plan.md".to_string()
             )]
         );
-        assert_eq!(
-            remaining,
-            vec!["velor", "auto", "--prompt", "foo"]
-        );
+        assert_eq!(remaining, vec!["velor", "auto", "--prompt", "foo"]);
     }
 
     #[test]
@@ -1071,10 +1082,7 @@ mod var_override_tests {
         let extracted = vec![("key".to_string(), "extracted".to_string())];
         let merged = merge_cli_vars(&explicit, &extracted);
 
-        assert_eq!(
-            merged,
-            vec![("key".to_string(), "explicit".to_string())]
-        );
+        assert_eq!(merged, vec![("key".to_string(), "explicit".to_string())]);
     }
 
     #[test]
