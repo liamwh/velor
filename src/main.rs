@@ -20,7 +20,9 @@ mod tui;
 
 use claude::{require_claude_on_path, run_claude};
 use config::FileConfig;
-use notification::{NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify};
+use notification::{
+    NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify,
+};
 use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
 
@@ -809,8 +811,6 @@ fn run_auto(
                                 status: auto_result.status,
                                 output_preview: Some(auto_result.output.clone()),
                                 prompt_name: prompt_name.clone(),
-                                started_at: auto_result.started_at,
-                                ended_at: auto_result.ended_at,
                             };
                             send_notifications(&notifiers, &payload);
                         }
@@ -824,10 +824,16 @@ fn run_auto(
             // Print final status message
             match auto_result.status {
                 RunStatus::Completed => {
-                    println!("✅ Run completed successfully after {} iteration(s).", auto_result.iterations_completed);
+                    println!(
+                        "✅ Run completed successfully after {} iteration(s).",
+                        auto_result.iterations_completed
+                    );
                 }
                 RunStatus::MaxIterationsReached => {
-                    println!("⚠️  Reached maximum iterations ({}) without completion.", auto_result.max_iterations);
+                    println!(
+                        "⚠️  Reached maximum iterations ({}) without completion.",
+                        auto_result.max_iterations
+                    );
                 }
                 _ => {}
             }
@@ -850,8 +856,6 @@ fn run_auto(
                     status: RunStatus::Failed,
                     output_preview: Some(e.to_string()),
                     prompt_name: prompt_name.clone(),
-                    started_at: Utc::now(),
-                    ended_at: Utc::now(),
                 };
                 send_notifications(&notifiers, &payload);
             }
@@ -941,7 +945,6 @@ fn run_auto_loop(
     retry_config: &RetryConfig,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
-    let started_at = Utc::now();
     let mut current_iteration = 1u32;
     let mut history = ConversationHistory::new();
     let mut final_output = String::new();
@@ -999,14 +1002,11 @@ fn run_auto_loop(
 
                 if result.stdout.contains(complete_token) {
                     println!("✅ PRD complete, exiting.");
-                    let ended_at = Utc::now();
                     return Ok(AutoLoopResult {
                         status: RunStatus::Completed,
                         iterations_completed: current_iteration,
                         max_iterations: iterations,
                         duration: start_time.elapsed(),
-                        started_at,
-                        ended_at,
                         output: final_output,
                     });
                 }
@@ -1045,14 +1045,11 @@ fn run_auto_loop(
     }
 
     // Ran all iterations without completion token
-    let ended_at = Utc::now();
     Ok(AutoLoopResult {
         status: RunStatus::MaxIterationsReached,
         iterations_completed: current_iteration - 1,
         max_iterations: iterations,
         duration: start_time.elapsed(),
-        started_at,
-        ended_at,
         output: final_output,
     })
 }
@@ -1068,10 +1065,6 @@ struct AutoLoopResult {
     max_iterations: u32,
     /// Total duration of the run.
     duration: std::time::Duration,
-    /// When the run started.
-    started_at: chrono::DateTime<chrono::Utc>,
-    /// When the run ended.
-    ended_at: chrono::DateTime<chrono::Utc>,
     /// Final output from Claude.
     output: String,
 }

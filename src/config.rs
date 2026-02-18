@@ -1127,7 +1127,10 @@ mod proptest_tests {
         assert!(tg.enabled);
         assert_eq!(tg.bot_token_env, "CUSTOM_TOKEN");
         assert_eq!(tg.chat_id, "-1001234567890");
-        assert_eq!(tg.api_base_url, Some("https://proxy.example.com".to_string()));
+        assert_eq!(
+            tg.api_base_url,
+            Some("https://proxy.example.com".to_string())
+        );
         assert_eq!(tg.parse_mode, Some(TelegramParseMode::Html));
     }
 
