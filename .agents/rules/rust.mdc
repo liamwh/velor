@@ -1,0 +1,42 @@
+---
+description: Writing rust code
+globs: *.rs
+alwaysApply: false
+---
+# Rust Instructions
+
+- Be agressive in creating new crates. We prefer crates and reuseable code across projects over modules.
+- For types exposed via API endpoints, derive `utoipa::ToSchema` to generate OpenAPI types for the frontend.
+- Prefer implementing the Try/From traits instead of using mapper or conversion functions to convert between types.
+- When writing a unit test and using an assert macro, always include a message.
+- Use types to model the domain (not just String/i32 everywhere)
+    - Newtypes for IDs/units: UserId, TenantId, Email, Money, Percentage
+	- Enums for state machines and variants instead of flags/strings
+	- Prefer NonZeroUsize, Duration, PathBuf, Url, IpAddr, etc. over primitives
+- Always document crates, modules, functions, structs, enums, struct fields and other code elements as per Rust best
+practices.
+- Use the instrument macro from `tracing` crate to instrument functions with the level set logically based on the function's purpose. If the function can return an error, use the `err` argument in the macro. If the function can return a result that isn't too complex, use the `ret` argument in the macro.
+- If a function has a parameter that has an `id` field, use it in the field attribute of the instrument macro.
+- Try to use fully qualified paths for imports whenever possible.
+- Return early for error conditions to keep happy-path code at minimal indentation level.
+- TEST EVERYTHING. All functionality must be either unit or property tested, whatever you determine is more appropriate.
+- Use Cargo `[dev-dependencies]` for test-only crates (e.g. `prost-types`, `git-version`) so they are not pulled into the runtime dependency set.
+- Use property testing with `proptest` for critical algorithms.
+- Always run `just check` and resolve all compiler errors and warnings before concluding work.
+- Always use `cargo nextest` for running tests, never run tests with `cargo test`. The nextest.toml file is found at the root of the project in `.config/nextest.toml`.
+- Run tests with `just test-rust`
+- We should prefer idempotency where possible. For example, `delete` functions from the application layer should always be idempotent.
+- Prefer failing early. Do NOT write fallback code. ALWAYS check required ENV vars / secrets at startup, and crash with a clear message if they don't exist.
+- Use `thiserror` for error types in library crates. Only use `color-eyre` in binary crates.
+- When running `cargo check`, ALWAYS use the quiet flag to avoid noisy output: `cargo check -q`.
+- ALWAYS ask before running `cargo clean`.
+- NEVER use anyhow. Use color-eyre or thiserror instead.
+
+# Configuration and Secrets Management
+
+- Secrets MUST come from environment variables. Never hardcode secrets in configuration files or source code.
+- Non-sensitive configuration MUST come from the application's TOML config file. Configuration files should only contain environment variable names for secrets, never the actual secret values.
+- ALL required configuration values and environment variables MUST be validated at application startup. The application MUST crash with clear error messages if any required values are missing or invalid, rather than coming online in a broken state.
+- Non-sensitive configuration should be added to the OpenTelemetry resource attributes at startup.
+- Any credential/key/token/password (including database URLs with passwords and Authorization-style header values) must be stored and passed around as secrecy::SecretString / secrecy::SecretVec<u8>, and may only be unwrapped using ExposeSecret at the narrowest boundary that consumes it (for example, when constructing the client), with no logging/formatting/serialization of the unwrapped value.
+- Any struct that could be logged (Config, request/response DTOs, error-context structs) must use veil to redact sensitive fields in Debug output, and developers must not add manual Debug/Display implementations that print secret fields or call expose_secret() inside formatting/log statements.

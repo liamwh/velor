@@ -33,9 +33,9 @@ test:
 test-verbose:
     cargo nextest run --nocapture
 
-# Format code
-fmt:
-    cargo fmt
+# Format all Rust code in the workspace
+format-rust:
+    @cargo fmt --all
 
 # Check code formatting
 fmt-check:
@@ -46,13 +46,15 @@ lint:
     cargo clippy -- -D warnings
 
 # Run all checks (fmt, clippy, tests)
-check:
-    cargo fmt -- --check && cargo clippy -- -D warnings && cargo nextest run
+check: format-rust lint-rust
+
+lint-rust:
+    cargo clippy --all-targets --all-features --workspace --quiet --no-deps
 
 # Install velor to ~/bin
 install:
     @echo "📦 Building velor binary..."
-    @cargo build --release -q
+    cargo build --release -q
     @echo "📥 Installing to ~/bin..."
     @mkdir -p ~/bin
     @cp target/release/velor ~/bin/
@@ -76,7 +78,7 @@ watch:
 
 # Run velor with custom prompt (usage: just custom --set "key=value")
 custom *args:
-    cargo build -q && ./target/debug/velor {{args}}
+    cargo build -q && ./target/debug/velor {{ args }}
 
 # Initialise velor in the current repository
 init:

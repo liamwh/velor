@@ -1,6 +1,4 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# AGENTS.md
 
 ## Project Overview
 
@@ -67,7 +65,7 @@ The CLI spawns the configured binary (default: `claude-glm`) with:
 - Stdout: parsed for text chunks and streamed to console
 - Stderr: streamed directly
 
-## Rust Guidelines (from .cursor/rules/rust.mdc)
+## Rust Guidelines (from .agents/rules/rust.mdc)
 
 - Use `thiserror` for library crates, `color-eyre` for binary crates (this is a binary)
 - Use `tracing::instrument` macro for function instrumentation
