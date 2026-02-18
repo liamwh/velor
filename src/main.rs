@@ -12,6 +12,7 @@ use std::path::Path;
 mod claude;
 mod config;
 mod git;
+mod notification;
 mod plan;
 mod retry;
 mod template;
@@ -19,6 +20,7 @@ mod tui;
 
 use claude::{require_claude_on_path, run_claude};
 use config::FileConfig;
+use notification::{NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify};
 use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
 
@@ -113,6 +115,10 @@ struct AutoArgs {
     /// Base backoff in milliseconds for exponential backoff (default: 100).
     #[arg(long)]
     base_backoff_ms: Option<u64>,
+
+    /// Disable notifications for this run.
+    #[arg(long)]
+    no_notify: bool,
 }
 
 /// Arguments for the `plan` subcommand
@@ -536,6 +542,7 @@ fn run_interactive_menu(
                 iterations: None,
                 max_retries: None,
                 base_backoff_ms: None,
+                no_notify: false,
             },
             home_cfg,
             git_root,
@@ -772,7 +779,10 @@ fn run_auto(
     println!(
         "🔄 Running auto mode with prompt '{prompt_name}' (max {iterations} iterations, max {max_retries} retries per iteration)..."
     );
-    run_auto_loop(
+
+    let no_notify = args.no_notify;
+
+    let result = run_auto_loop(
         iterations,
         &binary,
         &permission_mode,
@@ -781,7 +791,73 @@ fn run_auto(
         &complete_token,
         &prompt_name,
         &retry_config,
-    )
+    );
+
+    // Handle result and send notifications
+    match result {
+        Ok(auto_result) => {
+            // Send notification if enabled
+            if !no_notify && should_notify(auto_result.status, &file_cfg.notifications) {
+                match build_notifiers(&file_cfg.notifications) {
+                    Ok(notifiers) => {
+                        if !notifiers.is_empty() {
+                            let payload = NotificationPayload {
+                                mode: "auto",
+                                iterations_completed: auto_result.iterations_completed,
+                                max_iterations: auto_result.max_iterations,
+                                duration: auto_result.duration,
+                                status: auto_result.status,
+                                output_preview: Some(auto_result.output.clone()),
+                                prompt_name: prompt_name.clone(),
+                                started_at: auto_result.started_at,
+                                ended_at: auto_result.ended_at,
+                            };
+                            send_notifications(&notifiers, &payload);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to build notifiers: {e}");
+                    }
+                }
+            }
+
+            // Print final status message
+            match auto_result.status {
+                RunStatus::Completed => {
+                    println!("✅ Run completed successfully after {} iteration(s).", auto_result.iterations_completed);
+                }
+                RunStatus::MaxIterationsReached => {
+                    println!("⚠️  Reached maximum iterations ({}) without completion.", auto_result.max_iterations);
+                }
+                _ => {}
+            }
+
+            Ok(())
+        }
+        Err(e) => {
+            // Send failure notification if enabled
+            if !no_notify
+                && file_cfg.notifications.enabled
+                && file_cfg.notifications.notify_on_failure
+                && let Ok(notifiers) = build_notifiers(&file_cfg.notifications)
+                && !notifiers.is_empty()
+            {
+                let payload = NotificationPayload {
+                    mode: "auto",
+                    iterations_completed: 0, // We don't know which iteration failed
+                    max_iterations: iterations,
+                    duration: std::time::Duration::ZERO,
+                    status: RunStatus::Failed,
+                    output_preview: Some(e.to_string()),
+                    prompt_name: prompt_name.clone(),
+                    started_at: Utc::now(),
+                    ended_at: Utc::now(),
+                };
+                send_notifications(&notifiers, &payload);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Resolves the prompt template string from CLI args or config.
@@ -863,9 +939,12 @@ fn run_auto_loop(
     complete_token: &str,
     prompt_name: &str,
     retry_config: &RetryConfig,
-) -> color_eyre::eyre::Result<()> {
+) -> color_eyre::eyre::Result<AutoLoopResult> {
+    let start_time = std::time::Instant::now();
+    let started_at = Utc::now();
     let mut current_iteration = 1u32;
     let mut history = ConversationHistory::new();
+    let mut final_output = String::new();
 
     while current_iteration <= iterations {
         println!("🔁 Iteration {current_iteration}/{iterations}");
@@ -909,6 +988,9 @@ fn run_auto_loop(
 
         match retry_result {
             Ok(result) => {
+                // Store final output for notification preview
+                final_output = result.stdout.clone();
+
                 // Success - clear history and continue
                 if !history.is_empty() {
                     println!("✅ Crash recovery successful for iteration {current_iteration}");
@@ -917,7 +999,16 @@ fn run_auto_loop(
 
                 if result.stdout.contains(complete_token) {
                     println!("✅ PRD complete, exiting.");
-                    return Ok(());
+                    let ended_at = Utc::now();
+                    return Ok(AutoLoopResult {
+                        status: RunStatus::Completed,
+                        iterations_completed: current_iteration,
+                        max_iterations: iterations,
+                        duration: start_time.elapsed(),
+                        started_at,
+                        ended_at,
+                        output: final_output,
+                    });
                 }
 
                 current_iteration += 1;
@@ -953,7 +1044,36 @@ fn run_auto_loop(
         }
     }
 
-    Ok(())
+    // Ran all iterations without completion token
+    let ended_at = Utc::now();
+    Ok(AutoLoopResult {
+        status: RunStatus::MaxIterationsReached,
+        iterations_completed: current_iteration - 1,
+        max_iterations: iterations,
+        duration: start_time.elapsed(),
+        started_at,
+        ended_at,
+        output: final_output,
+    })
+}
+
+/// Result of running the auto loop.
+#[derive(Debug)]
+struct AutoLoopResult {
+    /// Final status of the run.
+    status: RunStatus,
+    /// Number of iterations completed.
+    iterations_completed: u32,
+    /// Maximum iterations allowed.
+    max_iterations: u32,
+    /// Total duration of the run.
+    duration: std::time::Duration,
+    /// When the run started.
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// When the run ended.
+    ended_at: chrono::DateTime<chrono::Utc>,
+    /// Final output from Claude.
+    output: String,
 }
 
 /// Executes Claude with exponential backoff retry logic.
