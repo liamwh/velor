@@ -15,6 +15,7 @@ mod git;
 mod plan;
 mod retry;
 mod template;
+mod tui;
 
 use claude::{require_claude_on_path, run_claude};
 use config::FileConfig;
@@ -26,7 +27,7 @@ use retry::{ConversationHistory, RetryConfig, RetryError};
 #[command(name = "velor", version, about)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,7 +76,7 @@ struct CommonArgs {
     #[arg(long)]
     complete_token: Option<String>,
 
-    /// Provide/override template variables (repeatable): --set key=value.
+    /// Provide/override template variables. Can also use --key=value directly.
     #[arg(long = "set", value_parser = parse_kv, action = ArgAction::Append)]
     set_vars: Vec<(String, String)>,
 
@@ -153,6 +154,75 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
         return Err("key must not be empty".to_string());
     }
     Ok((k.to_string(), v.to_string()))
+}
+
+/// Known clap flags that should NOT be treated as variable overrides.
+const KNOWN_FLAGS: &[&str] = &[
+    "config",
+    "prompt",
+    "prompt-text",
+    "permission-mode",
+    "prd-path",
+    "progress-path",
+    "complete-token",
+    "set",
+    "dry-run",
+    "iterations",
+    "max-retries",
+    "base-backoff-ms",
+    "specs-dir",
+    "max-iterations",
+    "openai-api-key",
+    "openai-model",
+    "openai-base-url",
+];
+
+/// Checks if a string is a valid variable name (lowercase, underscores).
+fn is_valid_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => false,
+        Some(c) if c == '_' || c.is_ascii_lowercase() => {
+            chars.all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// Extracts variable overrides from raw CLI arguments.
+/// Returns (extracted_overrides, remaining_args_for_clap).
+fn extract_var_overrides(
+    args: impl IntoIterator<Item = String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut overrides = Vec::new();
+    let mut remaining = Vec::new();
+
+    for arg in args {
+        if let Some(stripped) = arg.strip_prefix("--")
+            && let Some((key, value)) = stripped.split_once('=')
+            && is_valid_var_name(key)
+            && !KNOWN_FLAGS.contains(&key)
+        {
+            overrides.push((key.to_string(), value.to_string()));
+            continue;
+        }
+        remaining.push(arg);
+    }
+    (overrides, remaining)
+}
+
+/// Merges explicit --set vars with extracted var overrides.
+/// Explicit --set takes precedence over direct --key=value.
+fn merge_cli_vars(
+    explicit_set: &[(String, String)],
+    extracted: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut result = extracted.to_vec();
+    for (k, v) in explicit_set {
+        result.retain(|(ek, _)| ek != k);
+        result.push((k.clone(), v.clone()));
+    }
+    result
 }
 
 /// Default velor.toml configuration template.
@@ -387,7 +457,13 @@ fn main() -> color_eyre::eyre::Result<()> {
     // Install color-eyre for better error reports
     color_eyre::install()?;
 
-    let cli = Cli::parse();
+    // Pre-parse to extract --key=value variable overrides
+    let raw_args: Vec<String> = std::env::args().collect();
+    let (var_overrides, remaining_args) = extract_var_overrides(raw_args);
+
+    // Parse with clap using filtered arguments
+    let cli = Cli::parse_from(remaining_args);
+
     let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
     let git_root = git::discover_git_root(&cwd).wrap_err("failed to discover git root")?;
 
@@ -397,10 +473,82 @@ fn main() -> color_eyre::eyre::Result<()> {
         .unwrap_or_default();
 
     match cli.command {
-        Commands::Once(args) => run_once(args, home_cfg, git_root, cwd),
-        Commands::Auto(args) => run_auto(args, home_cfg, git_root, cwd),
-        Commands::Init => run_init(git_root),
-        Commands::Plan(args) => run_plan(args, home_cfg, git_root),
+        Some(Commands::Once(args)) => run_once(args, home_cfg, git_root, cwd, &var_overrides),
+        Some(Commands::Auto(args)) => run_auto(args, home_cfg, git_root, cwd, &var_overrides),
+        Some(Commands::Init) => run_init(git_root),
+        Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root),
+        None => run_interactive_menu(home_cfg, git_root, cwd),
+    }
+}
+
+/// Runs the interactive TUI menu when no subcommand is provided.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
+fn run_interactive_menu(
+    home_cfg: FileConfig,
+    git_root: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+) -> color_eyre::eyre::Result<()> {
+    use tui::MenuChoice;
+
+    let choice = tui::run_menu()?;
+
+    match choice {
+        MenuChoice::Once => run_once(
+            OnceArgs {
+                common: CommonArgs {
+                    config: None,
+                    prompt: None,
+                    prompt_text: None,
+                    permission_mode: None,
+                    prd_path: None,
+                    progress_path: None,
+                    complete_token: None,
+                    set_vars: vec![],
+                    dry_run: false,
+                },
+            },
+            home_cfg,
+            git_root,
+            cwd,
+            &[],
+        ),
+        MenuChoice::Auto => run_auto(
+            AutoArgs {
+                common: CommonArgs {
+                    config: None,
+                    prompt: None,
+                    prompt_text: None,
+                    permission_mode: None,
+                    prd_path: None,
+                    progress_path: None,
+                    complete_token: None,
+                    set_vars: vec![],
+                    dry_run: false,
+                },
+                iterations: None,
+                max_retries: None,
+                base_backoff_ms: None,
+            },
+            home_cfg,
+            git_root,
+            cwd,
+            &[],
+        ),
+        MenuChoice::Init => run_init(git_root),
+        MenuChoice::Plan => run_plan(
+            PlanArgs {
+                config: None,
+                specs_dir: None,
+                max_iterations: None,
+                openai_api_key: None,
+                openai_model: None,
+                openai_base_url: None,
+                dry_run: false,
+            },
+            home_cfg,
+            git_root,
+        ),
+        MenuChoice::Quit => Ok(()),
     }
 }
 
@@ -420,6 +568,7 @@ fn run_once(
     home_cfg: FileConfig,
     git_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
+    extracted_overrides: &[(String, String)],
 ) -> color_eyre::eyre::Result<()> {
     let common = args.common;
 
@@ -479,7 +628,8 @@ fn run_once(
         &config_path,
     );
 
-    let vars = template::merge_vars(&file_cfg.vars, &common.set_vars, &runtime_vars);
+    let cli_vars = merge_cli_vars(&common.set_vars, extracted_overrides);
+    let vars = template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
 
     let template_str = resolve_prompt_template(&common, &file_cfg, &prompt_name)?;
 
@@ -504,6 +654,7 @@ fn run_auto(
     home_cfg: FileConfig,
     git_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
+    extracted_overrides: &[(String, String)],
 ) -> color_eyre::eyre::Result<()> {
     let common = args.common;
 
@@ -568,7 +719,8 @@ fn run_auto(
         &config_path,
     );
 
-    let vars = template::merge_vars(&file_cfg.vars, &common.set_vars, &runtime_vars);
+    let cli_vars = merge_cli_vars(&common.set_vars, extracted_overrides);
+    let vars = template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
 
     let template_str = resolve_prompt_template(&common, &file_cfg, &prompt_name)?;
 
@@ -860,4 +1012,248 @@ fn execute_with_retry(
         "failed after {} retries: {}",
         config.max_retries, last_error
     )))
+}
+
+#[cfg(test)]
+mod var_override_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_var_name() {
+        assert!(is_valid_var_name("foo"));
+        assert!(is_valid_var_name("implementation_plan_2"));
+        assert!(is_valid_var_name("_private"));
+        assert!(is_valid_var_name("a"));
+        assert!(is_valid_var_name("abc123"));
+        assert!(!is_valid_var_name("Foo")); // uppercase
+        assert!(!is_valid_var_name("foo-bar")); // hyphen
+        assert!(!is_valid_var_name("123foo")); // starts with digit
+        assert!(!is_valid_var_name("")); // empty
+        assert!(!is_valid_var_name("fooBar")); // camelCase
+    }
+
+    #[test]
+    fn test_extract_var_overrides_basic() {
+        let args = vec![
+            "velor".to_string(),
+            "auto".to_string(),
+            "--prompt".to_string(),
+            "foo".to_string(),
+            "--implementation_plan_2=docs/plan.md".to_string(),
+        ];
+        let (overrides, remaining) = extract_var_overrides(args);
+
+        assert_eq!(
+            overrides,
+            vec![(
+                "implementation_plan_2".to_string(),
+                "docs/plan.md".to_string()
+            )]
+        );
+        assert_eq!(
+            remaining,
+            vec!["velor", "auto", "--prompt", "foo"]
+        );
+    }
+
+    #[test]
+    fn test_known_flags_not_extracted() {
+        let args = vec!["velor".to_string(), "--prompt=foo".to_string()];
+        let (overrides, remaining) = extract_var_overrides(args);
+
+        assert!(overrides.is_empty());
+        assert_eq!(remaining, vec!["velor", "--prompt=foo"]);
+    }
+
+    #[test]
+    fn test_merge_cli_vars_explicit_wins() {
+        let explicit = vec![("key".to_string(), "explicit".to_string())];
+        let extracted = vec![("key".to_string(), "extracted".to_string())];
+        let merged = merge_cli_vars(&explicit, &extracted);
+
+        assert_eq!(
+            merged,
+            vec![("key".to_string(), "explicit".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_merge_cli_vars_both_preserved() {
+        let explicit = vec![("key1".to_string(), "explicit".to_string())];
+        let extracted = vec![("key2".to_string(), "extracted".to_string())];
+        let merged = merge_cli_vars(&explicit, &extracted);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains(&("key1".to_string(), "explicit".to_string())));
+        assert!(merged.contains(&("key2".to_string(), "extracted".to_string())));
+    }
+
+    #[test]
+    fn test_extract_multiple_overrides() {
+        let args = vec![
+            "velor".to_string(),
+            "auto".to_string(),
+            "--foo=bar".to_string(),
+            "--baz=qux".to_string(),
+            "--prompt=test".to_string(),
+        ];
+        let (overrides, remaining) = extract_var_overrides(args);
+
+        assert_eq!(overrides.len(), 2);
+        assert!(overrides.contains(&("foo".to_string(), "bar".to_string())));
+        assert!(overrides.contains(&("baz".to_string(), "qux".to_string())));
+        assert_eq!(remaining, vec!["velor", "auto", "--prompt=test"]);
+    }
+
+    #[test]
+    fn test_all_known_flags_not_extracted() {
+        // Test all known flags are not extracted as variable overrides
+        for flag in KNOWN_FLAGS {
+            let args = vec!["velor".to_string(), format!("--{flag}=some_value")];
+            let (overrides, remaining) = extract_var_overrides(args);
+
+            assert!(
+                overrides.is_empty(),
+                "Flag {} should not be extracted as override",
+                flag
+            );
+            assert_eq!(remaining.len(), 2);
+            assert_eq!(remaining[1], format!("--{flag}=some_value"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod var_override_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Generate valid variable names: lowercase letters, underscores, digits (not starting with digit)
+    fn valid_var_name_strategy() -> impl Strategy<Value = String> {
+        "[a-z_][a-z0-9_]{0,20}"
+    }
+
+    /// Generate any string for values
+    fn any_value_strategy() -> impl Strategy<Value = String> {
+        ".*"
+    }
+
+    proptest! {
+        #[test]
+        fn test_is_valid_var_name_accepts_valid_names(name in valid_var_name_strategy()) {
+            prop_assert!(is_valid_var_name(&name));
+        }
+
+        #[test]
+        fn test_is_valid_var_name_rejects_uppercase(
+            prefix in "[a-z_]*",
+            upper in "[A-Z]",
+            suffix in "[a-z0-9_]*"
+        ) {
+            let name = format!("{prefix}{upper}{suffix}");
+            prop_assert!(!is_valid_var_name(&name));
+        }
+
+        #[test]
+        fn test_is_valid_var_name_rejects_leading_digit(
+            digit in "[0-9]",
+            rest in "[a-z0-9_]*"
+        ) {
+            let name = format!("{digit}{rest}");
+            prop_assert!(!is_valid_var_name(&name));
+        }
+
+        #[test]
+        fn test_is_valid_var_name_rejects_hyphen(
+            prefix in "[a-z_]+",
+            suffix in "[a-z0-9_]+"
+        ) {
+            let name = format!("{prefix}-{suffix}");
+            prop_assert!(!is_valid_var_name(&name));
+        }
+
+        #[test]
+        fn test_extract_var_overrides_preserves_non_override_args(
+            program in "prog[a-z]{0,5}",
+            subcmd in "cmd[a-z]{0,5}",
+            flag in "flag[a-z]{0,5}",
+            value in "[a-z]{1,5}"
+        ) {
+            // Skip if flag happens to be a known flag
+            prop_assume!(!KNOWN_FLAGS.contains(&flag.as_str()));
+
+            let args = vec![
+                program.clone(),
+                subcmd.clone(),
+                format!("--{flag}={value}"),
+            ];
+            let (overrides, remaining) = extract_var_overrides(args);
+
+            // Should extract as variable override
+            prop_assert_eq!(overrides.len(), 1);
+            prop_assert_eq!(&overrides[0], &(flag.clone(), value));
+
+            // Program and subcommand should remain
+            prop_assert!(remaining.contains(&program));
+            prop_assert!(remaining.contains(&subcmd));
+        }
+
+        #[test]
+        fn test_merge_cli_vars_explicit_always_wins(
+            key in valid_var_name_strategy(),
+            explicit_val in any_value_strategy(),
+            extracted_val in any_value_strategy()
+        ) {
+            // Skip if values are the same (would be indistinguishable)
+            prop_assume!(explicit_val != extracted_val);
+
+            let explicit = vec![(key.clone(), explicit_val.clone())];
+            let extracted = vec![(key.clone(), extracted_val)];
+            let merged = merge_cli_vars(&explicit, &extracted);
+
+            prop_assert_eq!(merged.len(), 1);
+            prop_assert_eq!(&merged[0], &(key, explicit_val));
+        }
+
+        #[test]
+        fn test_merge_cli_vars_preserves_unique_keys(
+            key1 in valid_var_name_strategy(),
+            key2 in valid_var_name_strategy(),
+            val1 in any_value_strategy(),
+            val2 in any_value_strategy()
+        ) {
+            // Skip if keys are the same
+            prop_assume!(key1 != key2);
+
+            let explicit = vec![(key1.clone(), val1.clone())];
+            let extracted = vec![(key2.clone(), val2.clone())];
+            let merged = merge_cli_vars(&explicit, &extracted);
+
+            prop_assert_eq!(merged.len(), 2);
+            prop_assert!(merged.contains(&(key1, val1)));
+            prop_assert!(merged.contains(&(key2, val2)));
+        }
+
+        #[test]
+        fn test_extract_var_overrides_roundtrip(
+            vars in prop::collection::vec(
+                (valid_var_name_strategy(), any_value_strategy()),
+                0..5
+            )
+        ) {
+            // Build args from vars
+            let mut args: Vec<String> = vec!["velor".to_string(), "auto".to_string()];
+            for (key, value) in &vars {
+                args.push(format!("--{key}={value}"));
+            }
+
+            let (overrides, _remaining) = extract_var_overrides(args);
+
+            // All vars should be extracted
+            prop_assert_eq!(overrides.len(), vars.len());
+            for (key, value) in &vars {
+                prop_assert!(overrides.contains(&(key.clone(), value.clone())));
+            }
+        }
+    }
 }
