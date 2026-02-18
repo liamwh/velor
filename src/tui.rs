@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn test_menu_item_labels_unique() {
         let labels: Vec<_> = MENU_ITEMS.iter().map(|m| m.label).collect();
-        let unique: Vec<_> = labels.iter().map(|&l| l).collect();
+        let unique = labels.to_vec();
         assert_eq!(labels, unique);
     }
 
