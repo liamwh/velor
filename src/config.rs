@@ -69,6 +69,84 @@ impl Default for PlanConfig {
     }
 }
 
+/// Parse mode for Telegram messages.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub enum TelegramParseMode {
+    /// MarkdownV2 formatting.
+    #[default]
+    MarkdownV2,
+    /// HTML formatting.
+    Html,
+}
+
+/// Configuration for Telegram notifications.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    /// Whether Telegram notifications are enabled.
+    pub enabled: bool,
+
+    /// Environment variable name containing the bot token.
+    pub bot_token_env: String,
+
+    /// Telegram chat ID to send messages to.
+    pub chat_id: String,
+
+    /// Optional API base URL (for proxies).
+    pub api_base_url: Option<String>,
+
+    /// Parse mode for messages (MarkdownV2, HTML, or None).
+    pub parse_mode: Option<TelegramParseMode>,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
+            chat_id: String::new(),
+            api_base_url: None,
+            parse_mode: Some(TelegramParseMode::MarkdownV2),
+        }
+    }
+}
+
+/// Configuration for notifications.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Whether notifications are globally enabled.
+    pub enabled: bool,
+
+    /// Send notification on successful completion.
+    pub notify_on_success: bool,
+
+    /// Send notification when max iterations are reached.
+    pub notify_on_max_iterations: bool,
+
+    /// Send notification on failure.
+    pub notify_on_failure: bool,
+
+    /// Number of characters to include in output preview.
+    pub output_preview_chars: u32,
+
+    /// Telegram notification configuration.
+    pub telegram: Option<TelegramConfig>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            notify_on_success: true,
+            notify_on_max_iterations: true,
+            notify_on_failure: true,
+            output_preview_chars: 500,
+            telegram: None,
+        }
+    }
+}
+
 /// Configuration loaded from the TOML file.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct FileConfig {
@@ -91,6 +169,10 @@ pub struct FileConfig {
     /// Plan subcommand configuration.
     #[serde(default)]
     pub plan: PlanConfig,
+
+    /// Notifications configuration.
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 /// Default values that can be overridden by CLI arguments.
@@ -253,6 +335,7 @@ impl FileConfig {
     /// - `prompts`: overlay prompts extend and replace base prompts
     /// - `conversation_db`: overlay config takes precedence
     /// - `plan`: overlay config takes precedence
+    /// - `notifications`: overlay config takes precedence
     #[must_use]
     #[tracing::instrument(level = "debug", ret)]
     pub fn merge(base: Self, overlay: Self) -> Self {
@@ -262,6 +345,7 @@ impl FileConfig {
             prompts: merge_prompts(&base.prompts, &overlay.prompts),
             conversation_db: overlay.conversation_db,
             plan: overlay.plan,
+            notifications: overlay.notifications,
         }
     }
 
@@ -512,6 +596,7 @@ mod tests {
                 plan_max_iterations: 5,
                 ..Default::default()
             },
+            notifications: NotificationsConfig::default(),
         };
 
         let overlay = FileConfig {
@@ -539,6 +624,10 @@ mod tests {
             },
             plan: PlanConfig {
                 openai_model: "gpt-4o-mini".to_string(),
+                ..Default::default()
+            },
+            notifications: NotificationsConfig {
+                enabled: true,
                 ..Default::default()
             },
         };
@@ -981,5 +1070,134 @@ mod proptest_tests {
         assert!(config.plan_max_iterations > 0);
         assert!(!config.openai_api_key_env.is_empty());
         assert!(!config.openai_model.is_empty());
+    }
+
+    // NotificationsConfig tests
+    #[test]
+    fn test_notifications_config_default() {
+        let config = NotificationsConfig::default();
+        assert!(!config.enabled);
+        assert!(config.notify_on_success);
+        assert!(config.notify_on_max_iterations);
+        assert!(config.notify_on_failure);
+        assert_eq!(config.output_preview_chars, 500);
+        assert!(config.telegram.is_none());
+    }
+
+    #[test]
+    fn test_telegram_config_default() {
+        let config = TelegramConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.bot_token_env, "TELEGRAM_BOT_TOKEN");
+        assert!(config.chat_id.is_empty());
+        assert!(config.api_base_url.is_none());
+        assert_eq!(config.parse_mode, Some(TelegramParseMode::MarkdownV2));
+    }
+
+    #[test]
+    fn test_telegram_parse_mode_default() {
+        let mode = TelegramParseMode::default();
+        assert_eq!(mode, TelegramParseMode::MarkdownV2);
+    }
+
+    #[test]
+    fn test_notifications_config_custom() {
+        let config = NotificationsConfig {
+            enabled: true,
+            notify_on_success: false,
+            notify_on_max_iterations: true,
+            notify_on_failure: true,
+            output_preview_chars: 1000,
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                bot_token_env: "CUSTOM_TOKEN".to_string(),
+                chat_id: "-1001234567890".to_string(),
+                api_base_url: Some("https://proxy.example.com".to_string()),
+                parse_mode: Some(TelegramParseMode::Html),
+            }),
+        };
+
+        assert!(config.enabled);
+        assert!(!config.notify_on_success);
+        assert!(config.notify_on_max_iterations);
+        assert!(config.notify_on_failure);
+        assert_eq!(config.output_preview_chars, 1000);
+
+        let tg = config.telegram.as_ref().expect("telegram should be set");
+        assert!(tg.enabled);
+        assert_eq!(tg.bot_token_env, "CUSTOM_TOKEN");
+        assert_eq!(tg.chat_id, "-1001234567890");
+        assert_eq!(tg.api_base_url, Some("https://proxy.example.com".to_string()));
+        assert_eq!(tg.parse_mode, Some(TelegramParseMode::Html));
+    }
+
+    // Test loading TOML with notifications section
+    #[test]
+    fn test_load_config_with_notifications() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir should be created");
+        let config_path = temp_dir.path().join("test.toml");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[notifications]
+enabled = true
+notify_on_success = true
+notify_on_max_iterations = true
+notify_on_failure = true
+output_preview_chars = 750
+
+[notifications.telegram]
+enabled = true
+bot_token_env = "MY_BOT_TOKEN"
+chat_id = "-1001234567890"
+parse_mode = "MarkdownV2"
+"#,
+        )
+        .expect("config should be written");
+
+        let config = FileConfig::load_if_exists(&config_path)
+            .expect("config should load")
+            .expect("config should exist");
+
+        assert!(config.notifications.enabled);
+        assert_eq!(config.notifications.output_preview_chars, 750);
+
+        let tg = config
+            .notifications
+            .telegram
+            .as_ref()
+            .expect("telegram should be set");
+        assert!(tg.enabled);
+        assert_eq!(tg.bot_token_env, "MY_BOT_TOKEN");
+        assert_eq!(tg.chat_id, "-1001234567890");
+        assert_eq!(tg.parse_mode, Some(TelegramParseMode::MarkdownV2));
+    }
+
+    #[test]
+    fn test_notifications_merge_overlay_wins() {
+        let base = FileConfig {
+            notifications: NotificationsConfig {
+                enabled: false,
+                output_preview_chars: 500,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let overlay = FileConfig {
+            notifications: NotificationsConfig {
+                enabled: true,
+                output_preview_chars: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = FileConfig::merge(base, overlay);
+
+        // Overlay should win
+        assert!(result.notifications.enabled);
+        assert_eq!(result.notifications.output_preview_chars, 1000);
     }
 }
