@@ -3,7 +3,6 @@
 //! This module provides notification capabilities that send messages when runs complete,
 //! reach max iterations, or fail. The first implementation is Telegram notifications.
 
-use chrono::{DateTime, Utc};
 use color_eyre::eyre::{WrapErr, eyre};
 use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
@@ -27,10 +26,6 @@ pub struct NotificationPayload {
     pub output_preview: Option<String>,
     /// Name of the prompt used.
     pub prompt_name: String,
-    /// When the run started.
-    pub started_at: DateTime<Utc>,
-    /// When the run ended.
-    pub ended_at: DateTime<Utc>,
 }
 
 /// Status of a completed run.
@@ -42,8 +37,6 @@ pub enum RunStatus {
     MaxIterationsReached,
     /// Error occurred during execution.
     Failed,
-    /// User interrupted with Ctrl+C (never notifies).
-    Interrupted,
 }
 
 impl RunStatus {
@@ -54,7 +47,6 @@ impl RunStatus {
             Self::Completed => "✅",
             Self::MaxIterationsReached => "⚠️",
             Self::Failed => "❌",
-            Self::Interrupted => "🛑",
         }
     }
 
@@ -65,7 +57,6 @@ impl RunStatus {
             Self::Completed => "Completed",
             Self::MaxIterationsReached => "Max Iterations Reached",
             Self::Failed => "Failed",
-            Self::Interrupted => "Interrupted",
         }
     }
 }
@@ -126,7 +117,10 @@ impl TelegramNotifier {
     /// - The HTTP client fails to build
     /// - The API base URL is invalid
     #[tracing::instrument(level = "debug", ret, err)]
-    pub fn new(config: &TelegramConfig, output_preview_chars: u32) -> color_eyre::eyre::Result<Self> {
+    pub fn new(
+        config: &TelegramConfig,
+        output_preview_chars: u32,
+    ) -> color_eyre::eyre::Result<Self> {
         let bot_token: SecretString = std::env::var(&config.bot_token_env)
             .map(SecretString::new)
             .wrap_err_with(|| {
@@ -170,7 +164,10 @@ impl TelegramNotifier {
     pub fn notify(&self, payload: &NotificationPayload) -> color_eyre::eyre::Result<()> {
         let url = self
             .api_base_url
-            .join(&format!("bot{}/sendMessage", self.bot_token.expose_secret()))
+            .join(&format!(
+                "bot{}/sendMessage",
+                self.bot_token.expose_secret()
+            ))
             .wrap_err("failed to construct Telegram API URL")?;
 
         let text = format_telegram_message(payload, self.output_preview_chars, self.parse_mode);
@@ -197,11 +194,7 @@ impl TelegramNotifier {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
-            return Err(eyre!(
-                "Telegram API returned error {}: {}",
-                status,
-                body
-            ));
+            return Err(eyre!("Telegram API returned error {}: {}", status, body));
         }
 
         Ok(())
@@ -323,11 +316,7 @@ pub fn build_notifiers(config: &NotificationsConfig) -> color_eyre::eyre::Result
 pub fn send_notifications(notifiers: &[Notifier], payload: &NotificationPayload) {
     for notifier in notifiers {
         if let Err(e) = notifier.notify(payload) {
-            tracing::error!(
-                "Failed to send {} notification: {}",
-                notifier.name(),
-                e
-            );
+            tracing::error!("Failed to send {} notification: {}", notifier.name(), e);
         }
     }
 }
@@ -343,7 +332,6 @@ pub const fn should_notify(status: RunStatus, config: &NotificationsConfig) -> b
         RunStatus::Completed => config.notify_on_success,
         RunStatus::MaxIterationsReached => config.notify_on_max_iterations,
         RunStatus::Failed => config.notify_on_failure,
-        RunStatus::Interrupted => false, // Never notify on user interrupt
     }
 }
 
@@ -360,12 +348,6 @@ mod tests {
             status,
             output_preview: Some("Test output with ANSI: \x1b[32mgreen\x1b[0m".to_string()),
             prompt_name: "implement-plan".to_string(),
-            started_at: DateTime::parse_from_rfc3339("2024-01-15T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            ended_at: DateTime::parse_from_rfc3339("2024-01-15T10:12:34Z")
-                .unwrap()
-                .with_timezone(&Utc),
         }
     }
 
@@ -374,15 +356,16 @@ mod tests {
         assert_eq!(RunStatus::Completed.emoji(), "✅");
         assert_eq!(RunStatus::MaxIterationsReached.emoji(), "⚠️");
         assert_eq!(RunStatus::Failed.emoji(), "❌");
-        assert_eq!(RunStatus::Interrupted.emoji(), "🛑");
     }
 
     #[test]
     fn test_run_status_label() {
         assert_eq!(RunStatus::Completed.label(), "Completed");
-        assert_eq!(RunStatus::MaxIterationsReached.label(), "Max Iterations Reached");
+        assert_eq!(
+            RunStatus::MaxIterationsReached.label(),
+            "Max Iterations Reached"
+        );
         assert_eq!(RunStatus::Failed.label(), "Failed");
-        assert_eq!(RunStatus::Interrupted.label(), "Interrupted");
     }
 
     #[test]
@@ -477,7 +460,11 @@ mod tests {
         payload.output_preview = Some("x".repeat(10_000));
         let message = format_telegram_message(&payload, 500, None);
 
-        assert!(message.len() <= 4096, "Message length {} exceeds 4096", message.len());
+        assert!(
+            message.len() <= 4096,
+            "Message length {} exceeds 4096",
+            message.len()
+        );
     }
 
     #[test]
@@ -486,7 +473,10 @@ mod tests {
         let message = format_telegram_message(&payload, 500, Some(TelegramParseMode::MarkdownV2));
 
         // Special characters should be escaped - the prompt name contains a hyphen
-        assert!(message.contains("\\-"), "Hyphens should be escaped in: {message}");
+        assert!(
+            message.contains("\\-"),
+            "Hyphens should be escaped in: {message}"
+        );
         // Duration contains a colon which doesn't need escaping, but the prompt name has hyphen
     }
 
@@ -503,7 +493,6 @@ mod tests {
         assert!(should_notify(RunStatus::Completed, &config));
         assert!(should_notify(RunStatus::MaxIterationsReached, &config));
         assert!(should_notify(RunStatus::Failed, &config));
-        assert!(!should_notify(RunStatus::Interrupted, &config));
     }
 
     #[test]
@@ -573,8 +562,6 @@ mod proptest_tests {
                 status: RunStatus::Completed,
                 output_preview: Some("x".repeat(preview_len)),
                 prompt_name: "test".to_string(),
-                started_at: Utc::now(),
-                ended_at: Utc::now(),
             };
 
             let message = format_telegram_message(&payload, 500, Some(TelegramParseMode::MarkdownV2));
@@ -639,11 +626,11 @@ mod wiremock_tests {
                 status: RunStatus::Completed,
                 output_preview: None,
                 prompt_name: "test".to_string(),
-                started_at: Utc::now(),
-                ended_at: Utc::now(),
             };
 
-            notifier.notify(&payload).expect("notification should succeed");
+            notifier
+                .notify(&payload)
+                .expect("notification should succeed");
 
             unsafe {
                 std::env::remove_var("TEST_TELEGRAM_TOKEN");
@@ -694,8 +681,6 @@ mod wiremock_tests {
                 status: RunStatus::Completed,
                 output_preview: None,
                 prompt_name: "test".to_string(),
-                started_at: Utc::now(),
-                ended_at: Utc::now(),
             };
 
             let result = notifier.notify(&payload);
