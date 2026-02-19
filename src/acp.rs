@@ -461,7 +461,6 @@ mod proptest_tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Property test: AcpRunResult roundtrip preserves content.
     proptest! {
         #[test]
         fn test_acp_run_result_roundtrip(content in ".*") {
@@ -472,7 +471,6 @@ mod proptest_tests {
         }
     }
 
-    /// Property test: AcpRunResult with unicode content.
     proptest! {
         #[test]
         fn test_acp_run_result_unicode(
@@ -488,7 +486,6 @@ mod proptest_tests {
         }
     }
 
-    /// Property test: AcpRunResult with newlines and special chars.
     proptest! {
         #[test]
         fn test_acp_run_result_with_special_chars(
@@ -504,7 +501,6 @@ mod proptest_tests {
         }
     }
 
-    /// Property test: AcpRunResult length is preserved.
     proptest! {
         #[test]
         fn test_acp_run_result_length(content in ".*") {
