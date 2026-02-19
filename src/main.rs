@@ -8,6 +8,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use color_eyre::eyre::WrapErr;
 use std::collections::BTreeMap;
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 mod claude;
 mod config;
@@ -524,6 +525,17 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // Install color-eyre for better error reports
     color_eyre::install()?;
 
+    // Create cancellation token for graceful shutdown
+    let cancel_token = CancellationToken::new();
+
+    // Register Ctrl+C handler for cancellation
+    let token_clone = cancel_token.clone();
+    ctrlc::set_handler(move || {
+        tracing::info!("Ctrl+C received, initiating graceful shutdown...");
+        token_clone.cancel();
+    })
+    .wrap_err("failed to register Ctrl+C handler")?;
+
     // Pre-parse to extract --key=value variable overrides
     let raw_args: Vec<String> = std::env::args().collect();
     let (var_overrides, remaining_args) = extract_var_overrides(raw_args);
@@ -540,8 +552,12 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .unwrap_or_default();
 
     match cli.command {
-        Some(Commands::Once(args)) => run_once(args, home_cfg, git_root, cwd, &var_overrides).await,
-        Some(Commands::Auto(args)) => run_auto(args, home_cfg, git_root, cwd, &var_overrides).await,
+        Some(Commands::Once(args)) => {
+            run_once(args, home_cfg, git_root, cwd, &var_overrides, cancel_token).await
+        }
+        Some(Commands::Auto(args)) => {
+            run_auto(args, home_cfg, git_root, cwd, &var_overrides, cancel_token).await
+        }
         Some(Commands::Init) => run_init(git_root).await,
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root).await,
         Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root).await,
@@ -558,67 +574,81 @@ async fn run_interactive_menu(
 ) -> color_eyre::eyre::Result<()> {
     use tui::MenuChoice;
 
+    // Create cancellation token for interactive menu
+    let cancel_token = CancellationToken::new();
+
     let choice = tui::run_menu()?;
 
     match choice {
-        MenuChoice::Once => run_once(
-            OnceArgs {
-                common: CommonArgs {
-                    config: None,
-                    prompt: None,
-                    prompt_text: None,
-                    permission_mode: None,
-                    prd_path: None,
-                    progress_path: None,
-                    complete_token: None,
-                    binary: None,
-                    set_vars: vec![],
-                    dry_run: false,
+        MenuChoice::Once => {
+            run_once(
+                OnceArgs {
+                    common: CommonArgs {
+                        config: None,
+                        prompt: None,
+                        prompt_text: None,
+                        permission_mode: None,
+                        prd_path: None,
+                        progress_path: None,
+                        complete_token: None,
+                        binary: None,
+                        set_vars: vec![],
+                        dry_run: false,
+                    },
                 },
-            },
-            home_cfg,
-            git_root,
-            cwd,
-            &[],
-        ).await,
-        MenuChoice::Auto => run_auto(
-            AutoArgs {
-                common: CommonArgs {
-                    config: None,
-                    prompt: None,
-                    prompt_text: None,
-                    permission_mode: None,
-                    prd_path: None,
-                    progress_path: None,
-                    complete_token: None,
-                    binary: None,
-                    set_vars: vec![],
-                    dry_run: false,
+                home_cfg,
+                git_root,
+                cwd,
+                &[],
+                cancel_token,
+            )
+            .await
+        }
+        MenuChoice::Auto => {
+            run_auto(
+                AutoArgs {
+                    common: CommonArgs {
+                        config: None,
+                        prompt: None,
+                        prompt_text: None,
+                        permission_mode: None,
+                        prd_path: None,
+                        progress_path: None,
+                        complete_token: None,
+                        binary: None,
+                        set_vars: vec![],
+                        dry_run: false,
+                    },
+                    iterations: None,
+                    max_retries: None,
+                    base_backoff_ms: None,
+                    no_notify: false,
                 },
-                iterations: None,
-                max_retries: None,
-                base_backoff_ms: None,
-                no_notify: false,
-            },
-            home_cfg,
-            git_root,
-            cwd,
-            &[],
-        ).await,
+                home_cfg,
+                git_root,
+                cwd,
+                &[],
+                cancel_token,
+            )
+            .await
+        }
         MenuChoice::Init => run_init(git_root).await,
-        MenuChoice::Plan => run_plan(
-            PlanArgs {
-                config: None,
-                specs_dir: None,
-                max_iterations: None,
-                openai_api_key: None,
-                openai_model: None,
-                openai_base_url: None,
-                dry_run: false,
-            },
-            home_cfg,
-            git_root,
-        ).await,
+        MenuChoice::Plan => {
+            run_plan(
+                PlanArgs {
+                    config: None,
+                    specs_dir: None,
+                    max_iterations: None,
+                    openai_api_key: None,
+                    openai_model: None,
+                    openai_base_url: None,
+                    dry_run: false,
+                },
+                home_cfg,
+                git_root,
+            )
+            .await
+        }
         MenuChoice::Quit => Ok(()),
     }
 }
@@ -640,6 +670,7 @@ async fn run_once(
     git_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
     extracted_overrides: &[(String, String)],
+    cancel_token: CancellationToken,
 ) -> color_eyre::eyre::Result<()> {
     let common = args.common;
 
@@ -729,6 +760,7 @@ async fn run_auto(
     git_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
     extracted_overrides: &[(String, String)],
+    cancel_token: CancellationToken,
 ) -> color_eyre::eyre::Result<()> {
     let common = args.common;
 
