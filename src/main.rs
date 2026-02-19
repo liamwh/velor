@@ -488,7 +488,9 @@ fn run_test_notification(
     let notifiers = build_notifiers(&merged_cfg.notifications)?;
 
     if notifiers.is_empty() {
-        println!("No notifications enabled. Configure [notifications.telegram] or [notifications.macos] in velor.toml");
+        println!(
+            "No notifications enabled. Configure [notifications.telegram] or [notifications.macos] in velor.toml"
+        );
         return Ok(());
     }
 
@@ -504,7 +506,11 @@ fn run_test_notification(
 
     println!(
         "Sending test notification via: {}",
-        notifiers.iter().map(|n| n.name()).collect::<Vec<_>>().join(", ")
+        notifiers
+            .iter()
+            .map(|n| n.name())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     send_notifications(&notifiers, &payload);
@@ -537,9 +543,7 @@ fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::Auto(args)) => run_auto(args, home_cfg, git_root, cwd, &var_overrides),
         Some(Commands::Init) => run_init(git_root),
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root),
-        Some(Commands::TestNotification) => {
-            run_test_notification(home_cfg, git_root)
-        }
+        Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root),
         None => run_interactive_menu(home_cfg, git_root, cwd),
     }
 }
