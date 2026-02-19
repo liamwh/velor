@@ -1189,6 +1189,7 @@ struct AutoLoopResult {
 /// Returns `RetryError::Retryable` when all retries are exhausted.
 /// Returns `RetryError::TimeoutExceeded` when the absolute timeout is exceeded.
 #[tracing::instrument(level = "debug", ret, err, fields(runner = ?runner))]
+#[allow(clippy::too_many_arguments)]
 async fn execute_with_retry(
     runner: &AgentRunner,
     binary: &str,
