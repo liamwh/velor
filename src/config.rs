@@ -171,6 +171,54 @@ impl Default for NotificationsConfig {
     }
 }
 
+/// Communication protocol for agent interaction.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// Spawn subprocess with stdin/stdout (original behavior).
+    #[default]
+    Subprocess,
+    /// ACP (Agent Client Protocol) via stdio.
+    Acp,
+}
+
+/// Permission handling mode for ACP.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    /// Automatically allow all permission requests.
+    #[default]
+    Allow,
+    /// Automatically deny all permission requests.
+    Deny,
+    // Future: Interactive prompting for each request.
+    // Ask,
+}
+
+/// Configuration for ACP (Agent Client Protocol) mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AcpConfig {
+    /// Environment variable name for Anthropic API key.
+    pub api_key_env: String,
+
+    /// Permission handling mode.
+    pub permission_mode: PermissionMode,
+
+    /// Keep adapter process alive between prompts (recommended).
+    pub persist_adapter: bool,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            permission_mode: PermissionMode::Allow,
+            persist_adapter: true,
+        }
+    }
+}
+
 /// Configuration loaded from the TOML file.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct FileConfig {
@@ -202,6 +250,10 @@ pub struct FileConfig {
 /// Default values that can be overridden by CLI arguments.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Defaults {
+    /// Communication protocol for agent interaction.
+    #[serde(default)]
+    pub protocol: Protocol,
+
     /// Default permission mode for Claude (e.g. "acceptEdits").
     pub permission_mode: Option<String>,
 
@@ -235,6 +287,10 @@ pub struct Defaults {
     /// Absolute timeout for all retries combined in milliseconds.
     #[serde(default = "default_absolute_timeout_ms")]
     pub absolute_timeout_ms: u32,
+
+    /// ACP-specific configuration (only used when protocol = "acp").
+    #[serde(default)]
+    pub acp: AcpConfig,
 }
 
 /// Default value for the binary field.
@@ -304,6 +360,8 @@ impl Defaults {
     #[tracing::instrument(level = "debug", ret)]
     pub fn merge(self, overlay: Self) -> Self {
         Self {
+            // For protocol, overlay takes precedence (Subprocess is default)
+            protocol: overlay.protocol,
             permission_mode: overlay.permission_mode.or(self.permission_mode),
             prd_path: overlay.prd_path.or(self.prd_path),
             progress_path: overlay.progress_path.or(self.progress_path),
@@ -314,6 +372,8 @@ impl Defaults {
             max_retries: overlay.max_retries,
             base_backoff_ms: overlay.base_backoff_ms,
             absolute_timeout_ms: overlay.absolute_timeout_ms,
+            // For acp, overlay takes precedence
+            acp: overlay.acp,
         }
     }
 }
@@ -449,6 +509,7 @@ mod tests {
             max_retries: 3,
             base_backoff_ms: 50,
             absolute_timeout_ms: 3600000, // 1 hour
+            ..Default::default()
         };
 
         let overlay = Defaults {
@@ -462,6 +523,7 @@ mod tests {
             max_retries: 7,
             base_backoff_ms: 200,
             absolute_timeout_ms: 7200000, // 2 hours
+            ..Default::default()
         };
 
         let result = base.clone().merge(overlay);
@@ -1294,5 +1356,139 @@ sound = "Sosumi"
             .expect("macos should be set");
         assert!(macos.enabled);
         assert_eq!(macos.sound, Some("Sosumi".to_string()));
+    }
+
+    // ACP configuration tests
+    #[test]
+    fn test_protocol_default() {
+        let protocol = Protocol::default();
+        assert_eq!(protocol, Protocol::Subprocess);
+    }
+
+    #[test]
+    fn test_permission_mode_default() {
+        let mode = PermissionMode::default();
+        assert_eq!(mode, PermissionMode::Allow);
+    }
+
+    #[test]
+    fn test_acp_config_default() {
+        let config = AcpConfig::default();
+        assert_eq!(config.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(config.permission_mode, PermissionMode::Allow);
+        assert!(config.persist_adapter);
+    }
+
+    #[test]
+    fn test_acp_config_custom() {
+        let config = AcpConfig {
+            api_key_env: "CUSTOM_API_KEY".to_string(),
+            permission_mode: PermissionMode::Deny,
+            persist_adapter: false,
+        };
+        assert_eq!(config.api_key_env, "CUSTOM_API_KEY");
+        assert_eq!(config.permission_mode, PermissionMode::Deny);
+        assert!(!config.persist_adapter);
+    }
+
+    #[test]
+    fn test_protocol_subprocess_variant() {
+        // Test that Subprocess variant exists and equals itself
+        assert_eq!(Protocol::Subprocess, Protocol::Subprocess);
+        assert_ne!(Protocol::Subprocess, Protocol::Acp);
+    }
+
+    #[test]
+    fn test_protocol_acp_variant() {
+        // Test that Acp variant exists and equals itself
+        assert_eq!(Protocol::Acp, Protocol::Acp);
+        assert_ne!(Protocol::Acp, Protocol::Subprocess);
+    }
+
+    #[test]
+    fn test_permission_mode_allow_variant() {
+        // Test that Allow variant exists and equals itself
+        assert_eq!(PermissionMode::Allow, PermissionMode::Allow);
+        assert_ne!(PermissionMode::Allow, PermissionMode::Deny);
+    }
+
+    #[test]
+    fn test_permission_mode_deny_variant() {
+        // Test that Deny variant exists and equals itself
+        assert_eq!(PermissionMode::Deny, PermissionMode::Deny);
+        assert_ne!(PermissionMode::Deny, PermissionMode::Allow);
+    }
+
+    #[test]
+    fn test_load_config_with_acp_settings() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir should be created");
+        let config_path = temp_dir.path().join("test.toml");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[defaults]
+protocol = "acp"
+binary = "claude-agent-acp"
+
+[defaults.acp]
+api_key_env = "CUSTOM_KEY"
+permission_mode = "deny"
+persist_adapter = false
+"#,
+        )
+        .expect("config should be written");
+
+        let config = FileConfig::load_if_exists(&config_path)
+            .expect("config should load")
+            .expect("config should exist");
+
+        assert_eq!(config.defaults.protocol, Protocol::Acp);
+        assert_eq!(config.defaults.binary, "claude-agent-acp");
+        assert_eq!(config.defaults.acp.api_key_env, "CUSTOM_KEY");
+        assert_eq!(config.defaults.acp.permission_mode, PermissionMode::Deny);
+        assert!(!config.defaults.acp.persist_adapter);
+    }
+
+    #[test]
+    fn test_defaults_merge_protocol_acp_wins() {
+        let base = Defaults {
+            protocol: Protocol::Subprocess,
+            ..Default::default()
+        };
+
+        let overlay = Defaults {
+            protocol: Protocol::Acp,
+            ..Default::default()
+        };
+
+        let result = base.clone().merge(overlay);
+        assert_eq!(result.protocol, Protocol::Acp);
+    }
+
+    #[test]
+    fn test_defaults_merge_acp_config_overlay_wins() {
+        let base = Defaults {
+            acp: AcpConfig {
+                api_key_env: "BASE_KEY".to_string(),
+                permission_mode: PermissionMode::Allow,
+                persist_adapter: true,
+            },
+            ..Default::default()
+        };
+
+        let overlay = Defaults {
+            acp: AcpConfig {
+                api_key_env: "OVERLAY_KEY".to_string(),
+                permission_mode: PermissionMode::Deny,
+                persist_adapter: false,
+            },
+            ..Default::default()
+        };
+
+        let result = base.clone().merge(overlay);
+        assert_eq!(result.acp.api_key_env, "OVERLAY_KEY");
+        assert_eq!(result.acp.permission_mode, PermissionMode::Deny);
+        assert!(!result.acp.persist_adapter);
     }
 }
