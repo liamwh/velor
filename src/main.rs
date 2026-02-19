@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
+mod acp;
 mod claude;
 mod config;
 mod git;
