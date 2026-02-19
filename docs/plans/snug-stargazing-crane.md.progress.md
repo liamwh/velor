@@ -231,11 +231,36 @@ Added comprehensive tests to `src/acp.rs`:
 - Added `#[allow(clippy::too_many_arguments)]` to `execute_with_retry`
 - Removed unused import in test module
 
+### Step 9: Documentation ✅
+
+Created comprehensive `README.md` with:
+
+1. **Project Overview** - Description of Velor Agent CLI
+2. **Installation Instructions** - From source and using just
+3. **Quick Start** - Initialize, configure, and run
+4. **Configuration** - TOML-based config with home and project-level overrides
+5. **ACP Protocol Documentation**:
+   - Why ACP section explaining benefits
+   - Setup steps for claude-agent-acp
+   - Configuration examples for `[defaults.acp]`
+   - Permission modes table (allow/deny)
+   - Implemented features table
+6. **Templates** - MiniJinja syntax and built-in variables
+7. **Notifications** - Telegram and macOS configuration
+8. **CLI Usage** - All commands and flags
+9. **Development** - just commands
+10. **Architecture** - Module structure and diagram
+
+**Fixed code quality issues:**
+- Removed unused doc comments from `proptest!` macro invocations in `src/acp.rs`
+  - These warnings occurred because the macro doesn't support doc comments
+  - Tests are self-documenting via descriptive names
+
+**All tests pass**: 177 tests passing, no clippy warnings, code formatted
+
 ## Remaining Tasks
 
-### Step 9: Documentation
-- [ ] Update README with ACP configuration examples
-- [ ] Document claude-agent-acp setup steps
+None - All steps complete!
 
 ## Implementation Order Notes
 
@@ -248,7 +273,7 @@ The plan is designed to be implemented sequentially, with each step building on 
 6. Abstraction layer provides clean API ✅
 7. Main integration wires everything together ✅
 8. Tests verify correctness ✅
-9. Documentation helps users (NEXT)
+9. Documentation helps users ✅
 
 ## Configuration Example (when complete)
 
@@ -267,15 +292,21 @@ persist_adapter = true
 
 ## Next Priority Task
 
-**Step 9: Documentation** - This is the final step because:
-- Users need clear instructions for configuring ACP mode
-- Documentation explains how to install and use claude-agent-acp
-- Examples help users understand the new protocol option
-- Completes the feature for public use
+**None** - All steps complete!
+
+The ACP (Agent Client Protocol) support feature is fully implemented with:
+- Async architecture with tokio runtime
+- Cancellation support with CancellationToken
+- Configuration with Protocol enum and AcpConfig
+- ACP client module implementing acp::Client trait
+- AgentRunner abstraction layer for unified interface
+- Main integration with both subprocess and ACP modes
+- 177 passing tests (unit, property, and integration tests)
+- Comprehensive README documentation
 
 ## Date Completed
 
-2025-02-19 - Completed dependencies (Step 1), async main (Step 2), cancellation support (Step 3), configuration (Step 4), ACP client module (Step 5), abstraction layer (Step 6), main integration (Step 7), and comprehensive tests (Step 8)
+2025-02-19 - Completed dependencies (Step 1), async main (Step 2), cancellation support (Step 3), configuration (Step 4), ACP client module (Step 5), abstraction layer (Step 6), main integration (Step 7), comprehensive tests (Step 8), and documentation (Step 9)
 
 ## Commit History
 
