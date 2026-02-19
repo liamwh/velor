@@ -47,6 +47,9 @@ enum Commands {
 
     /// Generate an implementation plan from spec files using OpenAI
     Plan(PlanArgs),
+
+    /// Send a test notification to verify notification configuration
+    TestNotification,
 }
 
 /// Arguments common to both subcommands
@@ -467,6 +470,49 @@ fn run_plan(
     Ok(())
 }
 
+/// Runs the `test-notification` subcommand to verify notification configuration.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
+fn run_test_notification(
+    home_cfg: FileConfig,
+    git_root: std::path::PathBuf,
+) -> color_eyre::eyre::Result<()> {
+    // Load git repo config (optional, may not exist)
+    let config_path = FileConfig::default_config_path(&git_root);
+    let repo_cfg = FileConfig::load_if_exists(&config_path)
+        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
+        .unwrap_or_default();
+
+    // Merge: home config as base, repo config as overlay
+    let merged_cfg = FileConfig::merge(home_cfg, repo_cfg);
+
+    let notifiers = build_notifiers(&merged_cfg.notifications)?;
+
+    if notifiers.is_empty() {
+        println!("No notifications enabled. Configure [notifications.telegram] or [notifications.macos] in velor.toml");
+        return Ok(());
+    }
+
+    let payload = NotificationPayload {
+        mode: "test",
+        iterations_completed: 1,
+        max_iterations: 1,
+        duration: std::time::Duration::from_secs(0),
+        status: RunStatus::Completed,
+        output_preview: Some("This is a test notification from velor.".to_string()),
+        prompt_name: "test-notification".to_string(),
+    };
+
+    println!(
+        "Sending test notification via: {}",
+        notifiers.iter().map(|n| n.name()).collect::<Vec<_>>().join(", ")
+    );
+
+    send_notifications(&notifiers, &payload);
+
+    println!("Test notification sent!");
+    Ok(())
+}
+
 fn main() -> color_eyre::eyre::Result<()> {
     // Install color-eyre for better error reports
     color_eyre::install()?;
@@ -491,6 +537,9 @@ fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::Auto(args)) => run_auto(args, home_cfg, git_root, cwd, &var_overrides),
         Some(Commands::Init) => run_init(git_root),
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root),
+        Some(Commands::TestNotification) => {
+            run_test_notification(home_cfg, git_root)
+        }
         None => run_interactive_menu(home_cfg, git_root, cwd),
     }
 }

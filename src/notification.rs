@@ -1,13 +1,13 @@
 //! Notification system for Velor Agent CLI.
 //!
 //! This module provides notification capabilities that send messages when runs complete,
-//! reach max iterations, or fail. The first implementation is Telegram notifications.
+//! reach max iterations, or fail. Supports Telegram and macOS notifications.
 
 use color_eyre::eyre::{WrapErr, eyre};
 use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
 
-use crate::config::{NotificationsConfig, TelegramConfig, TelegramParseMode};
+use crate::config::{MacOSConfig, NotificationsConfig, TelegramConfig, TelegramParseMode};
 
 /// Result of a completed run for notifications.
 #[derive(Debug, Clone)]
@@ -66,6 +66,8 @@ impl RunStatus {
 pub enum Notifier {
     /// Telegram notifier.
     Telegram(TelegramNotifier),
+    /// macOS notifier.
+    MacOS(MacOSNotifier),
 }
 
 impl Notifier {
@@ -78,6 +80,7 @@ impl Notifier {
     pub fn notify(&self, payload: &NotificationPayload) -> color_eyre::eyre::Result<()> {
         match self {
             Self::Telegram(n) => n.notify(payload),
+            Self::MacOS(n) => n.notify(payload),
         }
     }
 
@@ -86,6 +89,7 @@ impl Notifier {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Telegram(_) => "Telegram",
+            Self::MacOS(_) => "macOS",
         }
     }
 }
@@ -201,6 +205,69 @@ impl TelegramNotifier {
     }
 }
 
+/// macOS notifier using osascript (AppleScript).
+#[derive(Debug)]
+pub struct MacOSNotifier {
+    /// Sound to play with notification.
+    sound: Option<String>,
+    /// Maximum characters for output preview.
+    output_preview_chars: u32,
+}
+
+impl MacOSNotifier {
+    /// Creates a new macOS notifier from configuration.
+    #[must_use]
+    pub fn new(config: &MacOSConfig, output_preview_chars: u32) -> Self {
+        Self {
+            sound: config.sound.clone(),
+            output_preview_chars,
+        }
+    }
+
+    /// Sends a notification via macOS Notification Center.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if osascript fails to execute.
+    #[tracing::instrument(level = "debug", ret, err, skip(self))]
+    pub fn notify(&self, payload: &NotificationPayload) -> color_eyre::eyre::Result<()> {
+        let title = format!(
+            "{} Velor Run {}",
+            payload.status.emoji(),
+            payload.status.label()
+        );
+        let message = format_macos_message(payload, self.output_preview_chars);
+
+        // Build AppleScript command
+        let sound_clause = self
+            .sound
+            .as_ref()
+            .map(|s| format!(" sound name \"{}\"", escape_applescript_string(s)))
+            .unwrap_or_default();
+
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"{}",
+            escape_applescript_string(&message),
+            escape_applescript_string(&title),
+            sound_clause
+        );
+
+        // Execute osascript
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .wrap_err("failed to execute osascript for macOS notification")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(eyre!("osascript failed: {}", stderr));
+        }
+
+        Ok(())
+    }
+}
+
 /// Formats a notification message for Telegram.
 ///
 /// This function is testable in isolation from HTTP transport.
@@ -275,6 +342,48 @@ pub fn escape_markdown_v2(text: &str) -> String {
     result
 }
 
+/// Formats a notification message for macOS (plain text).
+///
+/// # Arguments
+///
+/// * `payload` - The notification payload containing run details
+/// * `output_preview_chars` - Maximum characters for output preview
+///
+/// # Returns
+///
+/// A formatted message string, truncated to 200 characters (macOS notification limit).
+#[must_use]
+pub fn format_macos_message(payload: &NotificationPayload, output_preview_chars: u32) -> String {
+    let duration_str = humantime::format_duration(payload.duration);
+
+    let mut message = format!(
+        "Mode: {}\nPrompt: {}\nIterations: {}/{}\nDuration: {}",
+        payload.mode,
+        payload.prompt_name,
+        payload.iterations_completed,
+        payload.max_iterations,
+        duration_str
+    );
+
+    if let Some(preview) = &payload.output_preview {
+        let preview = strip_ansi_escapes::strip_str(preview);
+        let preview = truncate_str(&preview, output_preview_chars as usize);
+        if !preview.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(preview);
+        }
+    }
+
+    // macOS notifications have a character limit around 256 chars for the body
+    truncate_str(&message, 200).to_string()
+}
+
+/// Escapes special characters for AppleScript strings.
+#[must_use]
+pub fn escape_applescript_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Truncates a string to at most `max_len` characters, respecting character boundaries.
 #[must_use]
 fn truncate_str(s: &str, max_len: usize) -> &str {
@@ -304,6 +413,13 @@ pub fn build_notifiers(config: &NotificationsConfig) -> color_eyre::eyre::Result
     {
         let notifier = TelegramNotifier::new(telegram_config, config.output_preview_chars)?;
         notifiers.push(Notifier::Telegram(notifier));
+    }
+
+    if let Some(macos_config) = &config.macos
+        && macos_config.enabled
+    {
+        let notifier = MacOSNotifier::new(macos_config, config.output_preview_chars);
+        notifiers.push(Notifier::MacOS(notifier));
     }
 
     Ok(notifiers)
@@ -519,6 +635,93 @@ mod tests {
         assert!(!should_notify(RunStatus::Completed, &config));
         assert!(should_notify(RunStatus::MaxIterationsReached, &config));
         assert!(should_notify(RunStatus::Failed, &config));
+    }
+
+    // macOS notifier tests
+    #[test]
+    fn test_format_macos_message_completed() {
+        let payload = test_payload(RunStatus::Completed);
+        let message = format_macos_message(&payload, 500);
+
+        assert!(message.contains("Mode: auto"));
+        assert!(message.contains("Prompt: implement-plan"));
+        assert!(message.contains("Iterations: 5/25"));
+        assert!(message.contains("12m 34s"));
+    }
+
+    #[test]
+    fn test_format_macos_message_strips_ansi() {
+        let payload = test_payload(RunStatus::Completed);
+        let message = format_macos_message(&payload, 500);
+
+        // ANSI codes should be stripped
+        assert!(!message.contains("\x1b["));
+        assert!(!message.contains("[32m"));
+    }
+
+    #[test]
+    fn test_format_macos_message_truncated_to_200() {
+        let mut payload = test_payload(RunStatus::Completed);
+        // Create a very long output preview
+        payload.output_preview = Some("x".repeat(10_000));
+        let message = format_macos_message(&payload, 500);
+
+        assert!(
+            message.len() <= 200,
+            "Message length {} exceeds 200",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn test_escape_applescript_string_backslash() {
+        assert_eq!(escape_applescript_string("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn test_escape_applescript_string_quote() {
+        assert_eq!(
+            escape_applescript_string("say \"hello\""),
+            "say \\\"hello\\\""
+        );
+    }
+
+    #[test]
+    fn test_escape_applescript_string_both() {
+        assert_eq!(
+            escape_applescript_string("path\\to\"file\""),
+            "path\\\\to\\\"file\\\""
+        );
+    }
+
+    #[test]
+    fn test_escape_applescript_string_preserves_normal() {
+        let input = "Hello World 123! @#$%^&*()";
+        assert_eq!(escape_applescript_string(input), input);
+    }
+
+    #[test]
+    fn test_macos_notifier_new() {
+        let config = MacOSConfig {
+            enabled: true,
+            sound: Some("Sosumi".to_string()),
+        };
+        let notifier = MacOSNotifier::new(&config, 500);
+
+        assert_eq!(notifier.sound, Some("Sosumi".to_string()));
+        assert_eq!(notifier.output_preview_chars, 500);
+    }
+
+    #[test]
+    fn test_macos_notifier_new_no_sound() {
+        let config = MacOSConfig {
+            enabled: true,
+            sound: None,
+        };
+        let notifier = MacOSNotifier::new(&config, 300);
+
+        assert_eq!(notifier.sound, None);
+        assert_eq!(notifier.output_preview_chars, 300);
     }
 }
 
@@ -766,5 +969,73 @@ mod wiremock_tests {
         unsafe {
             std::env::remove_var("SKIP_TEST_TOKEN");
         }
+    }
+
+    #[test]
+    fn test_build_notifiers_creates_macos() {
+        let config = NotificationsConfig {
+            enabled: true,
+            macos: Some(MacOSConfig {
+                enabled: true,
+                sound: Some("default".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let notifiers = build_notifiers(&config).expect("should build notifiers");
+        assert_eq!(notifiers.len(), 1);
+        assert_eq!(notifiers[0].name(), "macOS");
+    }
+
+    #[test]
+    fn test_build_notifiers_creates_both() {
+        unsafe {
+            std::env::set_var("BOTH_TEST_TOKEN", "test_token");
+        }
+
+        let config = NotificationsConfig {
+            enabled: true,
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                bot_token_env: "BOTH_TEST_TOKEN".to_string(),
+                chat_id: "-1001234567890".to_string(),
+                api_base_url: None,
+                parse_mode: Some(TelegramParseMode::MarkdownV2),
+            }),
+            macos: Some(MacOSConfig {
+                enabled: true,
+                sound: Some("Sosumi".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let notifiers = build_notifiers(&config).expect("should build notifiers");
+        assert_eq!(notifiers.len(), 2);
+
+        let names: Vec<&str> = notifiers.iter().map(|n| n.name()).collect();
+        assert!(
+            names.contains(&"Telegram"),
+            "Should contain Telegram notifier"
+        );
+        assert!(names.contains(&"macOS"), "Should contain macOS notifier");
+
+        unsafe {
+            std::env::remove_var("BOTH_TEST_TOKEN");
+        }
+    }
+
+    #[test]
+    fn test_build_notifiers_skips_disabled_macos() {
+        let config = NotificationsConfig {
+            enabled: true,
+            macos: Some(MacOSConfig {
+                enabled: false, // Disabled
+                sound: Some("default".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let notifiers = build_notifiers(&config).expect("should build notifiers");
+        assert!(notifiers.is_empty());
     }
 }
