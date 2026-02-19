@@ -20,7 +20,7 @@ mod retry;
 mod template;
 mod tui;
 
-use claude::{require_claude_on_path, run_claude};
+use claude::{AgentRunner, require_claude_on_path};
 use config::FileConfig;
 use notification::{
     NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify,
@@ -749,7 +749,21 @@ async fn run_once(
     require_claude_on_path(&binary)?;
 
     println!("Running Claude with prompt '{prompt_name}'...");
-    run_claude(&binary, &permission_mode, &rendered, &prompt_name)?;
+
+    // Create agent runner based on configured protocol
+    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, file_cfg.defaults.acp);
+
+    // Run the agent (no callback for streaming output in this mode)
+    runner
+        .run(
+            &binary,
+            &permission_mode,
+            &rendered,
+            &prompt_name,
+            &cwd,
+            None,
+        )
+        .await?;
     Ok(())
 }
 
@@ -871,8 +885,11 @@ async fn run_auto(
 
     let no_notify = args.no_notify;
 
+    // Create agent runner based on configured protocol
+    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, file_cfg.defaults.acp);
+
     let result = run_auto_loop(
-        iterations,
+        &runner,
         &binary,
         &permission_mode,
         &template_str,
@@ -880,7 +897,10 @@ async fn run_auto(
         &complete_token,
         &prompt_name,
         &retry_config,
-    );
+        &cwd,
+        iterations,
+    )
+    .await;
 
     // Handle result and send notifications
     match result {
@@ -1021,8 +1041,8 @@ fn build_runtime_vars(
 /// Returns an error if a Claude invocation fails after all retries.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "debug", ret)]
-fn run_auto_loop(
-    iterations: u32,
+async fn run_auto_loop(
+    runner: &AgentRunner,
     binary: &str,
     permission_mode: &str,
     template_str: &str,
@@ -1030,6 +1050,8 @@ fn run_auto_loop(
     complete_token: &str,
     prompt_name: &str,
     retry_config: &RetryConfig,
+    cwd: &std::path::Path,
+    iterations: u32,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1068,13 +1090,16 @@ fn run_auto_loop(
 
         // Execute with retry logic
         let retry_result = execute_with_retry(
+            runner,
             binary,
             permission_mode,
             &prompt_with_context,
             prompt_name,
             current_iteration,
             retry_config,
-        );
+            cwd,
+        )
+        .await;
 
         match retry_result {
             Ok(result) => {
@@ -1163,14 +1188,16 @@ struct AutoLoopResult {
 /// Returns `RetryError::Permanent` for non-retryable errors.
 /// Returns `RetryError::Retryable` when all retries are exhausted.
 /// Returns `RetryError::TimeoutExceeded` when the absolute timeout is exceeded.
-#[tracing::instrument(level = "debug", ret, err)]
-fn execute_with_retry(
+#[tracing::instrument(level = "debug", ret, err, fields(runner = ?runner))]
+async fn execute_with_retry(
+    runner: &AgentRunner,
     binary: &str,
     permission_mode: &str,
     prompt: &str,
     prompt_name: &str,
     iteration: u32,
     config: &RetryConfig,
+    cwd: &std::path::Path,
 ) -> Result<claude::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let retry_start = std::time::Instant::now();
@@ -1191,14 +1218,17 @@ fn execute_with_retry(
                 delay.as_millis(),
                 attempt
             );
-            std::thread::sleep(delay);
+            tokio::time::sleep(delay).await;
             println!(
                 "🔄 Retry attempt {attempt}/{} for iteration {iteration}...",
                 config.max_retries
             );
         }
 
-        match run_claude(binary, permission_mode, prompt, prompt_name) {
+        match runner
+            .run(binary, permission_mode, prompt, prompt_name, cwd, None)
+            .await
+        {
             Ok(result) => {
                 if attempt > 1 {
                     println!("✅ Retry {attempt} succeeded for iteration {iteration}");
