@@ -337,7 +337,7 @@ openai_model = "gpt-4o"
 /// Creates the `.velor` directory and a default `velor.toml` configuration file.
 /// Automatically migrates existing `agent-cli.toml` to `velor.toml` if found.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
-fn run_init(git_root: std::path::PathBuf) -> color_eyre::eyre::Result<()> {
+async fn run_init(git_root: std::path::PathBuf) -> color_eyre::eyre::Result<()> {
     let velor_dir = git_root.join(".velor");
     let config_path = velor_dir.join("velor.toml");
     let old_config_path = velor_dir.join("agent-cli.toml");
@@ -396,7 +396,7 @@ fn run_init(git_root: std::path::PathBuf) -> color_eyre::eyre::Result<()> {
 ///
 /// Returns an error if spec files are not found, API key is missing, or the API call fails.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
-fn run_plan(
+async fn run_plan(
     args: PlanArgs,
     home_cfg: FileConfig,
     git_root: std::path::PathBuf,
@@ -472,7 +472,7 @@ fn run_plan(
 
 /// Runs the `test-notification` subcommand to verify notification configuration.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
-fn run_test_notification(
+async fn run_test_notification(
     home_cfg: FileConfig,
     git_root: std::path::PathBuf,
 ) -> color_eyre::eyre::Result<()> {
@@ -519,7 +519,8 @@ fn run_test_notification(
     Ok(())
 }
 
-fn main() -> color_eyre::eyre::Result<()> {
+#[tokio::main]
+async fn main() -> color_eyre::eyre::Result<()> {
     // Install color-eyre for better error reports
     color_eyre::install()?;
 
@@ -539,18 +540,18 @@ fn main() -> color_eyre::eyre::Result<()> {
         .unwrap_or_default();
 
     match cli.command {
-        Some(Commands::Once(args)) => run_once(args, home_cfg, git_root, cwd, &var_overrides),
-        Some(Commands::Auto(args)) => run_auto(args, home_cfg, git_root, cwd, &var_overrides),
-        Some(Commands::Init) => run_init(git_root),
-        Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root),
-        Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root),
-        None => run_interactive_menu(home_cfg, git_root, cwd),
+        Some(Commands::Once(args)) => run_once(args, home_cfg, git_root, cwd, &var_overrides).await,
+        Some(Commands::Auto(args)) => run_auto(args, home_cfg, git_root, cwd, &var_overrides).await,
+        Some(Commands::Init) => run_init(git_root).await,
+        Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root).await,
+        Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root).await,
+        None => run_interactive_menu(home_cfg, git_root, cwd).await,
     }
 }
 
 /// Runs the interactive TUI menu when no subcommand is provided.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
-fn run_interactive_menu(
+async fn run_interactive_menu(
     home_cfg: FileConfig,
     git_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
@@ -579,7 +580,7 @@ fn run_interactive_menu(
             git_root,
             cwd,
             &[],
-        ),
+        ).await,
         MenuChoice::Auto => run_auto(
             AutoArgs {
                 common: CommonArgs {
@@ -603,8 +604,8 @@ fn run_interactive_menu(
             git_root,
             cwd,
             &[],
-        ),
-        MenuChoice::Init => run_init(git_root),
+        ).await,
+        MenuChoice::Init => run_init(git_root).await,
         MenuChoice::Plan => run_plan(
             PlanArgs {
                 config: None,
@@ -617,7 +618,7 @@ fn run_interactive_menu(
             },
             home_cfg,
             git_root,
-        ),
+        ).await,
         MenuChoice::Quit => Ok(()),
     }
 }
@@ -633,7 +634,7 @@ enum RunMode {
 
 /// Runs the `once` subcommand.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display(), cwd = %cwd.display()))]
-fn run_once(
+async fn run_once(
     args: OnceArgs,
     home_cfg: FileConfig,
     git_root: std::path::PathBuf,
@@ -722,7 +723,7 @@ fn run_once(
 
 /// Runs the `auto` subcommand.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display(), cwd = %cwd.display()))]
-fn run_auto(
+async fn run_auto(
     args: AutoArgs,
     home_cfg: FileConfig,
     git_root: std::path::PathBuf,
