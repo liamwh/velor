@@ -284,4 +284,4 @@ persist_adapter = true
 - `f148503` - feat(main): convert to async architecture with tokio
 - `f3eb7fc` - feat(config): add ACP protocol configuration support
 - `9768e2c` - feat(cancellation): add CancellationToken support and Ctrl+C handler
-- (To be committed) - test(acp): add comprehensive tests for ACP module with 13 new tests
+- `f89d9c4` - test(acp): add comprehensive tests for ACP module with 13 new tests
