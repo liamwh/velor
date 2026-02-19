@@ -1,9 +1,14 @@
-//! Interface to the Claude CLI.
+//! Interface to the Claude CLI and ACP agent.
 //!
-//! This module provides functionality to interact with the Anthropic Claude CLI,
-//! checking for its presence on the system and running it with appropriate arguments.
+//! This module provides functionality to interact with AI agents via:
+//! - Subprocess spawning (original method with Claude CLI)
+//! - ACP (Agent Client Protocol) for structured communication
 
+use crate::acp::{self, ChunkCallback};
+use crate::config::{AcpConfig, Protocol};
+use color_eyre::eyre::WrapErr;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -12,6 +17,101 @@ use std::thread;
 pub struct ClaudeRunResult {
     /// The standard output from Claude.
     pub stdout: String,
+}
+
+/// Agent runner that supports both subprocess and ACP protocols.
+///
+/// This enum provides a unified interface for running AI agents using either
+/// the traditional subprocess spawning method or the ACP protocol.
+#[derive(Debug, Clone)]
+pub enum AgentRunner {
+    /// Spawn subprocess with stdin/stdout (original behavior).
+    Subprocess,
+    /// ACP (Agent Client Protocol) via stdio.
+    Acp(AcpConfig),
+}
+
+impl AgentRunner {
+    /// Creates a new `AgentRunner` from the protocol configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `protocol` - The communication protocol to use
+    /// * `acp_config` - ACP configuration (only used when protocol is Acp)
+    #[must_use]
+    pub fn from_config(protocol: Protocol, acp_config: AcpConfig) -> Self {
+        match protocol {
+            Protocol::Subprocess => Self::Subprocess,
+            Protocol::Acp => Self::Acp(acp_config),
+        }
+    }
+
+    /// Runs the agent with the given parameters.
+    ///
+    /// This is an async method that dispatches to the appropriate implementation
+    /// based on the runner variant. For subprocess mode, the synchronous call
+    /// is wrapped in `spawn_blocking` to avoid blocking the async runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `binary` - Path to the agent binary (e.g., "claude-glm" or "claude-agent-acp")
+    /// * `permission_mode` - Permission mode for subprocess mode (e.g., "acceptEdits")
+    /// * `prompt` - The rendered prompt text to send
+    /// * `prompt_name` - Name of the prompt for logging
+    /// * `cwd` - Current working directory
+    /// * `on_chunk` - Optional callback for streaming output chunks
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent cannot be executed, fails, or returns non-zero exit code.
+    #[tracing::instrument(level = "debug", fields(binary = %binary, prompt_name = %prompt_name, runner = ?self), skip(on_chunk), ret, err)]
+    pub async fn run(
+        &self,
+        binary: &str,
+        permission_mode: &str,
+        prompt: &str,
+        prompt_name: &str,
+        cwd: &Path,
+        on_chunk: Option<ChunkCallback>,
+    ) -> color_eyre::eyre::Result<ClaudeRunResult> {
+        match self {
+            Self::Subprocess => {
+                // Wrap sync subprocess call in spawn_blocking to avoid blocking async runtime
+                let binary = binary.to_string();
+                let permission_mode = permission_mode.to_string();
+                let prompt = prompt.to_string();
+                let prompt_name = prompt_name.to_string();
+
+                tokio::task::spawn_blocking(move || {
+                    run_claude(&binary, &permission_mode, &prompt, &prompt_name)
+                })
+                .await
+                .wrap_err("subprocess task failed")?
+            }
+            Self::Acp(config) => {
+                // ACP mode is natively async
+                let acp_result =
+                    acp::run_acp(binary, prompt, prompt_name, config, cwd, on_chunk).await?;
+
+                // Convert AcpRunResult to ClaudeRunResult for compatibility
+                Ok(ClaudeRunResult {
+                    stdout: acp_result.stdout,
+                })
+            }
+        }
+    }
+
+    /// Returns `true` if this is an ACP runner.
+    #[must_use]
+    pub const fn is_acp(&self) -> bool {
+        matches!(self, Self::Acp(_))
+    }
+
+    /// Returns `true` if this is a subprocess runner.
+    #[must_use]
+    pub const fn is_subprocess(&self) -> bool {
+        matches!(self, Self::Subprocess)
+    }
 }
 
 /// Verifies that the Claude CLI is available on PATH.
@@ -319,5 +419,74 @@ mod tests {
 
         let out = concat_text_items(&items);
         assert_eq!(out, Some("AB".to_string()), "expected concatenated text");
+    }
+}
+
+#[cfg(test)]
+mod agent_runner_tests {
+    use super::*;
+    use crate::config::{AcpConfig, PermissionMode, Protocol};
+
+    #[test]
+    fn test_agent_runner_from_config_subprocess() {
+        let acp_config = AcpConfig::default();
+        let runner = AgentRunner::from_config(Protocol::Subprocess, acp_config);
+
+        assert!(runner.is_subprocess(), "expected subprocess runner");
+        assert!(!runner.is_acp(), "expected non-acp runner");
+    }
+
+    #[test]
+    fn test_agent_runner_from_config_acp() {
+        let acp_config = AcpConfig {
+            api_key_env: "CUSTOM_KEY".to_string(),
+            permission_mode: PermissionMode::Deny,
+            persist_adapter: false,
+        };
+        let runner = AgentRunner::from_config(Protocol::Acp, acp_config);
+
+        assert!(runner.is_acp(), "expected acp runner");
+        assert!(!runner.is_subprocess(), "expected non-subprocess runner");
+    }
+
+    #[test]
+    fn test_agent_runner_is_acp() {
+        let runner = AgentRunner::Acp(AcpConfig::default());
+        assert!(runner.is_acp(), "Acp variant should return true for is_acp");
+        assert!(
+            !runner.is_subprocess(),
+            "Acp variant should return false for is_subprocess"
+        );
+    }
+
+    #[test]
+    fn test_agent_runner_is_subprocess() {
+        let runner = AgentRunner::Subprocess;
+        assert!(
+            runner.is_subprocess(),
+            "Subprocess variant should return true for is_subprocess"
+        );
+        assert!(
+            !runner.is_acp(),
+            "Subprocess variant should return false for is_acp"
+        );
+    }
+
+    #[test]
+    fn test_agent_runner_clone() {
+        let acp_config = AcpConfig::default();
+        let runner = AgentRunner::from_config(Protocol::Acp, acp_config);
+        let _cloned = runner.clone();
+        // Just verifying that Clone is implemented
+    }
+
+    #[test]
+    fn test_agent_runner_debug() {
+        let runner = AgentRunner::Subprocess;
+        let debug_str = format!("{:?}", runner);
+        assert!(
+            debug_str.contains("Subprocess"),
+            "Debug output should contain Subprocess"
+        );
     }
 }

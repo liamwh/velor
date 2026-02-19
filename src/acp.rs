@@ -9,7 +9,7 @@
 use agent_client_protocol as acp;
 // Import Agent trait so its methods are available on ClientSideConnection
 use acp::Agent;
-use color_eyre::eyre::{eyre, WrapErr};
+use color_eyre::eyre::{WrapErr, eyre};
 use std::path::Path;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -246,9 +246,7 @@ pub async fn run_acp(
     cwd: &Path,
     _on_chunk: Option<ChunkCallback>,
 ) -> color_eyre::eyre::Result<AcpRunResult> {
-    tracing::info!(
-        "🤖 Invoking {binary} via ACP protocol (prompt: '{prompt_name}')..."
-    );
+    tracing::info!("🤖 Invoking {binary} via ACP protocol (prompt: '{prompt_name}')...");
 
     // Canonicalize cwd (ACP requires absolute paths)
     let cwd = cwd
@@ -295,9 +293,10 @@ pub async fn run_acp(
     let _result = local_set
         .run_until(async move {
             // Create the ACP client-side connection
-            let (conn, handle_io) = acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
-                tokio::task::spawn_local(fut);
-            });
+            let (conn, handle_io) =
+                acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
+                    tokio::task::spawn_local(fut);
+                });
 
             // Handle I/O in the background
             tokio::task::spawn_local(handle_io);
@@ -333,7 +332,9 @@ pub async fn run_acp(
             // Send the prompt using builder pattern
             conn.prompt(acp::PromptRequest::new(
                 session_id,
-                vec![acp::ContentBlock::Text(acp::TextContent::new(prompt.to_string()))],
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    prompt.to_string(),
+                ))],
             ))
             .await
             .map_err(|e| eyre!("ACP prompt failed: {e}"))?;
@@ -373,7 +374,10 @@ mod tests {
         let result = AcpRunResult {
             stdout: "test output".to_string(),
         };
-        assert_eq!(format!("{:?}", result), "AcpRunResult { stdout: \"test output\" }");
+        assert_eq!(
+            format!("{:?}", result),
+            "AcpRunResult { stdout: \"test output\" }"
+        );
     }
 }
 
