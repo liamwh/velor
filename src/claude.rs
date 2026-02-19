@@ -103,12 +103,14 @@ impl AgentRunner {
 
     /// Returns `true` if this is an ACP runner.
     #[must_use]
+    #[allow(dead_code)]
     pub const fn is_acp(&self) -> bool {
         matches!(self, Self::Acp(_))
     }
 
     /// Returns `true` if this is a subprocess runner.
     #[must_use]
+    #[allow(dead_code)]
     pub const fn is_subprocess(&self) -> bool {
         matches!(self, Self::Subprocess)
     }
