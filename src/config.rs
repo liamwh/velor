@@ -111,6 +111,26 @@ impl Default for TelegramConfig {
     }
 }
 
+/// Configuration for macOS notifications.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MacOSConfig {
+    /// Whether macOS notifications are enabled.
+    pub enabled: bool,
+
+    /// Sound to play (e.g., "default", "Basso", "Sosumi", or empty for silent).
+    pub sound: Option<String>,
+}
+
+impl Default for MacOSConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sound: Some("default".to_string()),
+        }
+    }
+}
+
 /// Configuration for notifications.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -132,6 +152,9 @@ pub struct NotificationsConfig {
 
     /// Telegram notification configuration.
     pub telegram: Option<TelegramConfig>,
+
+    /// macOS notification configuration.
+    pub macos: Option<MacOSConfig>,
 }
 
 impl Default for NotificationsConfig {
@@ -143,6 +166,7 @@ impl Default for NotificationsConfig {
             notify_on_failure: true,
             output_preview_chars: 500,
             telegram: None,
+            macos: None,
         }
     }
 }
@@ -1082,6 +1106,14 @@ mod proptest_tests {
         assert!(config.notify_on_failure);
         assert_eq!(config.output_preview_chars, 500);
         assert!(config.telegram.is_none());
+        assert!(config.macos.is_none());
+    }
+
+    #[test]
+    fn test_macos_config_default() {
+        let config = MacOSConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.sound, Some("default".to_string()));
     }
 
     #[test]
@@ -1115,6 +1147,10 @@ mod proptest_tests {
                 api_base_url: Some("https://proxy.example.com".to_string()),
                 parse_mode: Some(TelegramParseMode::Html),
             }),
+            macos: Some(MacOSConfig {
+                enabled: true,
+                sound: Some("Sosumi".to_string()),
+            }),
         };
 
         assert!(config.enabled);
@@ -1132,6 +1168,10 @@ mod proptest_tests {
             Some("https://proxy.example.com".to_string())
         );
         assert_eq!(tg.parse_mode, Some(TelegramParseMode::Html));
+
+        let macos = config.macos.as_ref().expect("macos should be set");
+        assert!(macos.enabled);
+        assert_eq!(macos.sound, Some("Sosumi".to_string()));
     }
 
     // Test loading TOML with notifications section
@@ -1202,5 +1242,57 @@ parse_mode = "MarkdownV2"
         // Overlay should win
         assert!(result.notifications.enabled);
         assert_eq!(result.notifications.output_preview_chars, 1000);
+    }
+
+    // Test loading TOML with notifications including macOS section
+    #[test]
+    fn test_load_config_with_notifications_and_macos() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir should be created");
+        let config_path = temp_dir.path().join("test.toml");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[notifications]
+enabled = true
+notify_on_success = true
+notify_on_max_iterations = true
+notify_on_failure = true
+output_preview_chars = 500
+
+[notifications.telegram]
+enabled = true
+bot_token_env = "MY_BOT_TOKEN"
+chat_id = "-1001234567890"
+parse_mode = "MarkdownV2"
+
+[notifications.macos]
+enabled = true
+sound = "Sosumi"
+"#,
+        )
+        .expect("config should be written");
+
+        let config = FileConfig::load_if_exists(&config_path)
+            .expect("config should load")
+            .expect("config should exist");
+
+        assert!(config.notifications.enabled);
+
+        let tg = config
+            .notifications
+            .telegram
+            .as_ref()
+            .expect("telegram should be set");
+        assert!(tg.enabled);
+        assert_eq!(tg.bot_token_env, "MY_BOT_TOKEN");
+
+        let macos = config
+            .notifications
+            .macos
+            .as_ref()
+            .expect("macos should be set");
+        assert!(macos.enabled);
+        assert_eq!(macos.sound, Some("Sosumi".to_string()));
     }
 }

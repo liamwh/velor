@@ -92,6 +92,10 @@ edit-config:
 show-prompts:
     @grep -E '^\[prompts\.' .velor/velor.toml | sed 's/\[prompts\.//g' | sed 's/\]//g'
 
+# Test notification configuration
+test-notification:
+    cargo build -q && ./target/debug/velor test-notification
+
 # List all justfile recipes
 default:
     @just --list
