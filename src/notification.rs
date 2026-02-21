@@ -459,7 +459,7 @@ mod tests {
         NotificationPayload {
             mode: "auto",
             iterations_completed: 5,
-            max_iterations: 25,
+            max_iterations: 50,
             duration: Duration::from_secs(754), // 12m 34s
             status,
             output_preview: Some("Test output with ANSI: \x1b[32mgreen\x1b[0m".to_string()),
@@ -493,7 +493,7 @@ mod tests {
         assert!(message.contains("Completed"));
         assert!(message.contains("Mode: auto"));
         assert!(message.contains("Prompt: implement-plan"));
-        assert!(message.contains("Iterations: 5/25"));
+        assert!(message.contains("Iterations: 5/50"));
         assert!(message.contains("12m 34s"));
     }
 
@@ -645,7 +645,7 @@ mod tests {
 
         assert!(message.contains("Mode: auto"));
         assert!(message.contains("Prompt: implement-plan"));
-        assert!(message.contains("Iterations: 5/25"));
+        assert!(message.contains("Iterations: 5/50"));
         assert!(message.contains("12m 34s"));
     }
 

@@ -4,17 +4,26 @@
 # Customise the values below to suit your project's needs.
 
 [defaults]
+# Communication protocol: "subprocess" (default) or "acp"
+protocol = "subprocess"
+
 # Default permission mode for Claude (accepts edit suggestions automatically)
 permission_mode = "acceptEdits"
 
-# Claude binary to use (e.g. "claude", "claude-glm", etc.)
+# Claude binary to use (e.g. "claude", "claude-glm", "claude-acp", etc.)
 binary = "claude-glm"
+
+# ACP-specific configuration (only used when protocol = "acp")
+[defaults.acp]
+api_key_env = "ZAI_API_KEY"
+permission_mode = "allow"
+persist_adapter = true
 
 # Default progress file for tracking work
 progress_path = ".velor/progress.md"
 
 # Default iterations for auto-mode
-iterations = 25
+iterations = 50
 
 # Default prompt name
 prompt = "once"
@@ -45,6 +54,17 @@ check_cmd = "just check"
 
 # Named prompt templates
 [prompts]
+# Simple test prompt for ACP
+acp-test = """
+You are connected via the Agent Control Protocol (ACP).
+Please respond with a brief message confirming:
+1. You received this message
+2. What model you're using
+3. A fun fact about Rust
+
+Keep it brief - 2-3 sentences max.
+"""
+
 # Single-shot prompt for one-off tasks
 once = """
 1. study {{pin}}.
