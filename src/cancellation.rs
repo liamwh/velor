@@ -4,8 +4,8 @@
 //! 1. First Ctrl+C: Signals graceful shutdown (complete current iteration, then stop)
 //! 2. Second Ctrl+C within 3 seconds: Force quit immediately
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -93,7 +93,9 @@ impl CancellationHandler {
     /// Returns `true` if graceful shutdown has been requested (first Ctrl+C).
     #[must_use]
     pub fn graceful_shutdown_requested(&self) -> bool {
-        self.inner.graceful_shutdown_requested.load(Ordering::SeqCst)
+        self.inner
+            .graceful_shutdown_requested
+            .load(Ordering::SeqCst)
     }
 
     /// Returns `true` if force cancellation has been requested (second Ctrl+C within window).
@@ -118,8 +120,12 @@ impl CancellationHandler {
     /// Resets the graceful shutdown flag (useful for testing or continuing after interruption).
     #[allow(dead_code)]
     pub fn reset(&self) {
-        self.inner.graceful_shutdown_requested.store(false, Ordering::SeqCst);
-        self.inner.force_cancel_requested.store(false, Ordering::SeqCst);
+        self.inner
+            .graceful_shutdown_requested
+            .store(false, Ordering::SeqCst);
+        self.inner
+            .force_cancel_requested
+            .store(false, Ordering::SeqCst);
         self.inner.first_press_time.store(0, Ordering::SeqCst);
     }
 }
@@ -154,8 +160,14 @@ mod tests {
     #[test]
     fn test_cancellation_handler_reset() {
         let (handler, _token) = CancellationHandler::new();
-        handler.inner.graceful_shutdown_requested.store(true, Ordering::SeqCst);
-        handler.inner.force_cancel_requested.store(true, Ordering::SeqCst);
+        handler
+            .inner
+            .graceful_shutdown_requested
+            .store(true, Ordering::SeqCst);
+        handler
+            .inner
+            .force_cancel_requested
+            .store(true, Ordering::SeqCst);
 
         handler.reset();
 

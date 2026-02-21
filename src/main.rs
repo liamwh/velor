@@ -347,6 +347,9 @@ openai_model = "gpt-4o"
 enabled = false
 directory = ".agents/rules"
 max_mid_iteration_injections = 2
+# Enable intelligent rule selection via ACP
+intelligent_selection = false
+intelligent_selection_max_rules = 5
 "#;
 
 /// Runs the `init` subcommand to initialise a new repository with velor config.
@@ -1125,6 +1128,7 @@ fn build_runtime_vars(
 /// * `state` - Persistent rules state across iterations
 /// * `config` - Rules configuration (max_mid_iteration_injections)
 /// * `iteration` - Current iteration number (for logging)
+/// * `intelligent_rules` - Optional intelligently selected rules for this iteration
 ///
 /// # Errors
 ///
@@ -1138,6 +1142,7 @@ async fn run_auto_iteration_with_session(
     state: &Arc<Mutex<RulesState>>,
     config: &config::RulesConfig,
     iteration: u32,
+    intelligent_rules: Option<&[rules::Rule]>,
 ) -> color_eyre::eyre::Result<String> {
     let mut injections = 0u32;
     let max = config.max_mid_iteration_injections;
@@ -1145,10 +1150,15 @@ async fn run_auto_iteration_with_session(
     let mut all_files_read = Vec::new();
     let mut files_delta = Vec::new(); // Rolling delta for chaining activations
 
-    // Select rules for initial prompt (always_apply rules only at first)
+    // Select rules for initial prompt (always_apply, glob-based, and intelligent rules)
     let initial_rules = {
         let state_guard = state.lock().await;
-        select_rules(rules_set, &state_guard)
+        rules::select_rules_with_intelligent(
+            rules_set,
+            &state_guard,
+            intelligent_rules,
+            config.intelligent_selection_max_rules,
+        )
         // Lock dropped here
     };
 
@@ -1474,7 +1484,8 @@ async fn run_auto_loop(
 /// Runs a single auto-mode iteration with ACP session for multi-turn rule injection.
 ///
 /// This is a helper function that creates an ACP session, runs the iteration with
-/// multi-turn rule injection, and closes the session.
+/// multi-turn rule injection, and closes the session. If intelligent selection is
+/// enabled, it first creates a separate session to select relevant rules.
 ///
 /// # Arguments
 ///
@@ -1489,7 +1500,7 @@ async fn run_auto_loop(
 ///
 /// # Errors
 ///
-/// Returns an error if session creation, turn execution, or session close fails.
+/// Returns an error if session creation, turn execution, intelligent selection, or session close fails.
 #[allow(clippy::too_many_arguments)]
 async fn run_auto_iteration_acp(
     binary: &str,
@@ -1501,18 +1512,134 @@ async fn run_auto_iteration_acp(
     iteration: u32,
     cwd: &Path,
 ) -> color_eyre::eyre::Result<String> {
-    // Create ACP session for this iteration
+    // Step 1: Intelligent rule selection (if enabled)
+    let intelligent_rules = if config.intelligent_selection && !rules_set.intelligent.is_empty() {
+        tracing::info!(
+            "Iteration {}: Running intelligent selection for {} rules",
+            iteration,
+            rules_set.intelligent.len()
+        );
+
+        match select_intelligent_rules_acp(
+            binary,
+            acp_config,
+            &rules_set.intelligent,
+            prompt,
+            config.intelligent_selection_max_rules,
+            cwd,
+        )
+        .await
+        {
+            Ok(rules) => {
+                tracing::info!(
+                    "Iteration {}: Selected {} intelligent rules: {:?}",
+                    iteration,
+                    rules.len(),
+                    rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+                );
+                Some(rules)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Iteration {}: Intelligent selection failed: {e}. Proceeding without intelligent rules.",
+                    iteration
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Step 2: Create ACP session for this iteration
     let mut session = acp::AcpSession::new(binary, acp_config, cwd).await?;
 
-    // Run iteration with multi-turn rule injection
-    let output =
-        run_auto_iteration_with_session(&mut session, prompt, rules_set, state, config, iteration)
-            .await?;
+    // Step 3: Run iteration with multi-turn rule injection
+    let output = run_auto_iteration_with_session(
+        &mut session,
+        prompt,
+        rules_set,
+        state,
+        config,
+        iteration,
+        intelligent_rules.as_deref(),
+    )
+    .await?;
 
-    // Close the session
+    // Step 4: Close the session
     session.close().await?;
 
     Ok(output)
+}
+
+/// Performs intelligent rule selection using a separate ACP session.
+///
+/// This function creates a short-lived ACP session to ask the agent which
+/// rules are relevant for the current task. The selected rules are then
+/// returned for use in the main iteration.
+///
+/// # Arguments
+///
+/// * `binary` - Path to the ACP adapter binary
+/// * `acp_config` - ACP configuration
+/// * `intelligent_rules` - Rules that are candidates for intelligent selection
+/// * `task_preview` - Preview of the current task
+/// * `max_rules` - Maximum number of rules to select
+/// * `cwd` - Current working directory
+///
+/// # Errors
+///
+/// Returns an error if session creation, prompt sending, or response parsing fails.
+#[allow(clippy::too_many_arguments)]
+async fn select_intelligent_rules_acp(
+    binary: &str,
+    acp_config: &config::AcpConfig,
+    intelligent_rules: &[rules::Rule],
+    task_preview: &str,
+    max_rules: usize,
+    cwd: &Path,
+) -> color_eyre::eyre::Result<Vec<rules::Rule>> {
+    use rules::{build_intelligent_selection_prompt, parse_intelligent_selection_response};
+    use std::collections::HashSet;
+
+    if intelligent_rules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build allowed names set for validation
+    let allowed_names: HashSet<_> = intelligent_rules.iter().map(|r| r.name.as_str()).collect();
+
+    // Build the selection prompt
+    let selection_prompt = build_intelligent_selection_prompt(intelligent_rules, task_preview);
+
+    tracing::debug!("Sending intelligent selection prompt...");
+
+    // Create a short-lived session for selection
+    let mut session = acp::AcpSession::new(binary, acp_config, cwd).await?;
+
+    // Run the selection prompt
+    let turn_result = session
+        .run_turn(&selection_prompt, "intelligent_selection")
+        .await?;
+
+    // Close the selection session
+    session.close().await?;
+
+    // Parse the response
+    let selected_names = parse_intelligent_selection_response(&turn_result.output, &allowed_names)
+        .wrap_err("Failed to parse intelligent selection response")?;
+
+    // Cap the number of rules and map names to Rule objects
+    let selected: Vec<_> = intelligent_rules
+        .iter()
+        .filter(|r| selected_names.contains(&r.name))
+        .take(max_rules)
+        .cloned()
+        .collect();
+
+    tracing::debug!("Intelligent selection returned {} rules", selected.len());
+
+    Ok(selected)
 }
 
 /// Result of running the auto loop.

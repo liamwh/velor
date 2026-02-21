@@ -140,6 +140,25 @@ pub struct RulesConfig {
 
     /// Directory for rule definitions (relative to git root).
     pub directory: String,
+
+    /// Maximum number of follow-up prompts per iteration for glob-based rule injection.
+    ///
+    /// This prevents infinite loops when rules trigger other rules in a chain.
+    /// Default: 2
+    pub max_mid_iteration_injections: u32,
+
+    /// Whether to use intelligent selection for rules without always_apply or globs.
+    ///
+    /// When enabled, rules that don't have always_apply: true or glob patterns
+    /// are selected via ACP based on the current task.
+    /// Default: false
+    pub intelligent_selection: bool,
+
+    /// Maximum number of intelligent rules to select per iteration.
+    ///
+    /// Prevents overwhelming the agent with too many rules.
+    /// Default: 5
+    pub intelligent_selection_max_rules: usize,
 }
 
 impl Default for RulesConfig {
@@ -147,6 +166,9 @@ impl Default for RulesConfig {
         Self {
             enabled: false,
             directory: ".agents/rules".to_string(),
+            max_mid_iteration_injections: 2,
+            intelligent_selection: false,
+            intelligent_selection_max_rules: 5,
         }
     }
 }
