@@ -89,8 +89,7 @@ impl AgentRunner {
             Self::Acp(config) => {
                 // ACP mode is natively async
                 tracing::info!("AgentRunner::run: entering ACP mode with binary {}", binary);
-                let acp_result =
-                    acp::run_acp(binary, prompt, prompt_name, config, cwd).await?;
+                let acp_result = acp::run_acp(binary, prompt, prompt_name, config, cwd).await?;
                 tracing::info!("AgentRunner::run: ACP run completed");
 
                 // Convert AcpRunResult to ClaudeRunResult for compatibility

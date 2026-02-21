@@ -44,7 +44,7 @@ repo_name = "my-repo"
 
 # Important file paths - customise for your project
 pin = "AGENTS.md" # Pinned information to the start of each agent
-implementation_plan = "~/.claude/plans/vast-hugging-puffin.md"
+plan = "~/.claude/plans/vast-hugging-puffin.md"
 rust_rules_file = ".agents/rules/rust.mdc"
 
 # Development commands - customise for your project
@@ -68,7 +68,7 @@ Keep it brief - 2-3 sentences max.
 # Single-shot prompt for one-off tasks
 once = """
 1. study {{pin}}.
-2. study {{implementation_plan}} and select the most important task to do next. Work ONLY on that ONE task.
+2. study {{plan}} and select the most important task to do next. Work ONLY on that ONE task.
 3. study {{rust_rules_file}}
 IMPORTANT:
 - Author property tests, snapshot tests, and/or unit tests (whichever combination you think is best)
@@ -83,7 +83,7 @@ If, while implementing the feature, you notice the plan is complete, output exac
 # Auto-mode prompt for iterative development with auto-implement-plan
 auto-implement-plan = """
 1. study {{pin}}.
-2. study {{implementation_plan}} and select the most important task to do next. Work ONLY on that ONE task. This should be the one YOU decide has the highest priority, not necessarily the first thing you see.
+2. study {{plan}} and select the most important task to do next. Work ONLY on that ONE task. This should be the one YOU decide has the highest priority, not necessarily the first thing you see.
 3. study {{rust_rules_file}}
 4. If, while implementing the feature, you notice the entire plan is complete, with all best-practices followed from end to end, double-check the entire plan's implementation for any possible improvements (don't trust the progress file, double-check everything), and if it's really completely and perfectly implemented, then output exactly this text: "{{complete_token}}". Otherwise, DO NOT OUTPUT {{complete_token}}, but instead just stop.
 IMPORTANT:
@@ -91,7 +91,7 @@ IMPORTANT:
 - After making the changes to the files run the tests
 - When the task is done, tests pass and {{check_cmd}} runs without errors or warnings, create a detailed commit (don't push) your work (only).
 - Update any other spec files if necessary.
-- Leave a summary of your progress at {{implementation_plan}}.progress.md.
+- Leave a summary of your progress at {{plan}}.progress.md.
 """
 
 [conversation_db]
@@ -104,4 +104,4 @@ retention_days = 0
 specs_dir = "specs"
 plan_max_iterations = 10
 openai_api_key_env = "OPENAI_API_KEY"
-openai_model = "gpt-4o"
+openai_model = "gpt-5.2"

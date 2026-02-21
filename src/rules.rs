@@ -140,9 +140,8 @@ pub struct RulesSet {
     pub always_apply: Vec<Rule>,
     /// Rules that apply based on glob pattern matching.
     pub glob_based: Vec<Rule>,
-    /// Rules that apply via intelligent selection (not used in MVP).
-    #[allow(dead_code)]
-    intelligent: Vec<Rule>,
+    /// Rules that apply via intelligent selection.
+    pub intelligent: Vec<Rule>,
 }
 
 impl RulesSet {
@@ -822,6 +821,188 @@ pub fn validate_rules_directory(git_root: &Path, rules_dir: &Path) -> Result<Pat
     Ok(canonical_rules_dir)
 }
 
+/// Response structure for intelligent rule selection.
+///
+/// The agent should respond with JSON in this format.
+#[derive(Debug, Deserialize)]
+pub struct IntelligentSelectionResponse {
+    /// Names of selected rules.
+    pub rules: Vec<String>,
+    /// Optional reasoning for the selection (not used, for logging only).
+    #[serde(default)]
+    pub reasoning: String,
+}
+
+/// Builds the intelligent rule selection prompt.
+///
+/// # Arguments
+///
+/// * `rules` - Rules to select from (intelligent rules only)
+/// * `task_preview` - Preview of the current task
+///
+/// # Returns
+///
+/// A prompt string requesting intelligent rule selection.
+#[must_use]
+pub fn build_intelligent_selection_prompt(rules: &[Rule], task_preview: &str) -> String {
+    let descriptions: String = rules
+        .iter()
+        .map(|r| format!("- {}: {}", r.name, r.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Cap task preview to prevent abuse
+    let task_preview_capped = if task_preview.len() > 500 {
+        format!("{}...", &task_preview[..500])
+    } else {
+        task_preview.to_string()
+    };
+
+    format!(
+        r#"You are selecting relevant project rules for the current task.
+
+Available rules:
+{descriptions}
+
+Task:
+{task_preview_capped}
+
+Respond ONLY with valid JSON in this exact format:
+{{"rules":["rule_name_1","rule_name_2"],"reasoning":"Brief explanation..."}}
+
+Respond with {{"rules":[],"reasoning":"none"}} if no rules apply."#
+    )
+}
+
+/// Parses the intelligent selection response from agent output.
+///
+/// # Arguments
+///
+/// * `output` - Raw output from the agent
+/// * `allowed_names` - Set of valid rule names for validation
+///
+/// # Errors
+///
+/// Returns an error if the JSON cannot be parsed.
+pub fn parse_intelligent_selection_response(
+    output: &str,
+    allowed_names: &HashSet<&str>,
+) -> Result<Vec<String>> {
+    // Cap output to prevent abuse
+    let output_capped = if output.len() > 4096 {
+        tracing::warn!("Intelligent selection output exceeded 4096 bytes, truncating");
+        &output[..4096]
+    } else {
+        output
+    };
+
+    // Try parsing as JSON directly first
+    let selection: IntelligentSelectionResponse = serde_json::from_str(output_capped)
+        .or_else(|_| extract_json_from_markdown(output_capped))?;
+
+    // Validate: reject any rule name not in the offered set
+    let rule_names: Vec<_> = selection
+        .rules
+        .into_iter()
+        .filter(|name| allowed_names.contains(name.as_str()))
+        .collect();
+
+    tracing::debug!(
+        "Intelligent selection parsed: {} rules selected (valid)",
+        rule_names.len()
+    );
+
+    Ok(rule_names)
+}
+
+/// Extracts JSON from a markdown code block.
+///
+/// This is a fallback for when the agent wraps the JSON in markdown code blocks.
+///
+/// # Arguments
+///
+/// * `text` - Text that may contain a JSON code block
+///
+/// # Errors
+///
+/// Returns an error if no valid JSON is found.
+fn extract_json_from_markdown(text: &str) -> Result<IntelligentSelectionResponse> {
+    use regex::Regex;
+
+    // Look for ```json ... ``` blocks
+    let re = Regex::new(r"```json\s*(\{.*?\})\s*```")
+        .map_err(|e| eyre!("Failed to compile regex: {e}"))?;
+
+    if let Some(caps) = re.captures(text) {
+        return serde_json::from_str(&caps[1]).map_err(Into::into);
+    }
+
+    // Try looking for ``` ... ``` blocks (no language specified)
+    let re_plain =
+        Regex::new(r"```\s*(\{.*?\})\s*```").map_err(|e| eyre!("Failed to compile regex: {e}"))?;
+
+    if let Some(caps) = re_plain.captures(text) {
+        return serde_json::from_str(&caps[1]).map_err(Into::into);
+    }
+
+    // Try parsing entire text as JSON
+    serde_json::from_str(text).map_err(Into::into)
+}
+
+/// Selects rules for injection with deterministic ordering including intelligent rules.
+///
+/// Order (deterministic for reproducibility):
+/// 1. `alwaysApply` rules (sorted by filename)
+/// 2. Glob-matched rules (sorted by filename)
+/// 3. Intelligent rules (sorted, capped)
+///
+/// # Arguments
+///
+/// * `rules_set` - All discovered rules
+/// * `state` - Current rules state
+/// * `intelligent_rules` - Optional intelligently selected rules
+/// * `max_intelligent` - Maximum number of intelligent rules to include
+///
+/// # Returns
+///
+/// Selected rules with injected set updated.
+#[must_use]
+pub fn select_rules_with_intelligent(
+    rules_set: &RulesSet,
+    state: &RulesState,
+    intelligent_rules: Option<&[Rule]>,
+    max_intelligent: usize,
+) -> SelectedRules {
+    let mut selected = SelectedRules::new(state.injected_rules().clone());
+
+    // 1. Always-apply rules (every iteration, sorted by name)
+    let mut always = rules_set.always_apply.clone();
+    always.sort_by(|a, b| a.name.cmp(&b.name));
+    for rule in always {
+        selected.add(rule);
+    }
+
+    // 2. Glob-based rules (from files read, sorted by name)
+    let mut glob_matches: Vec<_> = state.match_globs_for_files(&rules_set.glob_based);
+    glob_matches.sort_by(|a, b| a.name.cmp(&b.name));
+    for rule in glob_matches {
+        selected.add(rule.clone());
+    }
+
+    // 3. Intelligent rules (sorted, capped)
+    if let Some(intelligent) = intelligent_rules {
+        let mut sorted: Vec<_> = intelligent.to_vec();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Filter out already-injected rules and cap the count
+        for rule in sorted.into_iter().take(max_intelligent) {
+            selected.add(rule);
+        }
+    }
+
+    selected
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1119,6 +1300,277 @@ This is the content."#;
         // We can't test fully without actual files, but we can test the logic
         // For now, just ensure it doesn't panic
         drop(result);
+    }
+
+    /// Test build_intelligent_selection_prompt with multiple rules.
+    #[test]
+    fn test_build_intelligent_selection_prompt() {
+        let rules = vec![
+            Rule::new(
+                "rust".to_string(),
+                "Rust coding guidelines".to_string(),
+                vec![],
+                false,
+                "Content".to_string(),
+            ),
+            Rule::new(
+                "python".to_string(),
+                "Python best practices".to_string(),
+                vec![],
+                false,
+                "Content".to_string(),
+            ),
+        ];
+
+        let prompt = build_intelligent_selection_prompt(&rules, "Fix a bug in main.rs");
+
+        assert!(prompt.contains("rust: Rust coding guidelines"));
+        assert!(prompt.contains("python: Python best practices"));
+        assert!(prompt.contains("Fix a bug in main.rs"));
+        assert!(prompt.contains(
+            r#"{"rules":["rule_name_1","rule_name_2"],"reasoning":"Brief explanation..."}"#
+        ));
+    }
+
+    /// Test build_intelligent_selection_prompt caps long task preview.
+    #[test]
+    fn test_build_intelligent_selection_prompt_caps_long_task() {
+        let rules = vec![Rule::new(
+            "test".to_string(),
+            "Test rule".to_string(),
+            vec![],
+            false,
+            "Content".to_string(),
+        )];
+
+        let long_task = "a".repeat(600);
+        let prompt = build_intelligent_selection_prompt(&rules, &long_task);
+
+        // Task preview should be capped with "..."
+        assert!(prompt.contains("..."));
+        // Prompt should still contain important parts
+        assert!(prompt.contains("test: Test rule"));
+    }
+
+    /// Test parse_intelligent_selection_response with valid JSON.
+    #[test]
+    fn test_parse_intelligent_selection_response_valid() {
+        let output = r#"{"rules":["rust","python"],"reasoning":"Both are relevant"}"#;
+        let mut allowed = HashSet::new();
+        allowed.insert("rust");
+        allowed.insert("python");
+        allowed.insert("javascript");
+
+        let result = parse_intelligent_selection_response(output, &allowed).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"rust".to_string()));
+        assert!(result.contains(&"python".to_string()));
+    }
+
+    /// Test parse_intelligent_selection_response filters out invalid rule names.
+    #[test]
+    fn test_parse_intelligent_selection_response_filters_invalid() {
+        let output = r#"{"rules":["rust","unknown_rule","python"],"reasoning":"test"}"#;
+        let mut allowed = HashSet::new();
+        allowed.insert("rust");
+        allowed.insert("python");
+
+        let result = parse_intelligent_selection_response(output, &allowed).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"rust".to_string()));
+        assert!(result.contains(&"python".to_string()));
+        assert!(!result.iter().any(|r| r == "unknown_rule"));
+    }
+
+    /// Test parse_intelligent_selection_response handles empty rules.
+    #[test]
+    fn test_parse_intelligent_selection_response_empty() {
+        let output = r#"{"rules":[],"reasoning":"none"}"#;
+        let allowed = HashSet::new();
+
+        let result = parse_intelligent_selection_response(output, &allowed).unwrap();
+
+        assert_eq!(result.len(), 0);
+    }
+
+    /// Test extract_json_from_markdown extracts JSON from code blocks.
+    #[test]
+    fn test_extract_json_from_markdown_with_code_block() {
+        let text = r#"Here's my response:
+
+```json
+{"rules":["rust","python"],"reasoning":"test"}
+```
+
+That's it."#;
+
+        let result: IntelligentSelectionResponse = extract_json_from_markdown(text).unwrap();
+
+        assert_eq!(result.rules.len(), 2);
+        assert!(result.rules.contains(&"rust".to_string()));
+        assert!(result.rules.contains(&"python".to_string()));
+    }
+
+    /// Test extract_json_from_markdown handles plain JSON.
+    #[test]
+    fn test_extract_json_from_markdown_plain_json() {
+        let text = r#"{"rules":["rust"],"reasoning":"test"}"#;
+
+        let result: IntelligentSelectionResponse = extract_json_from_markdown(text).unwrap();
+
+        assert_eq!(result.rules.len(), 1);
+        assert_eq!(result.rules[0], "rust");
+    }
+
+    /// Test extract_json_from_markdown handles code blocks without language.
+    #[test]
+    fn test_extract_json_from_markdown_plain_code_block() {
+        let text = r#"```
+{"rules":["rust"],"reasoning":"test"}
+```"#;
+
+        let result: IntelligentSelectionResponse = extract_json_from_markdown(text).unwrap();
+
+        assert_eq!(result.rules.len(), 1);
+        assert_eq!(result.rules[0], "rust");
+    }
+
+    /// Test select_rules_with_intelligent includes intelligent rules.
+    #[test]
+    fn test_select_rules_with_intelligent() {
+        let mut rules_set = RulesSet::new();
+
+        // Add always-apply rule
+        rules_set.add_rule(Rule::new(
+            "always".to_string(),
+            "Always".to_string(),
+            vec![],
+            true,
+            "Content".to_string(),
+        ));
+
+        // Add glob-based rule (should NOT be selected since no files read)
+        rules_set.add_rule(Rule::new(
+            "globbed".to_string(),
+            "Globbed".to_string(),
+            vec!["*.rs".to_string()],
+            false,
+            "Content".to_string(),
+        ));
+
+        // Add intelligent rule
+        let intelligent_rule = Rule::new(
+            "intelligent".to_string(),
+            "Intelligent".to_string(),
+            vec![],
+            false,
+            "Content".to_string(),
+        );
+
+        let state = RulesState::new();
+        let selected = select_rules_with_intelligent(
+            &rules_set,
+            &state,
+            Some(&[intelligent_rule]),
+            10, // max_intelligent
+        );
+
+        // Should only include always-apply + intelligent (glob-based not selected since no files read)
+        assert_eq!(selected.rules.len(), 2);
+        assert!(selected.injected.contains("always"));
+        assert!(!selected.injected.contains("globbed"));
+        assert!(selected.injected.contains("intelligent"));
+    }
+
+    /// Test select_rules_with_intelligent caps intelligent rules.
+    #[test]
+    fn test_select_rules_with_intelligent_caps_rules() {
+        let rules_set = RulesSet::new();
+        let state = RulesState::new();
+
+        let intelligent_rules = vec![
+            Rule::new(
+                "rule1".to_string(),
+                "Rule 1".to_string(),
+                vec![],
+                false,
+                "Content".to_string(),
+            ),
+            Rule::new(
+                "rule2".to_string(),
+                "Rule 2".to_string(),
+                vec![],
+                false,
+                "Content".to_string(),
+            ),
+            Rule::new(
+                "rule3".to_string(),
+                "Rule 3".to_string(),
+                vec![],
+                false,
+                "Content".to_string(),
+            ),
+        ];
+
+        let selected = select_rules_with_intelligent(
+            &rules_set,
+            &state,
+            Some(&intelligent_rules),
+            2, // max_intelligent = 2
+        );
+
+        // Should only include 2 intelligent rules (alphabetically sorted)
+        let intelligent_count: usize = selected
+            .rules
+            .iter()
+            .filter(|r| intelligent_rules.iter().any(|ir| ir.name == r.name))
+            .count();
+        assert_eq!(intelligent_count, 2);
+    }
+
+    /// Test select_rules_with_intelligent without intelligent rules.
+    #[test]
+    fn test_select_rules_with_intelligent_no_intelligent() {
+        let mut rules_set = RulesSet::new();
+
+        rules_set.add_rule(Rule::new(
+            "always".to_string(),
+            "Always".to_string(),
+            vec![],
+            true,
+            "Content".to_string(),
+        ));
+
+        let state = RulesState::new();
+        let selected = select_rules_with_intelligent(&rules_set, &state, None, 10);
+
+        assert_eq!(selected.rules.len(), 1);
+        assert!(selected.injected.contains("always"));
+    }
+
+    /// Test select_rules_with_intelligent filters already-injected intelligent rules.
+    #[test]
+    fn test_select_rules_with_intelligent_filters_injected() {
+        let rules_set = RulesSet::new();
+
+        let intelligent_rule = Rule::new(
+            "intelligent".to_string(),
+            "Intelligent".to_string(),
+            vec![],
+            false,
+            "Content".to_string(),
+        );
+
+        let mut state = RulesState::new();
+        state.mark_injected("intelligent".to_string());
+
+        let selected =
+            select_rules_with_intelligent(&rules_set, &state, Some(&[intelligent_rule]), 10);
+
+        // The intelligent rule should NOT be included since it's already injected
+        assert_eq!(selected.rules.len(), 0);
     }
 }
 
