@@ -8,6 +8,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use color_eyre::eyre::WrapErr;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 mod acp;
 mod cancellation;
@@ -30,7 +31,11 @@ use notification::{
 };
 use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
-use rules::{RulesCache, RulesState, inject_rules, select_rules};
+use rules::{
+    RulesCache, RulesState, build_follow_up_prompt_delta, check_new_glob_matches,
+    get_rules_by_names, inject_rules, select_rules,
+};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// Velor Agent CLI - Run autonomous agents with Claude AI.
@@ -341,6 +346,7 @@ openai_model = "gpt-4o"
 [rules]
 enabled = false
 directory = ".agents/rules"
+max_mid_iteration_injections = 2
 "#;
 
 /// Runs the `init` subcommand to initialise a new repository with velor config.
@@ -927,8 +933,11 @@ async fn run_auto(
 
     let no_notify = args.no_notify;
 
+    // Clone acp config before using it (since AgentRunner takes ownership)
+    let acp_config = file_cfg.defaults.acp.clone();
+
     // Create agent runner based on configured protocol
-    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, file_cfg.defaults.acp);
+    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, acp_config);
 
     // Load rules if enabled for auto mode
     let rules_cache = if file_cfg.rules.enabled {
@@ -966,6 +975,9 @@ async fn run_auto(
         iterations,
         &cancel_handler,
         rules_set_ref,
+        &git_root,
+        &file_cfg.defaults.acp,
+        &file_cfg.rules,
     )
     .await;
 
@@ -1099,9 +1111,148 @@ fn build_runtime_vars(
     ]
 }
 
+/// Runs a single auto-mode iteration with multi-turn rule injection.
+///
+/// This function implements Phase 3 of the rules system: glob-based rule activation
+/// with mid-iteration injection. When the agent reads files matching glob patterns,
+/// new rules are injected via follow-up prompts within the same iteration.
+///
+/// # Arguments
+///
+/// * `session` - Active ACP session for multi-turn communication
+/// * `prompt` - The rendered prompt for this iteration
+/// * `rules_set` - All discovered rules
+/// * `state` - Persistent rules state across iterations
+/// * `config` - Rules configuration (max_mid_iteration_injections)
+/// * `iteration` - Current iteration number (for logging)
+///
+/// # Errors
+///
+/// Returns an error if a turn fails or ACP communication fails.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", ret, err)]
+async fn run_auto_iteration_with_session(
+    session: &mut acp::AcpSession,
+    prompt: &str,
+    rules_set: &rules::RulesSet,
+    state: &Arc<Mutex<RulesState>>,
+    config: &config::RulesConfig,
+    iteration: u32,
+) -> color_eyre::eyre::Result<String> {
+    let mut injections = 0u32;
+    let max = config.max_mid_iteration_injections;
+    let mut all_output = String::new();
+    let mut all_files_read = Vec::new();
+    let mut files_delta = Vec::new(); // Rolling delta for chaining activations
+
+    // Select rules for initial prompt (always_apply rules only at first)
+    let initial_rules = {
+        let state_guard = state.lock().await;
+        select_rules(rules_set, &state_guard)
+        // Lock dropped here
+    };
+
+    // TURN A: Initial prompt with always-apply rules
+    let prompt_with_rules = inject_rules(prompt, &initial_rules.rules);
+    tracing::debug!(
+        "Iteration {}: sending initial prompt with {} rules",
+        iteration,
+        initial_rules.rules.len()
+    );
+
+    let turn_result = session
+        .run_turn(
+            &prompt_with_rules,
+            &format!("iteration_{}_turn_a", iteration),
+        )
+        .await?;
+
+    all_output.push_str(&turn_result.output);
+    all_files_read.extend(turn_result.files_read.clone());
+    files_delta = turn_result.files_read;
+
+    // Update state with files read
+    {
+        let mut state_guard = state.lock().await;
+        for file in &files_delta {
+            state_guard.record_file_read(file.clone());
+        }
+        // Mark initial rules as injected
+        for rule in &initial_rules.rules {
+            state_guard.mark_injected(rule.name().to_string());
+        }
+        // Lock dropped
+    }
+
+    // Multi-turn loop for glob-based rule injection
+    loop {
+        // Check for new glob matches using current delta
+        let new_rule_names = {
+            let state_guard = state.lock().await;
+            check_new_glob_matches(rules_set, &files_delta, state_guard.injected_rules())
+            // Lock dropped
+        };
+
+        if new_rule_names.is_empty() || injections >= max {
+            tracing::debug!(
+                "Iteration {}: ending multi-turn (new_rules={}, injections={}/{})",
+                iteration,
+                new_rule_names.len(),
+                injections,
+                max
+            );
+            return Ok(all_output);
+        }
+
+        tracing::info!(
+            "Iteration {}: found {} new glob-based rules to inject: {:?}",
+            iteration,
+            new_rule_names.len(),
+            new_rule_names
+        );
+
+        // Fetch rule contents for formatting
+        let new_rules = get_rules_by_names(rules_set, &new_rule_names);
+
+        // Mark new rules as injected
+        {
+            let mut state_guard = state.lock().await;
+            for name in &new_rule_names {
+                state_guard.mark_injected(name.clone());
+            }
+            // Lock dropped
+        }
+
+        // TURN B, C, etc.: Follow-up prompt with new rules
+        let follow_up = build_follow_up_prompt_delta(&files_delta, &new_rules);
+        let turn_name = format!("iteration_{}_turn_{}", iteration, injections + 2);
+
+        let turn_result = session.run_turn(&follow_up, &turn_name).await?;
+
+        all_output.push_str(&turn_result.output);
+        all_files_read.extend(turn_result.files_read.clone());
+        files_delta = turn_result.files_read;
+
+        // Update state with new files read
+        {
+            let mut state_guard = state.lock().await;
+            for file in &files_delta {
+                state_guard.record_file_read(file.clone());
+            }
+            // Lock dropped
+        }
+
+        injections += 1;
+    }
+
+    // Should never reach here, but needed for type safety
+    unreachable!("Multi-turn loop should always return from within")
+}
+
 /// Runs the auto-mode loop until completion or max iterations.
 ///
 /// Includes crash resilience with exponential backoff retries and context preservation.
+/// For ACP mode with rules enabled, supports multi-turn per iteration for glob-based rule injection.
 ///
 /// # Errors
 ///
@@ -1121,11 +1272,18 @@ async fn run_auto_loop(
     iterations: u32,
     cancel_handler: &CancellationHandler,
     rules_set: Option<&rules::RulesSet>,
+    git_root: &std::path::Path,
+    acp_config: &config::AcpConfig,
+    rules_config: &config::RulesConfig,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
     let mut history = ConversationHistory::new();
     let mut final_output = String::new();
+
+    // Create persistent RulesState across iterations for glob-based rule tracking
+    let rules_state = Arc::new(Mutex::new(RulesState::new()));
+    let use_acp_session = rules_set.is_some() && runner.is_acp() && rules_config.enabled;
 
     while current_iteration <= iterations {
         // Check for force cancellation at the start of each iteration
@@ -1172,109 +1330,135 @@ async fn run_auto_loop(
             })?
         };
 
-        // Inject rules if available
-        let prompt_with_rules = if let Some(rules_set) = rules_set {
-            let state = rules::RulesState::new();
-            let selected = select_rules(rules_set, &state);
-            inject_rules(&rendered_prompt, &selected.rules)
+        // Execute iteration with appropriate mode
+        let iteration_output = if use_acp_session {
+            // ACP mode with rules enabled: use multi-turn session
+            match run_auto_iteration_acp(
+                binary,
+                acp_config,
+                &rendered_prompt,
+                rules_set.unwrap(), // Safe to unwrap because we checked use_acp_session
+                &rules_state,
+                rules_config,
+                current_iteration,
+                cwd,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    // Treat as retryable error
+                    let msg = format!("ACP iteration failed: {e}");
+                    println!("⚠️  All retries exhausted for iteration {current_iteration}");
+                    println!("📝 Preserving context for crash recovery...");
+                    println!("💡 The iteration will be retried with previous context prepended.");
+
+                    history.add(
+                        current_iteration,
+                        &rendered_prompt,
+                        &format!("<FAILED: {msg}>"),
+                    );
+                    continue; // Retry same iteration
+                }
+            }
         } else {
-            rendered_prompt.clone()
-        };
+            // Subprocess mode or rules disabled: use traditional single-shot
+            let prompt_with_rules = if let Some(rules_set) = rules_set {
+                let state = rules_state.lock().await;
+                let selected = select_rules(rules_set, &state);
+                inject_rules(&rendered_prompt, &selected.rules)
+            } else {
+                rendered_prompt.clone()
+            };
 
-        println!("📋 Prompt:\n{prompt_with_rules}");
-        println!("────────────────────────────────────────");
+            println!("📋 Prompt:\n{prompt_with_rules}");
+            println!("────────────────────────────────────────");
 
-        // Execute with retry logic
-        let retry_result = execute_with_retry(
-            runner,
-            binary,
-            permission_mode,
-            &prompt_with_rules,
-            prompt_name,
-            current_iteration,
-            retry_config,
-            cwd,
-            cancel_handler.token(),
-        )
-        .await;
+            // Execute with retry logic
+            let retry_result = execute_with_retry(
+                runner,
+                binary,
+                permission_mode,
+                &prompt_with_rules,
+                prompt_name,
+                current_iteration,
+                retry_config,
+                cwd,
+                cancel_handler.token(),
+            )
+            .await;
 
-        match retry_result {
-            Ok(result) => {
-                // Store final output for notification preview
-                final_output = result.stdout.clone();
-
-                // Success - clear history and continue
-                if !history.is_empty() {
-                    println!("✅ Crash recovery successful for iteration {current_iteration}");
+            match retry_result {
+                Ok(result) => result.stdout,
+                Err(RetryError::Permanent(e)) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "permanent failure on iteration {current_iteration}: {e}"
+                    ));
                 }
-                history.clear();
-
-                if result.stdout.contains(complete_token) {
-                    println!("✅ PRD complete, exiting.");
-                    return Ok(AutoLoopResult {
-                        status: RunStatus::Completed,
-                        iterations_completed: current_iteration,
-                        max_iterations: iterations,
-                        duration: start_time.elapsed(),
-                        output: final_output,
-                    });
+                Err(RetryError::TimeoutExceeded(e)) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "timeout exceeded on iteration {current_iteration}: {e}"
+                    ));
                 }
-
-                // Check if graceful shutdown was requested - stop after current iteration
-                let should_stop_after_this = cancel_handler.graceful_shutdown_requested();
-                if should_stop_after_this {
-                    println!("✅ Graceful shutdown: stopping after iteration {current_iteration}");
+                Err(RetryError::Cancelled) => {
+                    println!("\n🛑 Cancelled by user during iteration {current_iteration}");
                     return Ok(AutoLoopResult {
                         status: RunStatus::Cancelled,
-                        iterations_completed: current_iteration,
+                        iterations_completed: current_iteration - 1,
                         max_iterations: iterations,
                         duration: start_time.elapsed(),
                         output: final_output,
                     });
                 }
+                Err(RetryError::Retryable(e)) => {
+                    println!("⚠️  All retries exhausted for iteration {current_iteration}");
+                    println!("📝 Preserving context for crash recovery...");
+                    println!("💡 The iteration will be retried with previous context prepended.");
 
-                current_iteration += 1;
+                    history.add(
+                        current_iteration,
+                        &rendered_prompt,
+                        &format!("<FAILED: {e}>"),
+                    );
+                    continue; // Retry same iteration
+                }
             }
-            Err(RetryError::Permanent(e)) => {
-                // Permanent failure - give up
-                return Err(color_eyre::eyre::eyre!(
-                    "permanent failure on iteration {current_iteration}: {e}"
-                ));
-            }
-            Err(RetryError::TimeoutExceeded(e)) => {
-                // Timeout exceeded - give up
-                return Err(color_eyre::eyre::eyre!(
-                    "timeout exceeded on iteration {current_iteration}: {e}"
-                ));
-            }
-            Err(RetryError::Cancelled) => {
-                // User cancelled - exit gracefully
-                println!("\n🛑 Cancelled by user during iteration {current_iteration}");
-                return Ok(AutoLoopResult {
-                    status: RunStatus::Cancelled,
-                    iterations_completed: current_iteration - 1,
-                    max_iterations: iterations,
-                    duration: start_time.elapsed(),
-                    output: final_output,
-                });
-            }
-            Err(RetryError::Retryable(e)) => {
-                // All retries exhausted - preserve context and retry same iteration
-                println!("⚠️  All retries exhausted for iteration {current_iteration}");
-                println!("📝 Preserving context for crash recovery...");
-                println!("💡 The iteration will be retried with previous context prepended.");
+        };
 
-                // Add failed attempt to history for context
-                history.add(
-                    current_iteration,
-                    &prompt_with_rules,
-                    &format!("<FAILED: {e}>"),
-                );
+        // Store final output for notification preview
+        final_output = iteration_output.clone();
 
-                // Continue loop without incrementing iteration
-                // This will retry with context prepended
-            }
+        // Success - clear history and continue
+        if !history.is_empty() {
+            println!("✅ Crash recovery successful for iteration {current_iteration}");
         }
+        history.clear();
+
+        if iteration_output.contains(complete_token) {
+            println!("✅ PRD complete, exiting.");
+            return Ok(AutoLoopResult {
+                status: RunStatus::Completed,
+                iterations_completed: current_iteration,
+                max_iterations: iterations,
+                duration: start_time.elapsed(),
+                output: final_output,
+            });
+        }
+
+        // Check if graceful shutdown was requested - stop after current iteration
+        let should_stop_after_this = cancel_handler.graceful_shutdown_requested();
+        if should_stop_after_this {
+            println!("✅ Graceful shutdown: stopping after iteration {current_iteration}");
+            return Ok(AutoLoopResult {
+                status: RunStatus::Cancelled,
+                iterations_completed: current_iteration,
+                max_iterations: iterations,
+                duration: start_time.elapsed(),
+                output: final_output,
+            });
+        }
+
+        current_iteration += 1;
     }
 
     // Ran all iterations without completion token
@@ -1285,6 +1469,50 @@ async fn run_auto_loop(
         duration: start_time.elapsed(),
         output: final_output,
     })
+}
+
+/// Runs a single auto-mode iteration with ACP session for multi-turn rule injection.
+///
+/// This is a helper function that creates an ACP session, runs the iteration with
+/// multi-turn rule injection, and closes the session.
+///
+/// # Arguments
+///
+/// * `binary` - Path to the ACP adapter binary
+/// * `acp_config` - ACP configuration
+/// * `prompt` - The rendered prompt for this iteration
+/// * `rules_set` - All discovered rules
+/// * `state` - Persistent rules state across iterations
+/// * `config` - Rules configuration
+/// * `iteration` - Current iteration number
+/// * `cwd` - Current working directory
+///
+/// # Errors
+///
+/// Returns an error if session creation, turn execution, or session close fails.
+#[allow(clippy::too_many_arguments)]
+async fn run_auto_iteration_acp(
+    binary: &str,
+    acp_config: &config::AcpConfig,
+    prompt: &str,
+    rules_set: &rules::RulesSet,
+    state: &Arc<Mutex<RulesState>>,
+    config: &config::RulesConfig,
+    iteration: u32,
+    cwd: &Path,
+) -> color_eyre::eyre::Result<String> {
+    // Create ACP session for this iteration
+    let mut session = acp::AcpSession::new(binary, acp_config, cwd).await?;
+
+    // Run iteration with multi-turn rule injection
+    let output =
+        run_auto_iteration_with_session(&mut session, prompt, rules_set, state, config, iteration)
+            .await?;
+
+    // Close the session
+    session.close().await?;
+
+    Ok(output)
 }
 
 /// Result of running the auto loop.

@@ -16,8 +16,18 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::config::{AcpConfig, PermissionMode};
 use crate::rules::normalize_file_path_if_safe;
+use tokio::sync::Mutex;
 
-/// Result of running a prompt via ACP.
+/// Result of running a single turn via ACP.
+#[derive(Debug)]
+pub struct AcpTurnResult {
+    /// The complete output collected from the agent during this turn.
+    pub output: String,
+    /// Files read during this turn (repo-relative paths).
+    pub files_read: Vec<String>,
+}
+
+/// Result of running a prompt via ACP (legacy, for backward compatibility).
 #[derive(Debug)]
 pub struct AcpRunResult {
     /// The complete output collected from the agent.
@@ -221,7 +231,292 @@ impl acp::Client for VelorClient {
     }
 }
 
-/// Runs a prompt via the ACP protocol.
+/// A persistent ACP session for multi-turn interactions.
+///
+/// This struct manages a long-lived ACP subprocess and connection,
+/// allowing multiple turns (prompts) within the same session. This is
+/// essential for features like glob-based rule injection within an
+/// iteration.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut session = AcpSession::new(binary, config, cwd).await?;
+///
+/// // Turn A: Initial prompt
+/// let result1 = session.run_turn(prompt1, "turn_a").await?;
+///
+/// // Turn B: Follow-up based on files read
+/// let result2 = session.run_turn(prompt2, "turn_b").await?;
+///
+/// session.close().await?;
+/// ```
+#[derive(Debug)]
+pub struct AcpSession {
+    /// The spawned subprocess for the ACP adapter.
+    child: tokio::process::Child,
+    /// Client-side connection to the ACP adapter.
+    conn: acp::ClientSideConnection,
+    /// The session ID for this ACP session.
+    session_id: acp::SessionId,
+    /// Shared output buffer for collecting agent responses.
+    output: Arc<tokio::sync::Mutex<String>>,
+    /// Shared buffer for tracking files read this turn.
+    files_read_this_turn: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Working directory for this session.
+    cwd: PathBuf,
+}
+
+impl AcpSession {
+    /// Creates a new ACP session by spawning the adapter subprocess.
+    ///
+    /// # Arguments
+    ///
+    /// * `binary` - Path to the ACP adapter binary (e.g., "claude-agent-acp")
+    /// * `config` - ACP configuration options
+    /// * `cwd` - Current working directory
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The binary cannot be spawned
+    /// - ACP protocol initialization fails
+    /// - Session creation fails
+    pub async fn new(
+        binary: &str,
+        config: &AcpConfig,
+        cwd: &Path,
+    ) -> color_eyre::eyre::Result<Self> {
+        tracing::info!("🤖 Starting ACP session with {binary}...");
+
+        // Canonicalize cwd (ACP requires absolute paths)
+        let cwd = cwd
+            .canonicalize()
+            .wrap_err_with(|| format!("failed to canonicalize cwd: {}", cwd.display()))?;
+
+        // Get API key from environment
+        let api_key = std::env::var(&config.api_key_env).wrap_err_with(|| {
+            format!(
+                "ACP API key not found. Set the {} environment variable.",
+                config.api_key_env
+            )
+        })?;
+
+        // Spawn the ACP adapter binary
+        let mut child = tokio::process::Command::new(binary)
+            .current_dir(&cwd)
+            .env(&config.api_key_env, api_key)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .wrap_err_with(|| format!("failed to execute {binary}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| eyre!("failed to open {binary} stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| eyre!("failed to capture {binary} stdout"))?;
+
+        // Convert to async streams compatible with ACP SDK
+        let outgoing = stdin.compat_write();
+        let incoming = stdout.compat();
+
+        // Create shared output buffer for collecting agent responses
+        let output = Arc::new(tokio::sync::Mutex::new(String::new()));
+
+        // Create shared buffer for tracking files read this turn
+        let files_read_this_turn = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        // Create the Velor client with output collection and file read tracking
+        let client = VelorClient::new(
+            config.permission_mode,
+            output.clone(),
+            cwd.clone(),
+            files_read_this_turn.clone(),
+        );
+
+        // The ACP SDK futures are not Send, so we need to use LocalSet
+        let local_set = tokio::task::LocalSet::new();
+
+        // We need to get the connection and session_id out of the LocalSet
+        // Use a Mutex to share the result across the await boundary
+        let init_result: Arc<Mutex<Option<(acp::ClientSideConnection, acp::SessionId)>>> =
+            Arc::new(Mutex::new(None));
+
+        let cwd_for_async = cwd.clone();
+        let init_result_clone = init_result.clone();
+        local_set
+            .run_until(async move {
+                // Create the ACP client-side connection
+                let (conn, handle_io) =
+                    acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
+                        tokio::task::spawn_local(fut);
+                    });
+
+                // Handle I/O in the background
+                tokio::task::spawn_local(handle_io);
+
+                // Initialize the protocol using builder pattern
+                conn.initialize(
+                    acp::InitializeRequest::new(acp::ProtocolVersion::V1)
+                        .client_capabilities(acp::ClientCapabilities::default())
+                        .client_info(
+                            acp::Implementation::new("velor", env!("CARGO_PKG_VERSION"))
+                                .title("Velor Agent CLI"),
+                        ),
+                )
+                .await
+                .map_err(|e| eyre!("ACP initialize failed: {e}"))?;
+
+                // Create a new session using builder pattern
+                let session_response = conn
+                    .new_session(acp::NewSessionRequest::new(&cwd_for_async).mcp_servers(vec![]))
+                    .await
+                    .map_err(|e| eyre!("ACP new_session failed: {e}"))?;
+
+                let session_id = session_response.session_id;
+
+                // Store the connection and session_id
+                let mut guard = init_result_clone.lock().await;
+                *guard = Some((conn, session_id));
+
+                color_eyre::eyre::Result::<()>::Ok(())
+            })
+            .await?;
+
+        // Extract the connection and session_id
+        let (conn, session_id) = {
+            let mut guard = init_result.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| eyre!("ACP initialization failed to return connection"))?
+        };
+
+        tracing::info!("✅ ACP session established with id: {session_id}");
+
+        Ok(Self {
+            child,
+            conn,
+            session_id,
+            output,
+            files_read_this_turn,
+            cwd,
+        })
+    }
+
+    /// Runs a single turn within this ACP session.
+    ///
+    /// Each turn sends a prompt to the agent and collects the output
+    /// and files read during that turn.
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - The prompt text to send to the agent
+    /// * `turn_name` - Name of this turn (for logging)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Prompt sending fails
+    /// - The agent returns an error
+    pub async fn run_turn(
+        &mut self,
+        prompt: &str,
+        turn_name: &str,
+    ) -> color_eyre::eyre::Result<AcpTurnResult> {
+        // Log prompt preview for debugging
+        let prompt_preview = if prompt.len() > 200 {
+            format!("{}... ({} chars total)", &prompt[..200], prompt.len())
+        } else {
+            format!("{} ({} chars)", prompt, prompt.len())
+        };
+        tracing::debug!("sending ACP turn '{turn_name}': {prompt_preview}");
+
+        // Clone session_id first, before creating any other references
+        let session_id = self.session_id.clone();
+
+        // Clone Arcs for use within the async block
+        let output = self.output.clone();
+        let files_read_this_turn = self.files_read_this_turn.clone();
+
+        // Clear the output and files_read buffers for this new turn
+        {
+            let mut output_guard = output.lock().await;
+            output_guard.clear();
+        }
+        {
+            let mut files_read_guard = files_read_this_turn.lock().await;
+            files_read_guard.clear();
+        }
+
+        // Get a mutable reference to conn for the prompt call
+        // We need to do this carefully since we're using self within the closure
+        let conn_ref = &mut self.conn;
+
+        // The ACP SDK futures are not Send, so we need to use LocalSet
+        let local_set = tokio::task::LocalSet::new();
+
+        local_set
+            .run_until(async {
+                // Send the prompt using builder pattern and capture response
+                let prompt_response = conn_ref
+                    .prompt(acp::PromptRequest::new(
+                        session_id,
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            prompt.to_string(),
+                        ))],
+                    ))
+                    .await
+                    .map_err(|e| eyre!("ACP prompt failed: {e}"))?;
+
+                tracing::info!(
+                    "ACP turn '{}' completed with stop_reason: {:?}",
+                    turn_name,
+                    prompt_response.stop_reason
+                );
+
+                color_eyre::eyre::Result::<()>::Ok(())
+            })
+            .await?;
+
+        // Extract the collected output and files read from the Arcs
+        let output_str = output
+            .try_lock()
+            .map_err(|_| eyre!("Failed to lock output mutex"))?
+            .clone();
+        let files_read_vec = files_read_this_turn
+            .try_lock()
+            .map_err(|_| eyre!("Failed to lock files_read mutex"))?
+            .clone();
+
+        Ok(AcpTurnResult {
+            output: output_str,
+            files_read: files_read_vec,
+        })
+    }
+
+    /// Returns the session ID for this ACP session.
+    #[must_use]
+    pub fn session_id(&self) -> acp::SessionId {
+        self.session_id.clone()
+    }
+
+    /// Closes the ACP session and kills the subprocess.
+    ///
+    /// This method should be called when done with the session to clean
+    /// up resources properly.
+    pub async fn close(mut self) -> color_eyre::eyre::Result<()> {
+        tracing::info!("🔚 Closing ACP session {}", self.session_id);
+        self.child.kill().await.ok();
+        Ok(())
+    }
+}
+
+/// Runs a prompt via the ACP protocol (legacy single-shot interface).
 ///
 /// This function:
 /// 1. Spawns the ACP adapter binary as a subprocess
