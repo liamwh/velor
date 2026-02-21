@@ -111,6 +111,12 @@ impl Rule {
             .as_ref()
             .is_some_and(|gs| gs.is_match(path_relative))
     }
+
+    /// Returns the rule name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// Frontmatter metadata parsed from YAML between `---` delimiters.
@@ -671,6 +677,116 @@ pub fn normalize_file_path_if_safe(git_root: &Path, absolute: &Path) -> Option<S
             .map(|s| s.to_string_lossy())
             .collect::<Vec<_>>()
             .join("/"),
+    )
+}
+
+/// Check for new glob matches based on files read (SYNC - pure function).
+///
+/// Returns rule NAMES (not full Rule structs) to avoid unnecessary cloning.
+/// Rule contents are fetched only when needed for formatting.
+///
+/// # Arguments
+///
+/// * `rules_set` - All discovered rules
+/// * `files_read` - Files read in this turn (repo-relative paths)
+/// * `injected_rules` - Rules already injected (by name)
+///
+/// # Returns
+///
+/// Sorted, deduplicated list of rule names that match the files read and
+/// haven't been injected yet.
+#[must_use]
+pub fn check_new_glob_matches(
+    rules_set: &RulesSet,
+    files_read: &[String],
+    injected_rules: &HashSet<String>,
+) -> Vec<String> {
+    let mut matched_names = Vec::new();
+
+    for file in files_read {
+        for rule in &rules_set.glob_based {
+            if !injected_rules.contains(&rule.name) && rule.matches_path(file) {
+                matched_names.push(rule.name.clone());
+            }
+        }
+    }
+
+    matched_names.sort();
+    matched_names.dedup();
+    matched_names
+}
+
+/// Fetch rules by name from RulesSet (O(1) per lookup via HashMap).
+///
+/// # Arguments
+///
+/// * `rules_set` - All discovered rules
+/// * `names` - Rule names to fetch
+///
+/// # Returns
+///
+/// Vector of rules matching the given names.
+#[must_use]
+pub fn get_rules_by_names(rules_set: &RulesSet, names: &[String]) -> Vec<Rule> {
+    let all_rules: Vec<&Rule> = rules_set
+        .always_apply
+        .iter()
+        .chain(rules_set.glob_based.iter())
+        .chain(rules_set.intelligent.iter())
+        .collect();
+
+    names
+        .iter()
+        .filter_map(|name| {
+            all_rules
+                .iter()
+                .find(|r| &r.name == name)
+                .map(|r| (*r).clone())
+        })
+        .collect()
+}
+
+/// Build follow-up prompt with ONLY new rules (delta formatting).
+///
+/// Key requirements:
+/// - Short and directive (don't disrupt agent's flow)
+/// - List actual file paths opened
+/// - Mark clearly as "NEW RULES ONLY"
+/// - Instruct agent to continue, not restart
+///
+/// # Arguments
+///
+/// * `files_read` - Files read in the previous turn (repo-relative paths)
+/// * `new_rules` - New rules to inject
+///
+/// # Returns
+///
+/// Formatted follow-up prompt string.
+#[must_use]
+pub fn build_follow_up_prompt_delta(files_read: &[String], new_rules: &[Rule]) -> String {
+    let rules_text = new_rules
+        .iter()
+        .map(|r| format!("## {}\n\n{}\n", r.name(), r.content))
+        .collect::<Vec<_>>()
+        .join("\n---\n\n");
+
+    format!(
+        r#"# NEW Project Rules (delta)
+
+You opened these files:
+{}
+
+These NEW rules now apply:
+
+{}
+
+**Incorporate these new rules and continue from your current plan. Do not restart.**"#,
+        files_read
+            .iter()
+            .map(|f| format!("- {}", f))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        rules_text
     )
 }
 
