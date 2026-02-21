@@ -906,6 +906,7 @@ async fn run_auto(
         &retry_config,
         &cwd,
         iterations,
+        &cancel_token,
     )
     .await;
 
@@ -1059,6 +1060,7 @@ async fn run_auto_loop(
     retry_config: &RetryConfig,
     cwd: &std::path::Path,
     iterations: u32,
+    cancel_token: &CancellationToken,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1066,6 +1068,18 @@ async fn run_auto_loop(
     let mut final_output = String::new();
 
     while current_iteration <= iterations {
+        // Check for cancellation at the start of each iteration
+        if cancel_token.is_cancelled() {
+            println!("\n⚠️  Cancelled by user (Ctrl+C)");
+            return Ok(AutoLoopResult {
+                status: RunStatus::Cancelled,
+                iterations_completed: current_iteration - 1,
+                max_iterations: iterations,
+                duration: start_time.elapsed(),
+                output: final_output,
+            });
+        }
+
         println!("🔁 Iteration {current_iteration}/{iterations}");
         println!("────────────────────────────────────────");
 
@@ -1105,6 +1119,7 @@ async fn run_auto_loop(
             current_iteration,
             retry_config,
             cwd,
+            cancel_token,
         )
         .await;
 
@@ -1143,6 +1158,17 @@ async fn run_auto_loop(
                 return Err(color_eyre::eyre::eyre!(
                     "timeout exceeded on iteration {current_iteration}: {e}"
                 ));
+            }
+            Err(RetryError::Cancelled) => {
+                // User cancelled - exit gracefully
+                println!("\n🛑 Cancelled by user during iteration {current_iteration}");
+                return Ok(AutoLoopResult {
+                    status: RunStatus::Cancelled,
+                    iterations_completed: current_iteration - 1,
+                    max_iterations: iterations,
+                    duration: start_time.elapsed(),
+                    output: final_output,
+                });
             }
             Err(RetryError::Retryable(e)) => {
                 // All retries exhausted - preserve context and retry same iteration
@@ -1206,11 +1232,17 @@ async fn execute_with_retry(
     iteration: u32,
     config: &RetryConfig,
     cwd: &std::path::Path,
+    cancel_token: &CancellationToken,
 ) -> Result<claude::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let retry_start = std::time::Instant::now();
 
     for attempt in 1..=config.max_retries {
+        // Check for cancellation before each attempt
+        if cancel_token.is_cancelled() {
+            return Err(RetryError::Cancelled);
+        }
+
         // Check absolute timeout before each retry attempt
         if retry_start.elapsed().as_millis() > config.absolute_timeout_ms as u128 {
             return Err(RetryError::TimeoutExceeded(format!(
@@ -1227,6 +1259,12 @@ async fn execute_with_retry(
                 attempt
             );
             tokio::time::sleep(delay).await;
+
+            // Check again after sleep
+            if cancel_token.is_cancelled() {
+                return Err(RetryError::Cancelled);
+            }
+
             println!(
                 "🔄 Retry attempt {attempt}/{} for iteration {iteration}...",
                 config.max_retries
