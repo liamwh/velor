@@ -11,15 +11,10 @@ use agent_client_protocol as acp;
 use acp::Agent;
 use color_eyre::eyre::{WrapErr, eyre};
 use std::path::Path;
+use std::sync::Arc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::config::{AcpConfig, PermissionMode};
-
-/// Callback type for streaming output chunks.
-///
-/// This allows the caller to handle streaming output in real-time,
-/// for example printing to stdout or logging.
-pub type ChunkCallback = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Result of running a prompt via ACP.
 #[derive(Debug)]
@@ -35,13 +30,15 @@ pub struct AcpRunResult {
 struct VelorClient {
     /// Permission handling mode.
     permission_mode: PermissionMode,
+    /// Collected output from agent message chunks.
+    output: Arc<tokio::sync::Mutex<String>>,
 }
 
 impl VelorClient {
     /// Creates a new Velor client with the specified permission mode.
     #[must_use]
-    const fn new(permission_mode: PermissionMode) -> Self {
-        Self { permission_mode }
+    fn new(permission_mode: PermissionMode, output: Arc<tokio::sync::Mutex<String>>) -> Self {
+        Self { permission_mode, output }
     }
 }
 
@@ -157,7 +154,7 @@ impl acp::Client for VelorClient {
     /// Handles session notifications from the agent.
     ///
     /// This is the primary way the agent streams output to the client.
-    /// We extract text content from `AgentMessageChunk` updates and log via tracing.
+    /// We extract text content from `AgentMessageChunk` updates and collect it.
     async fn session_notification(
         &self,
         args: acp::SessionNotification,
@@ -172,8 +169,11 @@ impl acp::Client for VelorClient {
                 _ => "<unknown content>".into(),
             };
 
-            // TODO: Implement proper callback mechanism for streaming output.
-            // For now, info the output for visibility during testing.
+            // Collect the output chunk
+            let mut output = self.output.lock().await;
+            output.push_str(&text);
+
+            // Also log for visibility during testing
             tracing::info!("Agent output: {}", text);
         }
         Ok(())
@@ -194,18 +194,6 @@ impl acp::Client for VelorClient {
     }
 }
 
-// Thread-local storage for the current chunk callback.
-//
-// TODO: Implement proper callback storage. The challenge is that
-// `Box<dyn Fn>` cannot be cloned, so we need an alternative approach
-// such as:
-// - Using `Arc<Mutex<Option<ChunkCallback>>>`
-// - Storing callback in a struct with interior mutability
-// - Using channels to stream output
-tokio::task_local! {
-    static CURRENT_CALLBACK: std::cell::RefCell<Option<ChunkCallback>>;
-}
-
 /// Runs a prompt via the ACP protocol.
 ///
 /// This function:
@@ -214,7 +202,7 @@ tokio::task_local! {
 /// 3. Initializes the protocol
 /// 4. Creates a new session
 /// 5. Sends the prompt
-/// 6. Collects streaming output via the callback
+/// 6. Collects streaming output via session notifications
 /// 7. Returns the complete output
 ///
 /// # Arguments
@@ -224,7 +212,6 @@ tokio::task_local! {
 /// * `prompt_name` - Name of the prompt (for logging)
 /// * `config` - ACP configuration options
 /// * `cwd` - Current working directory
-/// * `on_chunk` - Optional callback for streaming output
 ///
 /// # Errors
 ///
@@ -240,7 +227,6 @@ pub async fn run_acp(
     prompt_name: &str,
     config: &AcpConfig,
     cwd: &Path,
-    _on_chunk: Option<ChunkCallback>,
 ) -> color_eyre::eyre::Result<AcpRunResult> {
     tracing::info!("🤖 Invoking {binary} via ACP protocol (prompt: '{prompt_name}')...");
 
@@ -280,8 +266,11 @@ pub async fn run_acp(
     let outgoing = stdin.compat_write();
     let incoming = stdout.compat();
 
-    // Create the Velor client
-    let client = VelorClient::new(config.permission_mode);
+    // Create shared output buffer for collecting agent responses
+    let output = Arc::new(tokio::sync::Mutex::new(String::new()));
+
+    // Create the Velor client with output collection
+    let client = VelorClient::new(config.permission_mode, output.clone());
 
     // The ACP SDK futures are not Send, so we need to use LocalSet
     let local_set = tokio::task::LocalSet::new();
@@ -325,9 +314,9 @@ pub async fn run_acp(
             };
             tracing::debug!("sending prompt via ACP: {prompt_preview}");
 
-            // Send the prompt using builder pattern
+            // Send the prompt using builder pattern and capture response
             tracing::info!("calling conn.prompt...");
-            conn.prompt(acp::PromptRequest::new(
+            let prompt_response = conn.prompt(acp::PromptRequest::new(
                 session_id,
                 vec![acp::ContentBlock::Text(acp::TextContent::new(
                     prompt.to_string(),
@@ -337,11 +326,8 @@ pub async fn run_acp(
             .map_err(|e| eyre!("ACP prompt failed: {e}"))?;
             tracing::info!("conn.prompt returned successfully");
 
-            // Wait for agent response (TODO: proper completion detection)
-            // The agent responds via session_notification asynchronously
-            tracing::info!("sleeping for 5 seconds to wait for agent response...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            tracing::info!("sleep completed");
+            // Log the stop reason for debugging
+            tracing::info!("Agent completed with stop_reason: {:?}", prompt_response.stop_reason);
 
             color_eyre::eyre::Result::<()>::Ok(())
         })
@@ -350,10 +336,14 @@ pub async fn run_acp(
     // Kill the child process
     child.kill().await.ok();
 
-    // Return success result (output is traced via session_notification)
-    Ok(AcpRunResult {
-        stdout: String::from("(ACP output logged to trace - see RUST_LOG=trace)"),
-    })
+    // Extract the collected output from the Arc
+    // Lock the mutex and clone the contents (works even if Arc is still shared)
+    let output = output
+        .try_lock()
+        .map_err(|_| eyre!("Failed to lock output mutex"))?
+        .clone();
+
+    Ok(AcpRunResult { stdout: output })
 }
 
 #[cfg(test)]
@@ -364,7 +354,8 @@ mod unit_tests {
     /// Test that VelorClient can be constructed with Allow mode.
     #[test]
     fn test_velor_client_new_allow() {
-        let client = VelorClient::new(PermissionMode::Allow);
+        let output = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let client = VelorClient::new(PermissionMode::Allow, output);
         // Can't inspect private field, but we can verify it compiles
         let _ = client;
     }
@@ -372,7 +363,8 @@ mod unit_tests {
     /// Test that VelorClient can be constructed with Deny mode.
     #[test]
     fn test_velor_client_new_deny() {
-        let client = VelorClient::new(PermissionMode::Deny);
+        let output = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let client = VelorClient::new(PermissionMode::Deny, output);
         let _ = client;
     }
 
@@ -456,12 +448,6 @@ mod unit_tests {
         }
     }
 
-    /// Test ChunkCallback type alias can be defined.
-    #[test]
-    fn test_chunk_callback_type_alias() {
-        // This just verifies the type alias compiles correctly
-        let _callback: Option<ChunkCallback> = None;
-    }
 }
 
 #[cfg(test)]
@@ -596,7 +582,6 @@ mod integration_tests {
             "test_prompt",
             &config,
             std::env::current_dir().unwrap().as_path(),
-            None,
         )
         .await;
 
@@ -631,7 +616,6 @@ mod integration_tests {
             "test_prompt",
             &config,
             std::env::current_dir().unwrap().as_path(),
-            None,
         )
         .await;
 
