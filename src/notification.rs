@@ -37,6 +37,8 @@ pub enum RunStatus {
     MaxIterationsReached,
     /// Error occurred during execution.
     Failed,
+    /// User cancelled via Ctrl+C.
+    Cancelled,
 }
 
 impl RunStatus {
@@ -47,6 +49,7 @@ impl RunStatus {
             Self::Completed => "✅",
             Self::MaxIterationsReached => "⚠️",
             Self::Failed => "❌",
+            Self::Cancelled => "🛑",
         }
     }
 
@@ -57,6 +60,7 @@ impl RunStatus {
             Self::Completed => "Completed",
             Self::MaxIterationsReached => "Max Iterations Reached",
             Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
         }
     }
 }
@@ -448,6 +452,7 @@ pub const fn should_notify(status: RunStatus, config: &NotificationsConfig) -> b
         RunStatus::Completed => config.notify_on_success,
         RunStatus::MaxIterationsReached => config.notify_on_max_iterations,
         RunStatus::Failed => config.notify_on_failure,
+        RunStatus::Cancelled => config.notify_on_failure,
     }
 }
 
@@ -472,6 +477,7 @@ mod tests {
         assert_eq!(RunStatus::Completed.emoji(), "✅");
         assert_eq!(RunStatus::MaxIterationsReached.emoji(), "⚠️");
         assert_eq!(RunStatus::Failed.emoji(), "❌");
+        assert_eq!(RunStatus::Cancelled.emoji(), "🛑");
     }
 
     #[test]
@@ -482,6 +488,7 @@ mod tests {
             "Max Iterations Reached"
         );
         assert_eq!(RunStatus::Failed.label(), "Failed");
+        assert_eq!(RunStatus::Cancelled.label(), "Cancelled");
     }
 
     #[test]

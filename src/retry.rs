@@ -113,6 +113,9 @@ pub enum RetryError {
 
     /// The absolute timeout for all retries combined was exceeded.
     TimeoutExceeded(String),
+
+    /// User cancelled via Ctrl+C.
+    Cancelled,
 }
 
 impl std::fmt::Display for RetryError {
@@ -121,6 +124,7 @@ impl std::fmt::Display for RetryError {
             RetryError::Retryable(msg) => write!(f, "retryable error: {}", msg),
             RetryError::Permanent(msg) => write!(f, "permanent error: {}", msg),
             RetryError::TimeoutExceeded(msg) => write!(f, "timeout exceeded: {}", msg),
+            RetryError::Cancelled => write!(f, "cancelled by user"),
         }
     }
 }
@@ -290,6 +294,12 @@ mod tests {
         assert!(
             err.to_string().contains("config error"),
             "error should contain message"
+        );
+
+        let err = RetryError::Cancelled;
+        assert!(
+            err.to_string().contains("cancelled"),
+            "error should contain 'cancelled'"
         );
     }
 
