@@ -173,8 +173,8 @@ impl acp::Client for VelorClient {
             };
 
             // TODO: Implement proper callback mechanism for streaming output.
-            // For now, trace the output for visibility.
-            tracing::trace!("Agent output: {}", text);
+            // For now, info the output for visibility during testing.
+            tracing::info!("Agent output: {}", text);
         }
         Ok(())
     }
@@ -326,6 +326,7 @@ pub async fn run_acp(
             tracing::debug!("sending prompt via ACP: {prompt_preview}");
 
             // Send the prompt using builder pattern
+            tracing::info!("calling conn.prompt...");
             conn.prompt(acp::PromptRequest::new(
                 session_id,
                 vec![acp::ContentBlock::Text(acp::TextContent::new(
@@ -334,6 +335,13 @@ pub async fn run_acp(
             ))
             .await
             .map_err(|e| eyre!("ACP prompt failed: {e}"))?;
+            tracing::info!("conn.prompt returned successfully");
+
+            // Wait for agent response (TODO: proper completion detection)
+            // The agent responds via session_notification asynchronously
+            tracing::info!("sleeping for 5 seconds to wait for agent response...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            tracing::info!("sleep completed");
 
             color_eyre::eyre::Result::<()>::Ok(())
         })
@@ -342,9 +350,9 @@ pub async fn run_acp(
     // Kill the child process
     child.kill().await.ok();
 
-    // Return success result
+    // Return success result (output is traced via session_notification)
     Ok(AcpRunResult {
-        stdout: String::new(), // Output is streamed via callback
+        stdout: String::from("(ACP output logged to trace - see RUST_LOG=trace)"),
     })
 }
 

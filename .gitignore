@@ -16,3 +16,10 @@ Cargo.lock
 
 # Velor-specific working directory
 .velor/*.md.progress.md
+
+# ACP testing (node modules and test files)
+node_modules/
+bun.lock
+package.json
+test_acp.js
+.velor/velor-acp-test.toml

@@ -523,6 +523,14 @@ async fn run_test_notification(
 
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
+    // Initialize tracing subscriber for logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
+
     // Install color-eyre for better error reports
     color_eyre::install()?;
 
@@ -684,15 +692,8 @@ async fn run_once(
         .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
         .unwrap_or_default();
 
-    // Debug: print protocol BEFORE merge (since merge takes ownership)
-    eprintln!("DEBUG [run_once]: home_cfg protocol = {:?}", home_cfg.defaults.protocol);
-    eprintln!("DEBUG [run_once]: repo_cfg protocol = {:?}", repo_cfg.defaults.protocol);
-
     // Merge: home config as base, repo config as overlay
     let file_cfg = FileConfig::merge(home_cfg, repo_cfg);
-
-    eprintln!("DEBUG [run_once]: file_cfg protocol = {:?}", file_cfg.defaults.protocol);
-    eprintln!("DEBUG [run_once]: About to get permission_mode...");
 
     let permission_mode = common
         .permission_mode
