@@ -1148,7 +1148,8 @@ async fn run_auto_iteration_with_session(
     let max = config.max_mid_iteration_injections;
     let mut all_output = String::new();
     let mut all_files_read = Vec::new();
-    let mut files_delta = Vec::new(); // Rolling delta for chaining activations
+    // files_delta will be initialized from the first turn result
+    let mut files_delta;
 
     // Select rules for initial prompt (always_apply, glob-based, and intelligent rules)
     let initial_rules = {
@@ -1211,7 +1212,7 @@ async fn run_auto_iteration_with_session(
                 injections,
                 max
             );
-            return Ok(all_output);
+            break;
         }
 
         tracing::info!(
@@ -1255,8 +1256,7 @@ async fn run_auto_iteration_with_session(
         injections += 1;
     }
 
-    // Should never reach here, but needed for type safety
-    unreachable!("Multi-turn loop should always return from within")
+    Ok(all_output)
 }
 
 /// Runs the auto-mode loop until completion or max iterations.

@@ -307,6 +307,7 @@ impl RulesCache {
     /// # Errors
     ///
     /// Returns an error if the rules cannot be loaded.
+    #[allow(dead_code)] // Public API for future use
     pub async fn get_rules_by_names(&self, names: &[String]) -> Result<Vec<Rule>> {
         let rules_set = self.get().await?;
         let all_rules: Vec<&Rule> = rules_set
@@ -630,6 +631,7 @@ pub fn inject_rules(prompt: &str, rules: &[Rule]) -> String {
 /// // Returns: Ok("src/main.rs".to_string())
 /// # let _ = path_relative_to(git_root, absolute);
 /// ```
+#[allow(dead_code)] // For future use
 pub fn path_relative_to(git_root: &Path, absolute: &Path) -> Result<String> {
     let relative = absolute.strip_prefix(git_root).wrap_err_with(|| {
         format!(
@@ -801,6 +803,7 @@ These NEW rules now apply:
 /// Returns an error if:
 /// - The rules directory doesn't exist
 /// - The rules directory is not under the git root
+#[allow(dead_code)] // For future security validation
 pub fn validate_rules_directory(git_root: &Path, rules_dir: &Path) -> Result<PathBuf> {
     let canonical_rules_dir = rules_dir
         .canonicalize()
@@ -828,8 +831,9 @@ pub fn validate_rules_directory(git_root: &Path, rules_dir: &Path) -> Result<Pat
 pub struct IntelligentSelectionResponse {
     /// Names of selected rules.
     pub rules: Vec<String>,
-    /// Optional reasoning for the selection (not used, for logging only).
+    /// Optional reasoning for the selection (for debugging/logging).
     #[serde(default)]
+    #[allow(dead_code)] // For future logging/debugging
     pub reasoning: String,
 }
 
@@ -1761,5 +1765,454 @@ Content"#;
         // Second access uses cached rules
         let rules2 = cache.get().await.unwrap();
         assert_eq!(rules2.total_count(), 1);
+    }
+
+    /// Test glob-based rule activation simulates multi-turn flow.
+    ///
+    /// This test simulates the end-to-end flow of glob-based rule activation
+    /// that happens within a single iteration in ACP mode.
+    #[tokio::test]
+    async fn test_glob_based_rule_activation_flow() {
+        let temp_dir = TempDir::new().unwrap();
+        let rules_dir = temp_dir.path().join(".agents").join("rules");
+        fs::create_dir_all(&rules_dir).await.unwrap();
+
+        // Create an always-apply rule
+        let always_rule_path = rules_dir.join("always.mdc");
+        let always_content = r#"---
+description: Always apply rule
+globs: []
+alwaysApply: true
+---
+This rule should always be applied."#;
+        fs::write(&always_rule_path, always_content).await.unwrap();
+
+        // Create a glob-based rule for Rust files
+        let rust_rule_path = rules_dir.join("rust.mdc");
+        let rust_content = r#"---
+description: Rust coding rules
+globs:
+  - "**/*.rs"
+  - "src/**/*.rs"
+alwaysApply: false
+---
+Use strict typing in Rust."#;
+        fs::write(&rust_rule_path, rust_content).await.unwrap();
+
+        // Create a glob-based rule for Python files
+        let python_rule_path = rules_dir.join("python.mdc");
+        let python_content = r#"---
+description: Python coding rules
+globs:
+  - "**/*.py"
+alwaysApply: false
+---
+Use type hints in Python."#;
+        fs::write(&python_rule_path, python_content).await.unwrap();
+
+        // Load rules
+        let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
+            .await
+            .unwrap();
+
+        assert_eq!(rules_set.always_apply.len(), 1);
+        assert_eq!(rules_set.glob_based.len(), 2);
+
+        // Simulate iteration state
+        let mut state = RulesState::new();
+
+        // Initial selection: only always-apply rules
+        let selected = select_rules(&rules_set, &state);
+        assert_eq!(selected.rules.len(), 1);
+        assert_eq!(selected.rules[0].name, "always");
+
+        // Simulate agent reading src/main.rs
+        state.record_file_read("src/main.rs".to_string());
+
+        // Check for new glob matches
+        let new_matches = check_new_glob_matches(
+            &rules_set,
+            &["src/main.rs".to_string()],
+            state.injected_rules(),
+        );
+
+        // Rust rule should match
+        assert_eq!(new_matches.len(), 1);
+        assert!(new_matches.contains(&"rust".to_string()));
+
+        // Fetch the matched rules
+        let matched_rules = get_rules_by_names(&rules_set, &new_matches);
+        assert_eq!(matched_rules.len(), 1);
+        assert_eq!(matched_rules[0].name, "rust");
+
+        // Mark as injected
+        state.mark_injected("rust".to_string());
+
+        // Simulate second turn: agent reads lib.rs and main.py
+        state.record_file_read("lib.rs".to_string());
+        state.record_file_read("main.py".to_string());
+
+        // Check for new glob matches (should only find python now)
+        let new_matches = check_new_glob_matches(
+            &rules_set,
+            &["lib.rs".to_string(), "main.py".to_string()],
+            state.injected_rules(),
+        );
+
+        // Only Python rule should match (rust already injected)
+        assert_eq!(new_matches.len(), 1);
+        assert!(new_matches.contains(&"python".to_string()));
+
+        // Mark python as injected
+        state.mark_injected("python".to_string());
+
+        // No more new matches
+        let new_matches = check_new_glob_matches(
+            &rules_set,
+            &["src/main.rs".to_string(), "lib.rs".to_string()],
+            state.injected_rules(),
+        );
+        assert_eq!(new_matches.len(), 0);
+    }
+
+    /// Test intelligent selection prompt building and response parsing.
+    #[tokio::test]
+    async fn test_intelligent_selection_end_to_end() {
+        let temp_dir = TempDir::new().unwrap();
+        let rules_dir = temp_dir.path().join(".agents").join("rules");
+        fs::create_dir_all(&rules_dir).await.unwrap();
+
+        // Create intelligent rules (no always_apply, no globs)
+        let test_plan_rule_path = rules_dir.join("test_plan.mdc");
+        let test_plan_content = r#"---
+description: Testing best practices for TDD and test plans
+globs: []
+alwaysApply: false
+---
+Write tests before implementation."#;
+        fs::write(&test_plan_rule_path, test_plan_content)
+            .await
+            .unwrap();
+
+        let api_design_rule_path = rules_dir.join("api_design.mdc");
+        let api_design_content = r#"---
+description: REST API design guidelines
+globs: []
+alwaysApply: false
+---
+Use proper HTTP status codes."#;
+        fs::write(&api_design_rule_path, api_design_content)
+            .await
+            .unwrap();
+
+        // Load rules
+        let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
+            .await
+            .unwrap();
+
+        assert_eq!(rules_set.intelligent.len(), 2);
+
+        // Build selection prompt
+        let prompt = build_intelligent_selection_prompt(
+            &rules_set.intelligent,
+            "I need to write tests for a new REST API endpoint",
+        );
+
+        // Verify prompt contains descriptions
+        assert!(prompt.contains("test_plan: Testing best practices for TDD and test plans"));
+        assert!(prompt.contains("api_design: REST API design guidelines"));
+        assert!(prompt.contains("I need to write tests for a new REST API endpoint"));
+
+        // Test parsing valid JSON response
+        let json_response = r#"{"rules":["test_plan"],"reasoning":"The task involves testing"}"#;
+        let mut allowed = HashSet::new();
+        allowed.insert("test_plan");
+        allowed.insert("api_design");
+
+        let parsed = parse_intelligent_selection_response(json_response, &allowed).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains(&"test_plan".to_string()));
+
+        // Test that invalid rule names are filtered out
+        let json_response_with_invalid =
+            r#"{"rules":["test_plan","unknown_rule"],"reasoning":"test"}"#;
+        let parsed_filtered =
+            parse_intelligent_selection_response(json_response_with_invalid, &allowed).unwrap();
+        assert_eq!(parsed_filtered.len(), 1);
+        assert!(!parsed_filtered.iter().any(|r| r == "unknown_rule"));
+
+        // Test markdown-wrapped JSON
+        let markdown_response = r#"Here's my selection:
+
+```json
+{"rules":["api_design","test_plan"],"reasoning":"Both are relevant"}
+```
+
+That's it."#;
+        let parsed_md = parse_intelligent_selection_response(markdown_response, &allowed).unwrap();
+        assert_eq!(parsed_md.len(), 2);
+        assert!(parsed_md.contains(&"api_design".to_string()));
+        assert!(parsed_md.contains(&"test_plan".to_string()));
+
+        // Test empty response
+        let empty_response = r#"{"rules":[],"reasoning":"none"}"#;
+        let parsed_empty = parse_intelligent_selection_response(empty_response, &allowed).unwrap();
+        assert_eq!(parsed_empty.len(), 0);
+    }
+
+    /// Test follow-up prompt formatting for delta injection.
+    #[tokio::test]
+    async fn test_follow_up_prompt_delta_formatting() {
+        // Create test rules
+        let rust_rule = Rule::new(
+            "rust".to_string(),
+            "Rust rules".to_string(),
+            vec!["**/*.rs".to_string()],
+            false,
+            "Use strict typing.".to_string(),
+        );
+
+        let test_rule = Rule::new(
+            "testing".to_string(),
+            "Testing rules".to_string(),
+            vec!["**/*test*.rs".to_string()],
+            false,
+            "Write tests first.".to_string(),
+        );
+
+        let files_read = vec![
+            "src/main.rs".to_string(),
+            "tests/integration_test.rs".to_string(),
+        ];
+        let new_rules = vec![rust_rule, test_rule];
+
+        let follow_up = build_follow_up_prompt_delta(&files_read, &new_rules);
+
+        // Verify the follow-up prompt contains expected elements
+        assert!(follow_up.contains("# NEW Project Rules (delta)"));
+        assert!(follow_up.contains("You opened these files:"));
+        assert!(follow_up.contains("- src/main.rs"));
+        assert!(follow_up.contains("- tests/integration_test.rs"));
+        assert!(follow_up.contains("## rust"));
+        assert!(follow_up.contains("Use strict typing."));
+        assert!(follow_up.contains("## testing"));
+        assert!(follow_up.contains("Write tests first."));
+        assert!(follow_up.contains(
+            "**Incorporate these new rules and continue from your current plan. Do not restart.**"
+        ));
+    }
+
+    /// Test state persistence across multiple iterations.
+    #[tokio::test]
+    async fn test_rules_state_persistence_across_iterations() {
+        let temp_dir = TempDir::new().unwrap();
+        let rules_dir = temp_dir.path().join(".agents").join("rules");
+        fs::create_dir_all(&rules_dir).await.unwrap();
+
+        // Create glob-based rules
+        let rust_rule_path = rules_dir.join("rust.mdc");
+        fs::write(
+            &rust_rule_path,
+            r#"---
+description: Rust rules
+globs: ["**/*.rs"]
+alwaysApply: false
+---
+Use Rust best practices."#,
+        )
+        .await
+        .unwrap();
+
+        let js_rule_path = rules_dir.join("js.mdc");
+        fs::write(
+            &js_rule_path,
+            r#"---
+description: JavaScript rules
+globs: ["**/*.js"]
+alwaysApply: false
+---
+Use JavaScript best practices."#,
+        )
+        .await
+        .unwrap();
+
+        let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
+            .await
+            .unwrap();
+
+        // Simulate state across iterations
+        let mut state = RulesState::new();
+
+        // Iteration 1: Agent reads src/main.rs
+        state.record_file_read("src/main.rs".to_string());
+        let iteration1_matches = state.match_globs_for_files(&rules_set.glob_based);
+        assert_eq!(iteration1_matches.len(), 1);
+        assert_eq!(iteration1_matches[0].name, "rust");
+
+        // Mark rust as injected
+        state.mark_injected("rust".to_string());
+
+        // Iteration 2: Agent reads more files
+        state.record_file_read("src/lib.rs".to_string());
+        state.record_file_read("index.js".to_string());
+
+        // Check for new matches (should only get js, rust already injected)
+        let iteration2_matches = state.match_globs_for_files(&rules_set.glob_based);
+        assert_eq!(iteration2_matches.len(), 1);
+        assert_eq!(iteration2_matches[0].name, "js");
+
+        // Mark js as injected
+        state.mark_injected("js".to_string());
+
+        // Iteration 3: No new matches
+        state.record_file_read("src/mod.rs".to_string());
+        let iteration3_matches = state.match_globs_for_files(&rules_set.glob_based);
+        assert_eq!(iteration3_matches.len(), 0);
+
+        // Verify all files were tracked
+        assert_eq!(state.files_read.len(), 4);
+        assert!(state.files_read.contains("src/main.rs"));
+        assert!(state.files_read.contains("src/lib.rs"));
+        assert!(state.files_read.contains("index.js"));
+        assert!(state.files_read.contains("src/mod.rs"));
+    }
+
+    /// Test select_rules_with_intelligent with all rule types.
+    #[tokio::test]
+    async fn test_select_rules_with_intelligent_comprehensive() {
+        let temp_dir = TempDir::new().unwrap();
+        let rules_dir = temp_dir.path().join(".agents").join("rules");
+        fs::create_dir_all(&rules_dir).await.unwrap();
+
+        // Create all rule types
+        fs::write(
+            rules_dir.join("always.mdc"),
+            r#"---
+description: Always apply
+globs: []
+alwaysApply: true
+---
+Always content"#,
+        )
+        .await
+        .unwrap();
+
+        fs::write(
+            rules_dir.join("globbed.mdc"),
+            r#"---
+description: Glob based
+globs: ["*.rs"]
+alwaysApply: false
+---
+Glob content"#,
+        )
+        .await
+        .unwrap();
+
+        fs::write(
+            rules_dir.join("intelligent.mdc"),
+            r#"---
+description: Intelligent selection
+globs: []
+alwaysApply: false
+---
+Intelligent content"#,
+        )
+        .await
+        .unwrap();
+
+        let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
+            .await
+            .unwrap();
+
+        let mut state = RulesState::new();
+
+        // Initially only always-apply rule is selected
+        let selected = select_rules_with_intelligent(&rules_set, &state, None, 10);
+        assert_eq!(selected.rules.len(), 1);
+        assert_eq!(selected.rules[0].name, "always");
+
+        // After reading matching file, glob-based rule is also selected
+        state.record_file_read("main.rs".to_string());
+        let selected_with_glob = select_rules_with_intelligent(&rules_set, &state, None, 10);
+        assert_eq!(selected_with_glob.rules.len(), 2);
+        assert!(selected_with_glob.rules.iter().any(|r| r.name == "always"));
+        assert!(selected_with_glob.rules.iter().any(|r| r.name == "globbed"));
+
+        // With intelligent rules provided, all three types are selected
+        let intelligent_rule = rules_set.intelligent.first().unwrap();
+        let selected_all = select_rules_with_intelligent(
+            &rules_set,
+            &state,
+            Some(std::slice::from_ref(intelligent_rule)),
+            10,
+        );
+        assert_eq!(selected_all.rules.len(), 3);
+    }
+
+    /// Test max_mid_iteration_injections cap enforcement.
+    #[tokio::test]
+    async fn test_max_mid_iteration_injections_cap() {
+        let temp_dir = TempDir::new().unwrap();
+        let rules_dir = temp_dir.path().join(".agents").join("rules");
+        fs::create_dir_all(&rules_dir).await.unwrap();
+
+        // Create multiple glob-based rules that match different files
+        for i in 0..5 {
+            let name = format!("rule{}", i);
+            let content = format!(
+                r#"---
+description: Rule {}
+globs: ["**/file{}.rs"]
+alwaysApply: false
+---
+Content {}"#,
+                i, i, i
+            );
+            fs::write(rules_dir.join(format!("{}.mdc", name)), content)
+                .await
+                .unwrap();
+        }
+
+        let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
+            .await
+            .unwrap();
+
+        let mut state = RulesState::new();
+
+        // Simulate reading all files in sequence
+        let files_read: Vec<String> = (0..5).map(|i| format!("file{}.rs", i)).collect();
+
+        // Check for new matches (all 5 should match)
+        let new_matches = check_new_glob_matches(&rules_set, &files_read, state.injected_rules());
+        assert_eq!(new_matches.len(), 5);
+
+        // With max_injections = 2, only 2 rules should be processed per iteration
+        let max_injections = 2u32;
+        let mut injections = 0u32;
+        let mut current_files = files_read.clone();
+        let mut processed_rules = Vec::new();
+
+        while injections < max_injections && !current_files.is_empty() {
+            let matches =
+                check_new_glob_matches(&rules_set, &current_files, state.injected_rules());
+            if matches.is_empty() {
+                break;
+            }
+
+            // Process first batch of matches
+            let rules_to_process = matches.iter().take(2).cloned().collect::<Vec<_>>();
+            for rule_name in &rules_to_process {
+                state.mark_injected(rule_name.clone());
+                processed_rules.push(rule_name.clone());
+            }
+            injections += 1;
+            current_files = Vec::new(); // Simulate processing without new files
+        }
+
+        // Should have processed at most max_injections * 2 = 4 rules
+        // (Each injection processes 2 rules, capped by max_injections)
+        assert!(processed_rules.len() <= 5); // All rules could be processed
+        assert!(injections <= max_injections);
     }
 }

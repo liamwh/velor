@@ -29,6 +29,7 @@ pub struct AcpTurnResult {
 
 /// Result of running a prompt via ACP (legacy, for backward compatibility).
 #[derive(Debug)]
+#[allow(dead_code)] // files_read is for future use
 pub struct AcpRunResult {
     /// The complete output collected from the agent.
     pub stdout: String,
@@ -69,6 +70,7 @@ impl VelorClient {
     }
 
     /// Get and clear files read this turn.
+    #[allow(dead_code)] // For future use in multi-turn flow
     pub async fn take_files_read(&self) -> Vec<String> {
         std::mem::take(&mut *self.files_read_this_turn.lock().await)
     }
@@ -263,10 +265,12 @@ pub struct AcpSession {
     output: Arc<tokio::sync::Mutex<String>>,
     /// Shared buffer for tracking files read this turn.
     files_read_this_turn: Arc<tokio::sync::Mutex<Vec<String>>>,
-    /// Working directory for this session.
+    /// Working directory for this session (for future use).
+    #[allow(dead_code)]
     cwd: PathBuf,
 }
 
+#[allow(dead_code)]
 impl AcpSession {
     /// Creates a new ACP session by spawning the adapter subprocess.
     ///
