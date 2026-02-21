@@ -8,9 +8,9 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use color_eyre::eyre::WrapErr;
 use std::collections::BTreeMap;
 use std::path::Path;
-use tokio_util::sync::CancellationToken;
 
 mod acp;
+mod cancellation;
 mod claude;
 mod config;
 mod git;
@@ -20,6 +20,8 @@ mod retry;
 mod template;
 mod tui;
 
+use cancellation::CancellationHandler;
+
 use claude::{AgentRunner, require_claude_on_path};
 use config::FileConfig;
 use notification::{
@@ -27,6 +29,7 @@ use notification::{
 };
 use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
+use tokio_util::sync::CancellationToken;
 
 /// Velor Agent CLI - Run autonomous agents with Claude AI.
 #[derive(Debug, Parser)]
@@ -534,16 +537,8 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // Install color-eyre for better error reports
     color_eyre::install()?;
 
-    // Create cancellation token for graceful shutdown
-    let cancel_token = CancellationToken::new();
-
-    // Register Ctrl+C handler for cancellation
-    let token_clone = cancel_token.clone();
-    ctrlc::set_handler(move || {
-        tracing::info!("Ctrl+C received, initiating graceful shutdown...");
-        token_clone.cancel();
-    })
-    .wrap_err("failed to register Ctrl+C handler")?;
+    // Create cancellation handler for two-stage shutdown
+    let (cancel_handler, _cancel_token) = CancellationHandler::new();
 
     // Pre-parse to extract --key=value variable overrides
     let raw_args: Vec<String> = std::env::args().collect();
@@ -562,10 +557,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
 
     match cli.command {
         Some(Commands::Once(args)) => {
-            run_once(args, home_cfg, git_root, cwd, &var_overrides, cancel_token).await
+            run_once(args, home_cfg, git_root, cwd, &var_overrides, cancel_handler).await
         }
         Some(Commands::Auto(args)) => {
-            run_auto(args, home_cfg, git_root, cwd, &var_overrides, cancel_token).await
+            run_auto(args, home_cfg, git_root, cwd, &var_overrides, cancel_handler).await
         }
         Some(Commands::Init) => run_init(git_root).await,
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root).await,
@@ -583,8 +578,8 @@ async fn run_interactive_menu(
 ) -> color_eyre::eyre::Result<()> {
     use tui::MenuChoice;
 
-    // Create cancellation token for interactive menu
-    let cancel_token = CancellationToken::new();
+    // Create cancellation handler for interactive menu
+    let (cancel_handler, __cancel_token) = CancellationHandler::new();
 
     let choice = tui::run_menu()?;
 
@@ -609,7 +604,7 @@ async fn run_interactive_menu(
                 git_root,
                 cwd,
                 &[],
-                cancel_token,
+                cancel_handler,
             )
             .await
         }
@@ -637,7 +632,7 @@ async fn run_interactive_menu(
                 git_root,
                 cwd,
                 &[],
-                cancel_token,
+                cancel_handler,
             )
             .await
         }
@@ -679,7 +674,7 @@ async fn run_once(
     git_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
     extracted_overrides: &[(String, String)],
-    cancel_token: CancellationToken,
+    cancel_handler: CancellationHandler,
 ) -> color_eyre::eyre::Result<()> {
     let common = args.common;
 
@@ -782,7 +777,7 @@ async fn run_auto(
     git_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
     extracted_overrides: &[(String, String)],
-    cancel_token: CancellationToken,
+    cancel_handler: CancellationHandler,
 ) -> color_eyre::eyre::Result<()> {
     let common = args.common;
 
@@ -906,7 +901,7 @@ async fn run_auto(
         &retry_config,
         &cwd,
         iterations,
-        &cancel_token,
+        &cancel_handler,
     )
     .await;
 
@@ -1060,7 +1055,7 @@ async fn run_auto_loop(
     retry_config: &RetryConfig,
     cwd: &std::path::Path,
     iterations: u32,
-    cancel_token: &CancellationToken,
+    cancel_handler: &CancellationHandler,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1068,9 +1063,9 @@ async fn run_auto_loop(
     let mut final_output = String::new();
 
     while current_iteration <= iterations {
-        // Check for cancellation at the start of each iteration
-        if cancel_token.is_cancelled() {
-            println!("\n⚠️  Cancelled by user (Ctrl+C)");
+        // Check for force cancellation at the start of each iteration
+        if cancel_handler.is_cancelled() {
+            println!("\n🛑 Force quit by user (Ctrl+C twice)");
             return Ok(AutoLoopResult {
                 status: RunStatus::Cancelled,
                 iterations_completed: current_iteration - 1,
@@ -1080,7 +1075,13 @@ async fn run_auto_loop(
             });
         }
 
+        // Check for graceful shutdown request - stop after this iteration completes
+        let should_stop_after_this = cancel_handler.graceful_shutdown_requested();
+
         println!("🔁 Iteration {current_iteration}/{iterations}");
+        if should_stop_after_this {
+            println!("⚠️  Stopping after this iteration (graceful shutdown requested)");
+        }
         println!("────────────────────────────────────────");
 
         // Render prompt with context if crash recovery is active
@@ -1119,7 +1120,7 @@ async fn run_auto_loop(
             current_iteration,
             retry_config,
             cwd,
-            cancel_token,
+            cancel_handler.token(),
         )
         .await;
 
@@ -1138,6 +1139,19 @@ async fn run_auto_loop(
                     println!("✅ PRD complete, exiting.");
                     return Ok(AutoLoopResult {
                         status: RunStatus::Completed,
+                        iterations_completed: current_iteration,
+                        max_iterations: iterations,
+                        duration: start_time.elapsed(),
+                        output: final_output,
+                    });
+                }
+
+                // Check if graceful shutdown was requested - stop after current iteration
+                let should_stop_after_this = cancel_handler.graceful_shutdown_requested();
+                if should_stop_after_this {
+                    println!("✅ Graceful shutdown: stopping after iteration {current_iteration}");
+                    return Ok(AutoLoopResult {
+                        status: RunStatus::Cancelled,
                         iterations_completed: current_iteration,
                         max_iterations: iterations,
                         duration: start_time.elapsed(),
