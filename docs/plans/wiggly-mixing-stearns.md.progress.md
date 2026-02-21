@@ -84,16 +84,41 @@
 - ✅ Unit tests for markdown JSON extraction
 - ✅ Unit tests for rule selection with intelligent rules
 
-## Remaining Work (Future Enhancements)
+## Completed (Phase 4 - Integration Tests and Warning Fixes)
 
-### Phase 4: Full Multi-Turn ACP Session Flow
-- [ ] Test end-to-end glob-based rule activation
-- [ ] Consider adding more sophisticated delta formatting strategies
-- [ ] Add integration test for intelligent selection end-to-end flow
+### Integration Tests (`src/rules.rs`)
+- ✅ Added `test_glob_based_rule_activation_flow`: Tests complete multi-turn flow for glob-based rule activation
+- ✅ Added `test_intelligent_selection_end_to_end`: Tests intelligent selection from prompt to parsing
+- ✅ Added `test_follow_up_prompt_delta_formatting`: Verifies follow-up prompt formatting
+- ✅ Added `test_rules_state_persistence_across_iterations`: Tests state persistence across iterations
+- ✅ Added `test_select_rules_with_intelligent_comprehensive`: Tests all three rule types together
+- ✅ Added `test_max_mid_iteration_injections_cap`: Verifies injection cap prevents infinite loops
+
+### Compiler Warning Fixes
+- ✅ Fixed unreachable code warning in `run_auto_iteration_with_session()` (src/main.rs)
+- ✅ Fixed unused assignment warning for `files_delta` variable (src/main.rs)
+- ✅ Added `#[allow(dead_code)]` to reserved API items in src/acp.rs and src/rules.rs
+- ✅ Fixed clippy warning (`cloned_ref_to_slice_refs`) using `std::slice::from_ref`
+
+### Test Results
+- ✅ All 225 tests pass (up from 219)
+- ✅ `cargo check` completes without warnings
+- ✅ `just check` (fmt + clippy + tests) passes
 
 ## Notes
-- Phase 3 is now complete and committed (commit 3ba88a5)
-- Phase 2 is now complete (intelligent rule selection implemented)
+- Phase 4 is now complete and committed (commit 9e2f003)
+- Phase 3 is complete (commit 3ba88a5)
+- Phase 2 is complete (intelligent rule selection implemented)
+- Phase 1 is complete (core rules system implemented)
 - The multi-turn logic only works in ACP mode (subprocess mode uses single-shot execution)
 - Intelligent selection uses a separate short-lived ACP session per iteration
-- Dead code warnings persist for utility functions not yet used
+- Dead code warnings resolved with `#[allow(dead_code)]` for reserved API items
+
+## Plan Status
+
+**All phases of the .agents/rules implementation plan are complete:**
+
+1. ✅ **Phase 1**: Core Rules Module (MVP) - Rule discovery, parsing, selection, injection
+2. ✅ **Phase 2**: Intelligent Rule Selection - ACP-based rule relevance detection
+3. ✅ **Phase 3**: Glob-Based Rule Activation - Mid-iteration injection via multi-turn ACP
+4. ✅ **Phase 4**: Integration Tests - End-to-end testing for all rule flows
