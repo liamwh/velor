@@ -10,17 +10,20 @@ use agent_client_protocol as acp;
 // Import Agent trait so its methods are available on ClientSideConnection
 use acp::Agent;
 use color_eyre::eyre::{WrapErr, eyre};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::config::{AcpConfig, PermissionMode};
+use crate::rules::normalize_file_path_if_safe;
 
 /// Result of running a prompt via ACP.
 #[derive(Debug)]
 pub struct AcpRunResult {
     /// The complete output collected from the agent.
     pub stdout: String,
+    /// Files read during this turn (repo-relative paths).
+    pub files_read: Vec<String>,
 }
 
 /// Velor's ACP Client implementation.
@@ -32,13 +35,32 @@ struct VelorClient {
     permission_mode: PermissionMode,
     /// Collected output from agent message chunks.
     output: Arc<tokio::sync::Mutex<String>>,
+    /// Git repository root path for rule matching.
+    git_root: PathBuf,
+    /// Files read during this turn (repo-relative paths for rule matching).
+    files_read_this_turn: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl VelorClient {
     /// Creates a new Velor client with the specified permission mode.
     #[must_use]
-    fn new(permission_mode: PermissionMode, output: Arc<tokio::sync::Mutex<String>>) -> Self {
-        Self { permission_mode, output }
+    fn new(
+        permission_mode: PermissionMode,
+        output: Arc<tokio::sync::Mutex<String>>,
+        git_root: PathBuf,
+        files_read_this_turn: Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            permission_mode,
+            output,
+            git_root,
+            files_read_this_turn,
+        }
+    }
+
+    /// Get and clear files read this turn.
+    pub async fn take_files_read(&self) -> Vec<String> {
+        std::mem::take(&mut *self.files_read_this_turn.lock().await)
     }
 }
 
@@ -88,6 +110,11 @@ impl acp::Client for VelorClient {
             let msg = format!("Path must be absolute, got: {}", request.path.display());
             tracing::error!("{}", msg);
             return Err(acp::Error::internal_error());
+        }
+
+        // Record file read (normalize to repo-relative) for rule matching
+        if let Some(relative) = normalize_file_path_if_safe(&self.git_root, path) {
+            self.files_read_this_turn.lock().await.push(relative);
         }
 
         // Read the file content
@@ -269,8 +296,16 @@ pub async fn run_acp(
     // Create shared output buffer for collecting agent responses
     let output = Arc::new(tokio::sync::Mutex::new(String::new()));
 
-    // Create the Velor client with output collection
-    let client = VelorClient::new(config.permission_mode, output.clone());
+    // Create shared buffer for tracking files read this turn
+    let files_read_this_turn = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    // Create the Velor client with output collection and file read tracking
+    let client = VelorClient::new(
+        config.permission_mode,
+        output.clone(),
+        cwd.clone(),
+        files_read_this_turn.clone(),
+    );
 
     // The ACP SDK futures are not Send, so we need to use LocalSet
     let local_set = tokio::task::LocalSet::new();
@@ -316,18 +351,22 @@ pub async fn run_acp(
 
             // Send the prompt using builder pattern and capture response
             tracing::info!("calling conn.prompt...");
-            let prompt_response = conn.prompt(acp::PromptRequest::new(
-                session_id,
-                vec![acp::ContentBlock::Text(acp::TextContent::new(
-                    prompt.to_string(),
-                ))],
-            ))
-            .await
-            .map_err(|e| eyre!("ACP prompt failed: {e}"))?;
+            let prompt_response = conn
+                .prompt(acp::PromptRequest::new(
+                    session_id,
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        prompt.to_string(),
+                    ))],
+                ))
+                .await
+                .map_err(|e| eyre!("ACP prompt failed: {e}"))?;
             tracing::info!("conn.prompt returned successfully");
 
             // Log the stop reason for debugging
-            tracing::info!("Agent completed with stop_reason: {:?}", prompt_response.stop_reason);
+            tracing::info!(
+                "Agent completed with stop_reason: {:?}",
+                prompt_response.stop_reason
+            );
 
             color_eyre::eyre::Result::<()>::Ok(())
         })
@@ -336,14 +375,21 @@ pub async fn run_acp(
     // Kill the child process
     child.kill().await.ok();
 
-    // Extract the collected output from the Arc
-    // Lock the mutex and clone the contents (works even if Arc is still shared)
+    // Extract the collected output and files read from the Arcs
+    // Lock the mutexes and clone the contents (works even if Arcs are still shared)
     let output = output
         .try_lock()
         .map_err(|_| eyre!("Failed to lock output mutex"))?
         .clone();
+    let files_read = files_read_this_turn
+        .try_lock()
+        .map_err(|_| eyre!("Failed to lock files_read mutex"))?
+        .clone();
 
-    Ok(AcpRunResult { stdout: output })
+    Ok(AcpRunResult {
+        stdout: output,
+        files_read,
+    })
 }
 
 #[cfg(test)]
@@ -355,7 +401,13 @@ mod unit_tests {
     #[test]
     fn test_velor_client_new_allow() {
         let output = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let client = VelorClient::new(PermissionMode::Allow, output);
+        let files_read = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = VelorClient::new(
+            PermissionMode::Allow,
+            output,
+            PathBuf::from("/tmp"),
+            files_read,
+        );
         // Can't inspect private field, but we can verify it compiles
         let _ = client;
     }
@@ -364,7 +416,13 @@ mod unit_tests {
     #[test]
     fn test_velor_client_new_deny() {
         let output = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let client = VelorClient::new(PermissionMode::Deny, output);
+        let files_read = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = VelorClient::new(
+            PermissionMode::Deny,
+            output,
+            PathBuf::from("/tmp"),
+            files_read,
+        );
         let _ = client;
     }
 
@@ -373,10 +431,11 @@ mod unit_tests {
     fn test_acp_run_result_debug() {
         let result = AcpRunResult {
             stdout: "test output".to_string(),
+            files_read: vec![],
         };
         assert_eq!(
             format!("{:?}", result),
-            "AcpRunResult { stdout: \"test output\" }"
+            "AcpRunResult { stdout: \"test output\", files_read: [] }"
         );
     }
 
@@ -385,6 +444,7 @@ mod unit_tests {
     fn test_acp_run_result_empty() {
         let result = AcpRunResult {
             stdout: String::new(),
+            files_read: vec![],
         };
         assert!(result.stdout.is_empty());
     }
@@ -395,6 +455,7 @@ mod unit_tests {
         let content = "line1\nline2\nline3";
         let result = AcpRunResult {
             stdout: content.to_string(),
+            files_read: vec![],
         };
         assert_eq!(result.stdout, content);
         assert_eq!(result.stdout.lines().count(), 3);
@@ -447,7 +508,6 @@ mod unit_tests {
             );
         }
     }
-
 }
 
 #[cfg(test)]
@@ -460,6 +520,7 @@ mod proptest_tests {
         fn test_acp_run_result_roundtrip(content in ".*") {
             let result = AcpRunResult {
                 stdout: content.clone(),
+                files_read: vec![],
             };
             prop_assert_eq!(result.stdout, content);
         }
@@ -474,6 +535,7 @@ mod proptest_tests {
             let content = format!("{}{}", emoji, ascii);
             let result = AcpRunResult {
                 stdout: content.clone(),
+                files_read: vec![],
             };
             prop_assert_eq!(result.stdout.len(), content.len());
             prop_assert_eq!(result.stdout, content);
@@ -490,6 +552,7 @@ mod proptest_tests {
             let content = format!("{}{}{}", prefix, special, suffix);
             let result = AcpRunResult {
                 stdout: content.clone(),
+                files_read: vec![],
             };
             prop_assert_eq!(result.stdout, content);
         }
@@ -500,6 +563,7 @@ mod proptest_tests {
         fn test_acp_run_result_length(content in ".*") {
             let result = AcpRunResult {
                 stdout: content.clone(),
+                files_read: vec![],
             };
             prop_assert_eq!(result.stdout.len(), content.len());
         }
