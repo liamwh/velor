@@ -4,7 +4,7 @@
 //! - Subprocess spawning (original method with Claude CLI)
 //! - ACP (Agent Client Protocol) for structured communication
 
-use crate::acp::{self, ChunkCallback};
+use crate::acp;
 use crate::config::{AcpConfig, Protocol};
 use color_eyre::eyre::WrapErr;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -59,12 +59,11 @@ impl AgentRunner {
     /// * `prompt` - The rendered prompt text to send
     /// * `prompt_name` - Name of the prompt for logging
     /// * `cwd` - Current working directory
-    /// * `on_chunk` - Optional callback for streaming output chunks
     ///
     /// # Errors
     ///
     /// Returns an error if the agent cannot be executed, fails, or returns non-zero exit code.
-    #[tracing::instrument(level = "debug", fields(binary = %binary, prompt_name = %prompt_name, runner = ?self), skip(on_chunk), ret, err)]
+    #[tracing::instrument(level = "debug", fields(binary = %binary, prompt_name = %prompt_name, runner = ?self), ret, err)]
     pub async fn run(
         &self,
         binary: &str,
@@ -72,7 +71,6 @@ impl AgentRunner {
         prompt: &str,
         prompt_name: &str,
         cwd: &Path,
-        on_chunk: Option<ChunkCallback>,
     ) -> color_eyre::eyre::Result<ClaudeRunResult> {
         match self {
             Self::Subprocess => {
@@ -92,7 +90,7 @@ impl AgentRunner {
                 // ACP mode is natively async
                 tracing::info!("AgentRunner::run: entering ACP mode with binary {}", binary);
                 let acp_result =
-                    acp::run_acp(binary, prompt, prompt_name, config, cwd, on_chunk).await?;
+                    acp::run_acp(binary, prompt, prompt_name, config, cwd).await?;
                 tracing::info!("AgentRunner::run: ACP run completed");
 
                 // Convert AcpRunResult to ClaudeRunResult for compatibility

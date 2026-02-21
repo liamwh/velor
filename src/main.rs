@@ -769,7 +769,6 @@ async fn run_once(
             &rendered,
             &prompt_name,
             &cwd,
-            None,
         )
         .await?;
     Ok(())
@@ -1273,7 +1272,7 @@ async fn execute_with_retry(
         }
 
         match runner
-            .run(binary, permission_mode, prompt, prompt_name, cwd, None)
+            .run(binary, permission_mode, prompt, prompt_name, cwd)
             .await
         {
             Ok(result) => {
