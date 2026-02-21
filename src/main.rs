@@ -261,7 +261,7 @@ binary = "claude-glm"
 progress_path = ".velor/progress.md"
 
 # Default iterations for auto-mode
-iterations = 25
+iterations = 50
 
 # Default prompt name
 prompt = "once"
@@ -684,8 +684,15 @@ async fn run_once(
         .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
         .unwrap_or_default();
 
+    // Debug: print protocol BEFORE merge (since merge takes ownership)
+    eprintln!("DEBUG [run_once]: home_cfg protocol = {:?}", home_cfg.defaults.protocol);
+    eprintln!("DEBUG [run_once]: repo_cfg protocol = {:?}", repo_cfg.defaults.protocol);
+
     // Merge: home config as base, repo config as overlay
     let file_cfg = FileConfig::merge(home_cfg, repo_cfg);
+
+    eprintln!("DEBUG [run_once]: file_cfg protocol = {:?}", file_cfg.defaults.protocol);
+    eprintln!("DEBUG [run_once]: About to get permission_mode...");
 
     let permission_mode = common
         .permission_mode
@@ -816,7 +823,7 @@ async fn run_auto(
     let iterations = args
         .iterations
         .or(file_cfg.defaults.iterations)
-        .unwrap_or(10);
+        .unwrap_or(50);
 
     let prompt_name = common
         .prompt
