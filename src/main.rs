@@ -30,7 +30,7 @@ use notification::{
 };
 use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
-use rules::{RulesCache, RulesState};
+use rules::{RulesCache, RulesState, inject_rules, select_rules};
 use tokio_util::sync::CancellationToken;
 
 /// Velor Agent CLI - Run autonomous agents with Claude AI.
@@ -337,6 +337,10 @@ specs_dir = "specs"
 plan_max_iterations = 10
 openai_api_key_env = "OPENAI_API_KEY"
 openai_model = "gpt-4o"
+
+[rules]
+enabled = false
+directory = ".agents/rules"
 "#;
 
 /// Runs the `init` subcommand to initialise a new repository with velor config.
@@ -762,8 +766,26 @@ async fn run_once(
 
     let rendered = template::render_template(&template_str, &vars)?;
 
+    // Load and inject rules if enabled
+    let prompt_with_rules = if file_cfg.rules.enabled {
+        let rules_cache = RulesCache::new(git_root.clone(), file_cfg.rules.directory.clone());
+        match rules_cache.get().await {
+            Ok(rules_set) => {
+                let state = RulesState::new();
+                let selected = select_rules(&rules_set, &state);
+                inject_rules(&rendered, &selected.rules)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load rules: {e}. Proceeding without rules.");
+                rendered.clone()
+            }
+        }
+    } else {
+        rendered.clone()
+    };
+
     if common.dry_run {
-        println!("{rendered}");
+        println!("{prompt_with_rules}");
         return Ok(());
     }
 
@@ -776,7 +798,13 @@ async fn run_once(
 
     // Run the agent (no callback for streaming output in this mode)
     runner
-        .run(&binary, &permission_mode, &rendered, &prompt_name, &cwd)
+        .run(
+            &binary,
+            &permission_mode,
+            &prompt_with_rules,
+            &prompt_name,
+            &cwd,
+        )
         .await?;
     Ok(())
 }
@@ -902,6 +930,29 @@ async fn run_auto(
     // Create agent runner based on configured protocol
     let runner = AgentRunner::from_config(file_cfg.defaults.protocol, file_cfg.defaults.acp);
 
+    // Load rules if enabled for auto mode
+    let rules_cache = if file_cfg.rules.enabled {
+        Some(RulesCache::new(
+            git_root.clone(),
+            file_cfg.rules.directory.clone(),
+        ))
+    } else {
+        None
+    };
+    let rules_set = if let Some(cache) = rules_cache {
+        match cache.get().await {
+            Ok(rules) => Some(rules),
+            Err(e) => {
+                tracing::warn!("Failed to load rules: {e}. Proceeding without rules.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Convert Option<RulesSet> to Option<&RulesSet> for passing
+    let rules_set_ref = rules_set.as_ref();
+
     let result = run_auto_loop(
         &runner,
         &binary,
@@ -914,6 +965,7 @@ async fn run_auto(
         &cwd,
         iterations,
         &cancel_handler,
+        rules_set_ref,
     )
     .await;
 
@@ -1068,6 +1120,7 @@ async fn run_auto_loop(
     cwd: &std::path::Path,
     iterations: u32,
     cancel_handler: &CancellationHandler,
+    rules_set: Option<&rules::RulesSet>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1097,7 +1150,7 @@ async fn run_auto_loop(
         println!("────────────────────────────────────────");
 
         // Render prompt with context if crash recovery is active
-        let prompt_with_context = if !history.is_empty() {
+        let rendered_prompt = if !history.is_empty() {
             let context = history.get_previous_context();
             let mut vars = base_vars.clone();
             vars.insert("iteration".to_string(), current_iteration.to_string());
@@ -1119,7 +1172,16 @@ async fn run_auto_loop(
             })?
         };
 
-        println!("📋 Prompt:\n{prompt_with_context}");
+        // Inject rules if available
+        let prompt_with_rules = if let Some(rules_set) = rules_set {
+            let state = rules::RulesState::new();
+            let selected = select_rules(rules_set, &state);
+            inject_rules(&rendered_prompt, &selected.rules)
+        } else {
+            rendered_prompt.clone()
+        };
+
+        println!("📋 Prompt:\n{prompt_with_rules}");
         println!("────────────────────────────────────────");
 
         // Execute with retry logic
@@ -1127,7 +1189,7 @@ async fn run_auto_loop(
             runner,
             binary,
             permission_mode,
-            &prompt_with_context,
+            &prompt_with_rules,
             prompt_name,
             current_iteration,
             retry_config,
@@ -1205,7 +1267,7 @@ async fn run_auto_loop(
                 // Add failed attempt to history for context
                 history.add(
                     current_iteration,
-                    &prompt_with_context,
+                    &prompt_with_rules,
                     &format!("<FAILED: {e}>"),
                 );
 

@@ -57,24 +57,33 @@ impl Rule {
         let glob_set = if globs.is_empty() {
             None
         } else {
-            let builder = GlobSetBuilder::new();
-            // Try to compile all globs; build() will return empty GlobSet if all fail
-            // For MVP, we accept any glob pattern that GlobSet accepts
-            let mut result = None;
+            let mut builder = GlobSetBuilder::new();
             for pattern in &globs {
                 // Normalize pattern: convert backslashes to forward slashes
                 let normalized = pattern.replace('\\', "/");
-                // Try to build a new globset with this pattern
-                let mut builder = GlobSetBuilder::new();
-                if let Ok(glob) = Glob::new(&normalized) {
-                    builder.add(glob);
-                    if let Ok(built) = builder.build() {
-                        result = Some(built);
-                        break; // Successfully built, use this result
+                // Add pattern to builder; log warning if pattern is invalid
+                match Glob::new(&normalized) {
+                    Ok(glob) => {
+                        builder.add(glob);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Invalid glob pattern '{}' in rule '{}': {}",
+                            pattern,
+                            name,
+                            e
+                        );
                     }
                 }
             }
-            result
+            // Build the GlobSet with all added patterns
+            match builder.build() {
+                Ok(glob_set) => Some(glob_set),
+                Err(e) => {
+                    tracing::warn!("Failed to build globset for rule '{}': {}", name, e);
+                    None
+                }
+            }
         };
 
         Self {
@@ -342,7 +351,12 @@ pub fn split_frontmatter(content: &str) -> Result<(String, String)> {
     }
 
     // First non-empty line must be opening delimiter
-    let first = lines.next().ok_or_else(|| eyre!("Empty file"))?;
+    let first = match lines.next() {
+        Some(f) => f,
+        // File is empty or contains only whitespace - return empty result
+        None => return Ok((String::new(), String::new())),
+    };
+
     if first.trim() != "---" {
         // No frontmatter found, return entire content as markdown
         return Ok((String::new(), content.to_string()));
@@ -1000,15 +1014,15 @@ mod proptest_tests {
     proptest! {
         #[test]
         fn test_split_frontmatter_preserves_content(content in ".*") {
-            // Skip empty content which returns an error
-            if content.is_empty() {
-                return Ok(());
-            }
-            let (_yaml, markdown) = split_frontmatter(&content).unwrap();
-            // Markdown should always be non-empty or equal to original content
+            let result = split_frontmatter(&content);
+            // Should never error
+            let (_yaml, markdown) = result.unwrap();
+            // Markdown should always be non-empty unless content is whitespace-only
             // When frontmatter is not found, markdown == content
             // When frontmatter is found, markdown is the content after closing ---
-            prop_assert!(!markdown.is_empty() || content.is_empty());
+            // For whitespace-only content, markdown may be empty
+            let is_whitespace_only = content.trim().is_empty();
+            prop_assert!(!markdown.is_empty() || is_whitespace_only);
         }
 
         #[test]
