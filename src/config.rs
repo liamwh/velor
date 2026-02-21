@@ -131,6 +131,26 @@ impl Default for MacOSConfig {
     }
 }
 
+/// Configuration for the rules system.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RulesConfig {
+    /// Whether the rules system is enabled.
+    pub enabled: bool,
+
+    /// Directory for rule definitions (relative to git root).
+    pub directory: String,
+}
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: ".agents/rules".to_string(),
+        }
+    }
+}
+
 /// Configuration for notifications.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -245,6 +265,10 @@ pub struct FileConfig {
     /// Notifications configuration.
     #[serde(default)]
     pub notifications: NotificationsConfig,
+
+    /// Rules system configuration.
+    #[serde(default)]
+    pub rules: RulesConfig,
 }
 
 /// Default values that can be overridden by CLI arguments.
@@ -420,6 +444,7 @@ impl FileConfig {
     /// - `conversation_db`: overlay config takes precedence
     /// - `plan`: overlay config takes precedence
     /// - `notifications`: overlay config takes precedence
+    /// - `rules`: overlay config takes precedence
     #[must_use]
     #[tracing::instrument(level = "debug", ret)]
     pub fn merge(base: Self, overlay: Self) -> Self {
@@ -430,6 +455,7 @@ impl FileConfig {
             conversation_db: overlay.conversation_db,
             plan: overlay.plan,
             notifications: overlay.notifications,
+            rules: overlay.rules,
         }
     }
 
@@ -683,6 +709,7 @@ mod tests {
                 ..Default::default()
             },
             notifications: NotificationsConfig::default(),
+            rules: RulesConfig::default(),
         };
 
         let overlay = FileConfig {
@@ -716,6 +743,7 @@ mod tests {
                 enabled: true,
                 ..Default::default()
             },
+            rules: RulesConfig::default(),
         };
 
         let result = FileConfig::merge(base, overlay);

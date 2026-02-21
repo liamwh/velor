@@ -17,6 +17,7 @@ mod git;
 mod notification;
 mod plan;
 mod retry;
+mod rules;
 mod template;
 mod tui;
 
@@ -29,6 +30,7 @@ use notification::{
 };
 use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
+use rules::{RulesCache, RulesState};
 use tokio_util::sync::CancellationToken;
 
 /// Velor Agent CLI - Run autonomous agents with Claude AI.
@@ -557,10 +559,26 @@ async fn main() -> color_eyre::eyre::Result<()> {
 
     match cli.command {
         Some(Commands::Once(args)) => {
-            run_once(args, home_cfg, git_root, cwd, &var_overrides, cancel_handler).await
+            run_once(
+                args,
+                home_cfg,
+                git_root,
+                cwd,
+                &var_overrides,
+                cancel_handler,
+            )
+            .await
         }
         Some(Commands::Auto(args)) => {
-            run_auto(args, home_cfg, git_root, cwd, &var_overrides, cancel_handler).await
+            run_auto(
+                args,
+                home_cfg,
+                git_root,
+                cwd,
+                &var_overrides,
+                cancel_handler,
+            )
+            .await
         }
         Some(Commands::Init) => run_init(git_root).await,
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root).await,
@@ -758,13 +776,7 @@ async fn run_once(
 
     // Run the agent (no callback for streaming output in this mode)
     runner
-        .run(
-            &binary,
-            &permission_mode,
-            &rendered,
-            &prompt_name,
-            &cwd,
-        )
+        .run(&binary, &permission_mode, &rendered, &prompt_name, &cwd)
         .await?;
     Ok(())
 }
