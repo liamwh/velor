@@ -199,6 +199,42 @@ pub struct NotificationsConfig {
     pub macos: Option<MacOSConfig>,
 }
 
+/// Configuration for the automations feature.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AutomationsConfig {
+    /// Directory for automation definitions (relative to git root).
+    pub automations_dir: String,
+
+    /// Path to the state database for tracking runs (relative to git root).
+    pub state_db_path: String,
+
+    /// Default maximum concurrent automations.
+    pub max_concurrent: u32,
+
+    /// Default timezone for schedule parsing (IANA tz database name).
+    pub default_timezone: String,
+
+    /// Default timeout for automation runs (seconds).
+    pub default_timeout_seconds: u64,
+
+    /// Maximum output size to store (bytes).
+    pub max_output_bytes: usize,
+}
+
+impl Default for AutomationsConfig {
+    fn default() -> Self {
+        Self {
+            automations_dir: ".velor/automations.d".to_string(),
+            state_db_path: ".velor/automations.db".to_string(),
+            max_concurrent: 3,
+            default_timezone: "UTC".to_string(),
+            default_timeout_seconds: 3600, // 1 hour
+            max_output_bytes: 100_000,     // 100 KB
+        }
+    }
+}
+
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
@@ -291,6 +327,10 @@ pub struct FileConfig {
     /// Rules system configuration.
     #[serde(default)]
     pub rules: RulesConfig,
+
+    /// Automations configuration.
+    #[serde(default)]
+    pub automations: AutomationsConfig,
 }
 
 /// Default values that can be overridden by CLI arguments.
@@ -467,6 +507,7 @@ impl FileConfig {
     /// - `plan`: overlay config takes precedence
     /// - `notifications`: overlay config takes precedence
     /// - `rules`: overlay config takes precedence
+    /// - `automations`: overlay config takes precedence
     #[must_use]
     #[tracing::instrument(level = "debug", ret)]
     pub fn merge(base: Self, overlay: Self) -> Self {
@@ -478,6 +519,7 @@ impl FileConfig {
             plan: overlay.plan,
             notifications: overlay.notifications,
             rules: overlay.rules,
+            automations: overlay.automations,
         }
     }
 
@@ -732,6 +774,7 @@ mod tests {
             },
             notifications: NotificationsConfig::default(),
             rules: RulesConfig::default(),
+            automations: AutomationsConfig::default(),
         };
 
         let overlay = FileConfig {
@@ -766,6 +809,7 @@ mod tests {
                 ..Default::default()
             },
             rules: RulesConfig::default(),
+            automations: AutomationsConfig::default(),
         };
 
         let result = FileConfig::merge(base, overlay);

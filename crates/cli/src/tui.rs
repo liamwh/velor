@@ -29,6 +29,8 @@ pub enum MenuChoice {
     Init,
     /// Generate an implementation plan from spec files using OpenAI
     Plan,
+    /// Manage and run scheduled automations
+    Automations,
     /// Exit the program
     Quit,
 }
@@ -62,6 +64,11 @@ const MENU_ITEMS: &[MenuItem] = &[
         label: "Generate Plan",
         description: "Generate an implementation plan from spec files using OpenAI",
         choice: MenuChoice::Plan,
+    },
+    MenuItem {
+        label: "Automations",
+        description: "Manage and run scheduled automations",
+        choice: MenuChoice::Automations,
     },
     MenuItem {
         label: "Quit",
@@ -235,7 +242,7 @@ mod tests {
     #[test]
     fn test_menu_items_not_empty() {
         assert!(!MENU_ITEMS.is_empty());
-        assert_eq!(MENU_ITEMS.len(), 5);
+        assert_eq!(MENU_ITEMS.len(), 6);
     }
 
     #[test]

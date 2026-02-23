@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 mod acp;
+mod automations;
 mod cancellation;
 mod claude;
 mod config;
@@ -24,6 +25,7 @@ mod tui;
 
 use cancellation::CancellationHandler;
 
+use automations::AutomationsArgs;
 use claude::{AgentRunner, require_claude_on_path};
 use config::FileConfig;
 use notification::{
@@ -63,6 +65,9 @@ enum Commands {
 
     /// Send a test notification to verify notification configuration
     TestNotification,
+
+    /// Manage and run scheduled automations
+    Automations(AutomationsArgs),
 }
 
 /// Arguments common to both subcommands
@@ -540,6 +545,30 @@ async fn run_test_notification(
     Ok(())
 }
 
+/// Runs the `automations` subcommand.
+///
+/// Dispatches to the appropriate automations subcommand handler.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
+async fn run_automations(
+    args: AutomationsArgs,
+    home_cfg: FileConfig,
+    git_root: std::path::PathBuf,
+) -> color_eyre::eyre::Result<()> {
+    use automations::AutomationsCommand;
+
+    match args.command {
+        AutomationsCommand::List => automations::run_list(home_cfg, git_root).await,
+        AutomationsCommand::Validate => automations::run_validate(home_cfg, git_root).await,
+        AutomationsCommand::Run { name } => automations::run_run(name, home_cfg, git_root).await,
+        AutomationsCommand::Status { name } => {
+            automations::run_status(name, home_cfg, git_root).await
+        }
+        AutomationsCommand::Daemon { tick_interval_secs } => {
+            automations::run_daemon(tick_interval_secs, home_cfg, git_root).await
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
     // Initialize tracing subscriber for logging
@@ -597,6 +626,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::Init) => run_init(git_root).await,
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root).await,
         Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root).await,
+        Some(Commands::Automations(args)) => run_automations(args, home_cfg, git_root).await,
         None => run_interactive_menu(home_cfg, git_root, cwd).await,
     }
 }
@@ -684,6 +714,10 @@ async fn run_interactive_menu(
                 git_root,
             )
             .await
+        }
+        MenuChoice::Automations => {
+            // When selected from TUI, show the list of automations
+            automations::run_list(home_cfg, git_root).await
         }
         MenuChoice::Quit => Ok(()),
     }
