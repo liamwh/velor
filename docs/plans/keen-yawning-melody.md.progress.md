@@ -181,6 +181,67 @@ Summary [2.819s] 258 tests run: 258 passed, 0 skipped
 
 All clippy checks pass with no warnings.
 
-## Phase 5: Pending
+## Phase 5: Worktree Support ✅ COMPLETE
 
-- Not yet started
+**Status:** Completed - Commit: `788835a`
+
+### Tasks Completed
+
+1. ✅ **Implement WorktreeCleanup struct**
+   - Added `WorktreeCleanup` struct with `path` and `git_root` fields
+   - Implemented `new()` constructor for creating cleanup handles
+   - Implemented `cleanup()` async method that properly removes worktrees using `git worktree remove --force`
+
+2. ✅ **Implement setup_worktree() method**
+   - Added async `setup_worktree()` method to `AutomationRunner`
+   - Returns `Ok(None)` when not in a git repository (graceful degradation)
+   - Creates named worktrees with format: `automation-{name}-{timestamp}`
+   - Places worktrees in sibling directory to git_root
+   - Uses `git worktree add -d` to create detached worktrees
+
+3. ✅ **Update run_automation() to use worktrees**
+   - Modified to call `setup_worktree()` before execution
+   - Uses worktree path for execution if created, otherwise falls back to git_root
+   - Properly cleans up worktree after execution (even on failure)
+   - Logs warnings if cleanup fails
+
+4. ✅ **Update execute_velor() signature**
+   - Changed to accept `work_dir: &Path` parameter instead of using `self.git_root` directly
+   - Allows execution in either worktree or main repository
+
+5. ✅ **Add comprehensive tests**
+   - `test_worktree_cleanup_new`: Verifies WorktreeCleanup struct creation
+   - `test_setup_worktree_returns_none_for_non_git_repo`: Verifies graceful degradation
+   - `test_setup_worktree_creates_worktree_for_git_repo`: Full integration test with real git repository
+
+### Design Decisions
+
+- **Detached worktrees (`-d` flag)**: Prevents branch switching conflicts
+- **Sibling directory placement**: Worktrees created next to git_root for easy cleanup
+- **Graceful degradation**: Automatically skips worktree creation when not in a git repo
+- **Explicit cleanup**: Worktree cleanup is explicit after execution, not via Drop trait
+- **Logging on failure**: Failed cleanup is logged as a warning but doesn't fail the run
+
+### Test Results
+```
+Summary [2.369s] 261 tests run: 261 passed, 0 skipped
+```
+
+All clippy checks pass with no warnings.
+
+## Plan Complete ✅
+
+The automations feature is now fully implemented according to the original plan. All 7 steps have been completed:
+
+1. ✅ Convert to Workspace Structure
+2. ✅ Create velor-automations Crate
+3. ✅ Implement Automation Store (store.rs)
+4. ✅ Implement Config (config.rs)
+5. ✅ Implement Scheduler (scheduler.rs)
+6. ✅ Implement Runner (runner.rs) with worktree support
+7. ✅ Update CLI with Automations subcommand
+
+Additional enhancements:
+- Bug fixes and comprehensive testing (Phases 3-4)
+- Catch-up policy implementation (Phase 4)
+- Worktree support for isolated execution (Phase 5)
