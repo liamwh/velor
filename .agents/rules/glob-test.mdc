@@ -1,0 +1,22 @@
+---
+description: Test rule for Markdown files - verify glob-based injection works
+globs:
+  - "**/*.md"
+  - "**/*.markdown"
+alwaysApply: false
+---
+# Markdown File Rule (TEST)
+
+This is a TEST rule for Markdown files.
+
+When you see this rule, it means:
+1. You read a `.md` file
+2. The glob-matching system worked
+3. Mid-iteration rule injection is functioning
+
+## Markdown Best Practices
+- Use descriptive headers
+- Add alt text for images
+- Use code blocks with language tags
+
+**This rule should ONLY appear when you open Markdown files.**

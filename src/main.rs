@@ -31,9 +31,10 @@ use notification::{
 };
 use plan::{PlanRunConfig, run_plan_generation};
 use retry::{ConversationHistory, RetryConfig, RetryError};
+#[allow(unused_imports)]
 use rules::{
-    RulesCache, RulesState, build_follow_up_prompt_delta, check_new_glob_matches,
-    get_rules_by_names, inject_rules, select_rules,
+    RulesCache, RulesState, build_follow_up_prompt_delta, check_new_glob_matches_with_tracing,
+    get_rules_by_names, inject_rules, select_rules, select_rules_with_intelligent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -776,8 +777,10 @@ async fn run_once(
     let rendered = template::render_template(&template_str, &vars)?;
 
     // Load and inject rules if enabled
+    tracing::info!("Rules enabled in config: {}", file_cfg.rules.enabled);
     let prompt_with_rules = if file_cfg.rules.enabled {
         let rules_cache = RulesCache::new(git_root.clone(), file_cfg.rules.directory.clone());
+        tracing::info!("Loading rules from: {}/{}", git_root.display(), file_cfg.rules.directory);
         match rules_cache.get().await {
             Ok(rules_set) => {
                 let state = RulesState::new();
@@ -940,30 +943,40 @@ async fn run_auto(
     let acp_config = file_cfg.defaults.acp.clone();
 
     // Create agent runner based on configured protocol
-    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, acp_config);
+    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, acp_config.clone());
+    tracing::info!("Runner created: {:?}", runner);
 
     // Load rules if enabled for auto mode
+    tracing::info!("Rules enabled in config: {}", file_cfg.rules.enabled);
     let rules_cache = if file_cfg.rules.enabled {
+        tracing::info!("Creating rules cache for {}/{}", git_root.display(), file_cfg.rules.directory);
         Some(RulesCache::new(
             git_root.clone(),
             file_cfg.rules.directory.clone(),
         ))
     } else {
+        tracing::info!("Rules not enabled, skipping cache creation");
         None
     };
     let rules_set = if let Some(cache) = rules_cache {
+        tracing::info!("Fetching rules from cache...");
         match cache.get().await {
-            Ok(rules) => Some(rules),
+            Ok(rules) => {
+                tracing::info!("Rules loaded successfully: {} total rules", rules.total_count());
+                Some(rules)
+            }
             Err(e) => {
                 tracing::warn!("Failed to load rules: {e}. Proceeding without rules.");
                 None
             }
         }
     } else {
+        tracing::info!("No rules cache, proceeding without rules");
         None
     };
     // Convert Option<RulesSet> to Option<&RulesSet> for passing
     let rules_set_ref = rules_set.as_ref();
+    tracing::info!("rules_set_ref.is_some(): {}", rules_set_ref.is_some());
 
     let result = run_auto_loop(
         &runner,
@@ -1182,6 +1195,16 @@ async fn run_auto_iteration_with_session(
     all_files_read.extend(turn_result.files_read.clone());
     files_delta = turn_result.files_read;
 
+    // Debug logging to understand what files were read
+    tracing::info!(
+        "Turn A completed: files_read={}, output_len={}",
+        files_delta.len(),
+        turn_result.output.len()
+    );
+    if !files_delta.is_empty() {
+        tracing::info!("Files read in Turn A: {:?}", files_delta);
+    }
+
     // Update state with files read
     {
         let mut state_guard = state.lock().await;
@@ -1197,12 +1220,21 @@ async fn run_auto_iteration_with_session(
 
     // Multi-turn loop for glob-based rule injection
     loop {
-        // Check for new glob matches using current delta
-        let new_rule_names = {
+        // Check for new glob matches using current delta (with detailed tracing)
+        let new_rules_with_files = {
             let state_guard = state.lock().await;
-            check_new_glob_matches(rules_set, &files_delta, state_guard.injected_rules())
+            rules::check_new_glob_matches_with_tracing(
+                rules_set,
+                &files_delta,
+                state_guard.injected_rules(),
+            )
             // Lock dropped
         };
+
+        let new_rule_names: Vec<_> = new_rules_with_files
+            .iter()
+            .map(|(name, _files)| name.clone())
+            .collect();
 
         if new_rule_names.is_empty() || injections >= max {
             tracing::debug!(
@@ -1215,12 +1247,14 @@ async fn run_auto_iteration_with_session(
             break;
         }
 
-        tracing::info!(
-            "Iteration {}: found {} new glob-based rules to inject: {:?}",
-            iteration,
-            new_rule_names.len(),
-            new_rule_names
-        );
+        // Log detailed information about what triggered each rule
+        for (rule_name, files) in &new_rules_with_files {
+            tracing::info!(
+                "📋 Mid-iteration: Injecting rule '{}' (triggered by files: {})",
+                rule_name,
+                files.join(", ")
+            );
+        }
 
         // Fetch rule contents for formatting
         let new_rules = get_rules_by_names(rules_set, &new_rule_names);
