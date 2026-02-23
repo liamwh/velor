@@ -1,0 +1,29 @@
+---
+description: TOML configuration file rules
+globs:
+  - "**/*.toml"
+  - "**/Cargo.toml"
+alwaysApply: false
+---
+# TOML File Rules
+
+When working with TOML configuration files:
+
+## Best Practices
+- Use consistent indentation (2 spaces preferred)
+- Group related settings together with `[section]` headers
+- Add comments above complex configuration options
+- Keep lists sorted alphabetically when it makes sense
+- Use double quotes for string values that may contain special characters
+
+## Common Patterns
+```toml
+[section]
+enabled = true
+directory = "path/to/dir"
+
+[section.subsection]
+max_items = 10
+```
+
+**This rule should be injected when you read any .toml file.**

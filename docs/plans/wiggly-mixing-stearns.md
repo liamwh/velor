@@ -1,5 +1,27 @@
 # .agents/rules Implementation Plan
 
+## Status: COMPLETE ✅
+
+All phases have been implemented and tested:
+- **Phase 1**: Core Rules Module ✅
+- **Phase 2**: Intelligent Rule Selection (ACP) ✅
+- **Phase 3**: Glob-Based Rule Activation and Mid-Iteration Injection ✅
+- **Phase 4**: Prompt Injection ✅
+
+### Verification (2026-02-22)
+
+1. **All 225 tests pass** - Unit, integration, and property tests cover all phases
+2. **Dry-run test works** - `velor once --dry-run --prompt acp-test` correctly injects always-apply rules
+3. **Test rules created**:
+   - `always-test.mdc` - always-apply rule for testing
+   - `toml-test.mdc` - glob-based rule for `.toml` files
+   - `intelligent-test.mdc` - intelligent selection rule for planning
+4. **Config updated** - Rules system enabled in `.velor/velor.toml`
+
+The rules system is fully functional and ready for use.
+
+---
+
 ## Context
 
 Velor needs an intelligent rules system similar to Cursor's `.cursor/rules` feature. Rules are `.mdc` files in `.agents/rules/` at the git root that contain project-specific instructions for the AI agent. Each rule has YAML frontmatter with metadata (`description`, `globs`, `alwaysApply`) controlling when it should be applied.

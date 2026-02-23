@@ -235,11 +235,39 @@ impl RulesState {
     ///
     /// Only returns rules that haven't been injected yet.
     #[must_use]
+    #[allow(dead_code)] // Kept for public API compatibility
     pub fn match_globs_for_files<'a>(&'a self, rules: &'a [Rule]) -> Vec<&'a Rule> {
         rules
             .iter()
             .filter(|r| !self.injected_rules.contains(&r.name))
             .filter(|r| self.files_read.iter().any(|path| r.matches_path(path)))
+            .collect()
+    }
+
+    /// Returns rules whose globs match any previously-read file, along with matching files.
+    ///
+    /// Returns a vector of (rule, matching_files) tuples for tracing purposes.
+    #[must_use]
+    pub fn match_globs_for_files_with_reason<'a>(
+        &'a self,
+        rules: &'a [Rule],
+    ) -> Vec<(&'a Rule, Vec<&'a str>)> {
+        rules
+            .iter()
+            .filter(|r| !self.injected_rules.contains(&r.name))
+            .filter_map(|r| {
+                let matching_files: Vec<_> = self
+                    .files_read
+                    .iter()
+                    .filter(|path| r.matches_path(path))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !matching_files.is_empty() {
+                    Some((r, matching_files))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -548,12 +576,23 @@ pub fn select_rules(rules_set: &RulesSet, state: &RulesState) -> SelectedRules {
     // 1. Always-apply rules (every iteration, sorted by name)
     let mut always = rules_set.always_apply.clone();
     always.sort_by(|a, b| a.name.cmp(&b.name));
+    for rule in &always {
+        tracing::info!("📋 Injecting rule '{}' (always_apply: true)", rule.name);
+    }
     for rule in always {
         selected.add(rule);
     }
 
     // 2. Glob-based rules (from files read, sorted by name)
-    let mut glob_matches: Vec<_> = state.match_globs_for_files(&rules_set.glob_based);
+    let glob_matches_with_reason = state.match_globs_for_files_with_reason(&rules_set.glob_based);
+    for (rule, files) in &glob_matches_with_reason {
+        tracing::info!(
+            "📋 Injecting rule '{}' (glob match triggered by: {})",
+            rule.name,
+            files.join(", ")
+        );
+    }
+    let mut glob_matches: Vec<_> = glob_matches_with_reason.into_iter().map(|(r, _)| r).collect();
     glob_matches.sort_by(|a, b| a.name.cmp(&b.name));
     for rule in glob_matches {
         selected.add(rule.clone());
@@ -697,6 +736,7 @@ pub fn normalize_file_path_if_safe(git_root: &Path, absolute: &Path) -> Option<S
 /// Sorted, deduplicated list of rule names that match the files read and
 /// haven't been injected yet.
 #[must_use]
+#[allow(dead_code)] // Kept for public API compatibility
 pub fn check_new_glob_matches(
     rules_set: &RulesSet,
     files_read: &[String],
@@ -707,14 +747,41 @@ pub fn check_new_glob_matches(
     for file in files_read {
         for rule in &rules_set.glob_based {
             if !injected_rules.contains(&rule.name) && rule.matches_path(file) {
-                matched_names.push(rule.name.clone());
+                matched_names.push((rule.name.clone(), file.clone()));
             }
         }
     }
 
     matched_names.sort();
     matched_names.dedup();
-    matched_names
+    matched_names.into_iter().map(|(name, _file)| name).collect()
+}
+
+/// Check for new glob matches with detailed file-to-rule mapping (for tracing).
+///
+/// Returns both rule names and which files triggered each rule.
+#[must_use]
+pub fn check_new_glob_matches_with_tracing(
+    rules_set: &RulesSet,
+    files_read: &[String],
+    injected_rules: &HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    let mut rule_to_files: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    for file in files_read {
+        for rule in &rules_set.glob_based {
+            if !injected_rules.contains(&rule.name) && rule.matches_path(file) {
+                rule_to_files
+                    .entry(rule.name.clone())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+    }
+
+    let mut result: Vec<_> = rule_to_files.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
 }
 
 /// Fetch rules by name from RulesSet (O(1) per lookup via HashMap).
@@ -982,12 +1049,23 @@ pub fn select_rules_with_intelligent(
     // 1. Always-apply rules (every iteration, sorted by name)
     let mut always = rules_set.always_apply.clone();
     always.sort_by(|a, b| a.name.cmp(&b.name));
+    for rule in &always {
+        tracing::info!("📋 Injecting rule '{}' (always_apply: true)", rule.name);
+    }
     for rule in always {
         selected.add(rule);
     }
 
     // 2. Glob-based rules (from files read, sorted by name)
-    let mut glob_matches: Vec<_> = state.match_globs_for_files(&rules_set.glob_based);
+    let glob_matches_with_reason = state.match_globs_for_files_with_reason(&rules_set.glob_based);
+    for (rule, files) in &glob_matches_with_reason {
+        tracing::info!(
+            "📋 Injecting rule '{}' (glob match triggered by: {})",
+            rule.name,
+            files.join(", ")
+        );
+    }
+    let mut glob_matches: Vec<_> = glob_matches_with_reason.into_iter().map(|(r, _)| r).collect();
     glob_matches.sort_by(|a, b| a.name.cmp(&b.name));
     for rule in glob_matches {
         selected.add(rule.clone());
@@ -1000,6 +1078,7 @@ pub fn select_rules_with_intelligent(
 
         // Filter out already-injected rules and cap the count
         for rule in sorted.into_iter().take(max_intelligent) {
+            tracing::info!("📋 Injecting rule '{}' (intelligent selection)", rule.name);
             selected.add(rule);
         }
     }
@@ -1290,6 +1369,36 @@ This is the content."#;
         // Adding same rule again should be ignored
         selected.add(rule);
         assert_eq!(selected.rules.len(), 1);
+    }
+
+    /// Test check_new_glob_matches_with_tracing for .md files.
+    #[test]
+    fn test_check_new_glob_matches_with_tracing_md() {
+        // Create a mock rule set with a glob-based rule for .md files
+        let mut rules_set = RulesSet::new();
+        let rule = Rule::new(
+            "glob-test".to_string(),
+            "Test rule for Markdown files".to_string(),
+            vec!["**/*.md".to_string()],
+            false,
+            "# Test Rule\nThis is a test.".to_string(),
+        );
+        rules_set.glob_based.push(rule);
+
+        let injected_rules = HashSet::new();
+
+        // Test that .md files match
+        let matches = check_new_glob_matches_with_tracing(
+            &rules_set,
+            &["CLAUDE.md".to_string(), "README.md".to_string()],
+            &injected_rules,
+        );
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "glob-test");
+        // The files should be sorted
+        assert!(matches[0].1.contains(&"CLAUDE.md".to_string()));
+        assert!(matches[0].1.contains(&"README.md".to_string()));
     }
 
     /// Test normalize_file_path_if_safe with path under git root.
@@ -2214,5 +2323,136 @@ Content {}"#,
         // (Each injection processes 2 rules, capped by max_injections)
         assert!(processed_rules.len() <= 5); // All rules could be processed
         assert!(injections <= max_injections);
+    }
+
+    /// Test glob-based injection with detailed file-to-rule mapping for tracing.
+    ///
+    /// This test verifies that when files are read, the correct rules are matched
+    /// and the mapping between files and rules is correctly tracked.
+    #[tokio::test]
+    async fn test_glob_based_injection_with_tracing() {
+        let temp_dir = TempDir::new().unwrap();
+        let rules_dir = temp_dir.path().join(".agents").join("rules");
+        fs::create_dir_all(&rules_dir).await.unwrap();
+
+        // Create glob-based rules for different file types
+        fs::write(
+            rules_dir.join("toml.mdc"),
+            r#"---
+description: TOML configuration files
+globs:
+  - "**/*.toml"
+  - "Cargo.toml"
+alwaysApply: false
+---
+Use consistent TOML formatting."#,
+        )
+        .await
+        .unwrap();
+
+        fs::write(
+            rules_dir.join("markdown.mdc"),
+            r#"---
+description: Markdown files
+globs:
+  - "**/*.md"
+  - "**/*.markdown"
+alwaysApply: false
+---
+Use proper Markdown syntax."#,
+        )
+        .await
+        .unwrap();
+
+        let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
+            .await
+            .unwrap();
+
+        let mut state = RulesState::new();
+
+        // Simulate agent reading multiple files
+        state.record_file_read("Cargo.toml".to_string());
+        state.record_file_read("README.md".to_string());
+        state.record_file_read(".velor/velor.toml".to_string());
+
+        // Check for new matches with detailed file mapping
+        let matches_with_files =
+            check_new_glob_matches_with_tracing(&rules_set, &["Cargo.toml".to_string()], state.injected_rules());
+
+        // Should match toml rule with Cargo.toml
+        assert_eq!(matches_with_files.len(), 1);
+        assert_eq!(matches_with_files[0].0, "toml");
+        assert_eq!(matches_with_files[0].1, vec!["Cargo.toml".to_string()]);
+
+        // Mark toml as injected
+        state.mark_injected("toml".to_string());
+
+        // Now check README.md - should match markdown rule
+        let matches_with_files =
+            check_new_glob_matches_with_tracing(&rules_set, &["README.md".to_string()], state.injected_rules());
+
+        assert_eq!(matches_with_files.len(), 1);
+        assert_eq!(matches_with_files[0].0, "markdown");
+        assert_eq!(matches_with_files[0].1, vec!["README.md".to_string()]);
+
+        // Mark markdown as injected
+        state.mark_injected("markdown".to_string());
+
+        // Now check .velor/velor.toml with toml already injected
+        // Since toml was already injected for Cargo.toml, it won't match again
+        // (rules persist across iterations once injected)
+        let matches_with_files = check_new_glob_matches_with_tracing(
+            &rules_set,
+            &[".velor/velor.toml".to_string()],
+            state.injected_rules(),
+        );
+        assert_eq!(matches_with_files.len(), 0); // Already injected, no new match
+    }
+
+    /// Test the match_globs_for_files_with_reason method for tracing output.
+    #[tokio::test]
+    async fn test_match_globs_for_files_with_reason() {
+        let temp_dir = TempDir::new().unwrap();
+        let rules_dir = temp_dir.path().join(".agents").join("rules");
+        fs::create_dir_all(&rules_dir).await.unwrap();
+
+        // Create test rules
+        fs::write(
+            rules_dir.join("config.mdc"),
+            r#"---
+description: Config files
+globs:
+  - "**/*.toml"
+  - "**/*.yaml"
+alwaysApply: false
+---
+Config file rules"#,
+        )
+        .await
+        .unwrap();
+
+        let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
+            .await
+            .unwrap();
+
+        let mut state = RulesState::new();
+
+        // Record files read
+        state.record_file_read("Cargo.toml".to_string());
+        state.record_file_read("README.md".to_string());
+        state.record_file_read(".velor/velor.toml".to_string());
+
+        // Get matches with reason (which files triggered which rules)
+        let matches_with_reason = state.match_globs_for_files_with_reason(&rules_set.glob_based);
+
+        // Should have one rule matched (config.mdc) with two files
+        assert_eq!(matches_with_reason.len(), 1);
+        assert_eq!(matches_with_reason[0].0.name, "config");
+
+        // The files should be Cargo.toml and .velor/velor.toml (both match *.toml)
+        let matching_files = &matches_with_reason[0].1;
+        assert_eq!(matching_files.len(), 2);
+        assert!(matching_files.contains(&"Cargo.toml"));
+        assert!(matching_files.contains(&".velor/velor.toml"));
     }
 }

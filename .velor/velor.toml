@@ -65,6 +65,12 @@ Please respond with a brief message confirming:
 Keep it brief - 2-3 sentences max.
 """
 
+# Test prompt to verify glob-based rule injection
+test-glob-injection = """
+Read the file CLAUDE.md and tell me what it says about the repository.
+This test verifies that glob-based rule injection works when you read Markdown files.
+"""
+
 # Single-shot prompt for one-off tasks
 once = """
 1. study {{pin}}.
@@ -89,7 +95,7 @@ auto-implement-plan = """
 IMPORTANT:
 - Author property tests, snapshot tests, and/or unit tests (whichever combination of the 3 you think is best)
 - After making the changes to the files run the tests
-- When the task is done, tests pass and {{check_cmd}} runs without errors or warnings, create a detailed commit (don't push) your work (only).
+- When the task done, tests pass and {{check_cmd}} runs without errors or warnings, create a detailed commit (don't push) your work (only).
 - Update any other spec files if necessary.
 - Leave a summary of your progress at {{plan}}.progress.md.
 """
@@ -105,3 +111,11 @@ specs_dir = "specs"
 plan_max_iterations = 10
 openai_api_key_env = "OPENAI_API_KEY"
 openai_model = "gpt-5.2"
+
+# Rules system configuration
+[rules]
+enabled = true
+directory = ".agents/rules"
+max_mid_iteration_injections = 2
+intelligent_selection = false
+intelligent_selection_max_rules = 5

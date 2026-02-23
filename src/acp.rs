@@ -220,15 +220,27 @@ impl acp::Client for VelorClient {
 
     /// Handles extension method calls from the agent.
     ///
-    /// Returns method not found for unhandled extensions.
-    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+    /// This intercepts MCP tool calls and other extension methods.
+    /// We log them to understand what tools the agent is using.
+    async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        // Log extension method calls to understand what the agent is doing
+        tracing::info!("🔧 Agent called extension method: {}", args.method);
+        // params is Arc<RawValue>, not Option
+        tracing::debug!("Method params: {:?}", args.params);
+        // Return method_not_found to let the adapter handle it
         Err(acp::Error::method_not_found())
     }
 
     /// Handles extension notifications from the agent.
     ///
-    /// Returns method not found for unhandled extensions.
-    async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
+    /// This intercepts MCP notifications and other extension notifications.
+    /// We log them to understand what the agent is doing.
+    async fn ext_notification(&self, args: acp::ExtNotification) -> acp::Result<()> {
+        // Log extension notifications to understand what the agent is doing
+        tracing::info!("🔔 Agent sent extension notification: {}", args.method);
+        // params is Arc<RawValue>, not Option
+        tracing::debug!("Notification params: {:?}", args.params);
+        // Return method_not_found to let the adapter handle it
         Err(acp::Error::method_not_found())
     }
 }
@@ -253,12 +265,16 @@ impl acp::Client for VelorClient {
 ///
 /// session.close().await?;
 /// ```
-#[derive(Debug)]
 pub struct AcpSession {
     /// The spawned subprocess for the ACP adapter.
     child: tokio::process::Child,
-    /// Client-side connection to the ACP adapter.
-    conn: acp::ClientSideConnection,
+    /// The LocalSet that keeps the ACP I/O handler alive.
+    /// This must live as long as the session to prevent the background
+    /// I/O task from being cancelled.
+    local_set: tokio::task::LocalSet,
+    /// Shared reference to the ACP connection (wrapped because it's !Send).
+    /// Stored inside Arc<Mutex> to allow access from outside LocalSet.
+    conn: Arc<Mutex<Option<acp::ClientSideConnection>>>,
     /// The session ID for this ACP session.
     session_id: acp::SessionId,
     /// Shared output buffer for collecting agent responses.
@@ -268,6 +284,17 @@ pub struct AcpSession {
     /// Working directory for this session (for future use).
     #[allow(dead_code)]
     cwd: PathBuf,
+}
+
+impl std::fmt::Debug for AcpSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpSession")
+            .field("session_id", &self.session_id)
+            .field("cwd", &self.cwd)
+            .field("output_len", &self.output.try_lock().ok().map(|x| x.len()))
+            .field("files_read_len", &self.files_read_this_turn.try_lock().ok().map(|x| x.len()))
+            .finish()
+    }
 }
 
 #[allow(dead_code)]
@@ -307,9 +334,12 @@ impl AcpSession {
         })?;
 
         // Spawn the ACP adapter binary
+        // Unset CLAUDECODE to prevent "nested session" error
         let mut child = tokio::process::Command::new(binary)
             .current_dir(&cwd)
             .env(&config.api_key_env, api_key)
+            .env("CLAUDECODE", "")
+            .env("CLAUDE_CODE_ENTRY_POINT", "")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -344,15 +374,17 @@ impl AcpSession {
         );
 
         // The ACP SDK futures are not Send, so we need to use LocalSet
+        // This LocalSet must live as long as the session to keep the I/O handler alive
         let local_set = tokio::task::LocalSet::new();
 
         // We need to get the connection and session_id out of the LocalSet
         // Use a Mutex to share the result across the await boundary
-        let init_result: Arc<Mutex<Option<(acp::ClientSideConnection, acp::SessionId)>>> =
-            Arc::new(Mutex::new(None));
+        let conn: Arc<Mutex<Option<acp::ClientSideConnection>>> = Arc::new(Mutex::new(None));
+        let session_id_holder: Arc<Mutex<Option<acp::SessionId>>> = Arc::new(Mutex::new(None));
 
         let cwd_for_async = cwd.clone();
-        let init_result_clone = init_result.clone();
+        let conn_clone = conn.clone();
+        let session_id_holder_clone = session_id_holder.clone();
         local_set
             .run_until(async move {
                 // Create the ACP client-side connection
@@ -361,7 +393,7 @@ impl AcpSession {
                         tokio::task::spawn_local(fut);
                     });
 
-                // Handle I/O in the background
+                // Handle I/O in the background - this must stay alive for the entire session
                 tokio::task::spawn_local(handle_io);
 
                 // Initialize the protocol using builder pattern
@@ -384,26 +416,30 @@ impl AcpSession {
 
                 let session_id = session_response.session_id;
 
-                // Store the connection and session_id
-                let mut guard = init_result_clone.lock().await;
-                *guard = Some((conn, session_id));
+                // Store the connection and session_id in the Arc<Mutex>
+                let mut conn_guard = conn_clone.lock().await;
+                *conn_guard = Some(conn);
+                let mut session_id_guard = session_id_holder_clone.lock().await;
+                *session_id_guard = Some(session_id);
 
                 color_eyre::eyre::Result::<()>::Ok(())
             })
             .await?;
 
-        // Extract the connection and session_id
-        let (conn, session_id) = {
-            let mut guard = init_result.lock().await;
+        // Extract the session_id
+        let session_id = {
+            let guard = session_id_holder.lock().await;
             guard
-                .take()
-                .ok_or_else(|| eyre!("ACP initialization failed to return connection"))?
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| eyre!("ACP initialization failed to return session_id"))?
         };
 
         tracing::info!("✅ ACP session established with id: {session_id}");
 
         Ok(Self {
             child,
+            local_set,
             conn,
             session_id,
             output,
@@ -446,6 +482,7 @@ impl AcpSession {
         // Clone Arcs for use within the async block
         let output = self.output.clone();
         let files_read_this_turn = self.files_read_this_turn.clone();
+        let conn = self.conn.clone();
 
         // Clear the output and files_read buffers for this new turn
         {
@@ -457,15 +494,18 @@ impl AcpSession {
             files_read_guard.clear();
         }
 
-        // Get a mutable reference to conn for the prompt call
-        // We need to do this carefully since we're using self within the closure
-        let conn_ref = &mut self.conn;
-
-        // The ACP SDK futures are not Send, so we need to use LocalSet
-        let local_set = tokio::task::LocalSet::new();
+        // Use the SAME LocalSet that the session was created with
+        // This is critical - the background I/O handler is running in this LocalSet
+        let local_set = &mut self.local_set;
 
         local_set
-            .run_until(async {
+            .run_until(async move {
+                // Get the connection from the Arc<Mutex>
+                let conn_guard = conn.lock().await;
+                let conn_ref = conn_guard
+                    .as_ref()
+                    .ok_or_else(|| eyre!("Connection not initialized"))?;
+
                 // Send the prompt using builder pattern and capture response
                 let prompt_response = conn_ref
                     .prompt(acp::PromptRequest::new(
@@ -570,9 +610,12 @@ pub async fn run_acp(
     })?;
 
     // Spawn the ACP adapter binary
+    // Unset CLAUDECODE to prevent "nested session" error
     let mut child = tokio::process::Command::new(binary)
         .current_dir(&cwd)
         .env(&config.api_key_env, api_key)
+        .env("CLAUDECODE", "")
+        .env("CLAUDE_CODE_ENTRY_POINT", "")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)

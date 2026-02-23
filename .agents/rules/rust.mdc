@@ -1,6 +1,8 @@
 ---
 description: Writing rust code
-globs: *.rs
+globs:
+  - "*.rs"
+  - "**/*.rs"
 alwaysApply: false
 ---
 # Rust Instructions

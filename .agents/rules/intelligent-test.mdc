@@ -1,0 +1,19 @@
+---
+description: Intelligent selection test rule for planning and design
+globs: []
+alwaysApply: false
+---
+# Planning and Design Rule
+
+This rule should be selected intelligently when:
+- Planning new features
+- Designing system architecture
+- Making implementation decisions
+
+## Planning Best Practices
+1. Break down complex tasks into smaller steps
+2. Consider edge cases and error handling
+3. Plan for testing from the start
+4. Document assumptions and constraints
+
+**This is a test rule for intelligent selection.**
