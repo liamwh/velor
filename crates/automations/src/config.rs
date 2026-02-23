@@ -40,21 +40,16 @@ impl Default for AutomationsConfig {
 }
 
 /// Catch-up policy for missed runs.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CatchUpPolicy {
     /// Skip all missed runs, run only once on next tick.
+    #[default]
     Skip,
     /// Run once regardless of how many were missed.
     RunOnce,
     /// Run all missed schedules (may be dangerous!).
     RunAll,
-}
-
-impl Default for CatchUpPolicy {
-    fn default() -> Self {
-        Self::Skip
-    }
 }
 
 /// An automation definition loaded from TOML.
@@ -233,7 +228,7 @@ key = "value"
             let automations = result.unwrap();
             assert_eq!(automations.len(), 1);
             assert_eq!(automations[0].name, "test");
-            assert_eq!(automations[0].enabled, true);
+            assert!(automations[0].enabled);
         });
     }
 

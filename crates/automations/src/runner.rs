@@ -53,6 +53,12 @@ impl AutomationRunner {
         }
     }
 
+    /// Get a reference to the underlying store.
+    #[must_use]
+    pub const fn store(&self) -> &AutomationStore {
+        &self.store
+    }
+
     /// Run a single automation.
     ///
     /// # Errors
@@ -293,5 +299,27 @@ mod tests {
 
         // Just verify the runner was created
         assert_eq!(runner.max_output_bytes, 100_000);
+    }
+
+    #[tokio::test]
+    async fn test_runner_store_access() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        let runner = AutomationRunner::new(store, 3, temp_dir.path(), "velor".to_string(), 100_000);
+
+        // Verify we can access the store
+        let store_ref = runner.store();
+
+        // Try to query the store to verify it's functional
+        let runs = store_ref
+            .get_runs(None, 10)
+            .await
+            .expect("get_runs should succeed");
+        assert_eq!(runs.len(), 0);
     }
 }
