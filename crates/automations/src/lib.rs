@@ -1,0 +1,17 @@
+//! Velor Automations - Cron job capability for Velor agents.
+//!
+//! This crate provides scheduled, recurring execution of prompts,
+//! similar to OpenAI Codex automations.
+
+#![warn(missing_docs)]
+
+pub mod config;
+pub mod runner;
+pub mod scheduler;
+pub mod store;
+
+// Re-exports for convenience
+pub use config::{Automation, AutomationsConfig, CatchUpPolicy, load_automations};
+pub use runner::AutomationRunner;
+pub use scheduler::Scheduler;
+pub use store::{AutomationRun, AutomationRunStatus, AutomationStore};

@@ -592,7 +592,10 @@ pub fn select_rules(rules_set: &RulesSet, state: &RulesState) -> SelectedRules {
             files.join(", ")
         );
     }
-    let mut glob_matches: Vec<_> = glob_matches_with_reason.into_iter().map(|(r, _)| r).collect();
+    let mut glob_matches: Vec<_> = glob_matches_with_reason
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect();
     glob_matches.sort_by(|a, b| a.name.cmp(&b.name));
     for rule in glob_matches {
         selected.add(rule.clone());
@@ -754,7 +757,10 @@ pub fn check_new_glob_matches(
 
     matched_names.sort();
     matched_names.dedup();
-    matched_names.into_iter().map(|(name, _file)| name).collect()
+    matched_names
+        .into_iter()
+        .map(|(name, _file)| name)
+        .collect()
 }
 
 /// Check for new glob matches with detailed file-to-rule mapping (for tracing).
@@ -766,7 +772,8 @@ pub fn check_new_glob_matches_with_tracing(
     files_read: &[String],
     injected_rules: &HashSet<String>,
 ) -> Vec<(String, Vec<String>)> {
-    let mut rule_to_files: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut rule_to_files: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     for file in files_read {
         for rule in &rules_set.glob_based {
@@ -1065,7 +1072,10 @@ pub fn select_rules_with_intelligent(
             files.join(", ")
         );
     }
-    let mut glob_matches: Vec<_> = glob_matches_with_reason.into_iter().map(|(r, _)| r).collect();
+    let mut glob_matches: Vec<_> = glob_matches_with_reason
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect();
     glob_matches.sort_by(|a, b| a.name.cmp(&b.name));
     for rule in glob_matches {
         selected.add(rule.clone());
@@ -2376,8 +2386,11 @@ Use proper Markdown syntax."#,
         state.record_file_read(".velor/velor.toml".to_string());
 
         // Check for new matches with detailed file mapping
-        let matches_with_files =
-            check_new_glob_matches_with_tracing(&rules_set, &["Cargo.toml".to_string()], state.injected_rules());
+        let matches_with_files = check_new_glob_matches_with_tracing(
+            &rules_set,
+            &["Cargo.toml".to_string()],
+            state.injected_rules(),
+        );
 
         // Should match toml rule with Cargo.toml
         assert_eq!(matches_with_files.len(), 1);
@@ -2388,8 +2401,11 @@ Use proper Markdown syntax."#,
         state.mark_injected("toml".to_string());
 
         // Now check README.md - should match markdown rule
-        let matches_with_files =
-            check_new_glob_matches_with_tracing(&rules_set, &["README.md".to_string()], state.injected_rules());
+        let matches_with_files = check_new_glob_matches_with_tracing(
+            &rules_set,
+            &["README.md".to_string()],
+            state.injected_rules(),
+        );
 
         assert_eq!(matches_with_files.len(), 1);
         assert_eq!(matches_with_files[0].0, "markdown");
