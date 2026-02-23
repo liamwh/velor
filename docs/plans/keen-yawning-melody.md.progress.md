@@ -149,9 +149,37 @@ Summary [4.299s] 255 tests run: 255 passed, 0 skipped
 
 All clippy checks pass with no warnings.
 
-## Phase 4: Pending
+## Phase 4: Catch-Up Policy Implementation ✅ COMPLETE
 
-- Not yet started
+**Status:** Completed - Commit: `b7e37d2`
+
+### Tasks Completed
+
+1. ✅ **Implement catch-up policy handling in daemon**
+   - The `CatchUpPolicy` enum was previously defined but not actually used
+   - Implemented proper catch-up logic in `run_daemon()` that:
+     - Calculates missed runs using `Scheduler::missed_runs_since()`
+     - Executes each scheduled run individually with proper status reporting
+     - Respects the `max_catch_up` configuration value
+   - Enhanced daemon output to show catch-up policy and number of executions
+
+2. ✅ **Add comprehensive unit tests**
+   - `test_catch_up_policy_skip()`: Verifies Skip policy runs once on next scheduled time
+   - `test_catch_up_policy_run_once()`: Verifies RunOnce policy runs once if any runs were missed
+   - `test_catch_up_policy_run_all()`: Verifies RunAll policy runs all missed schedules up to limit
+   - Added helper function `create_test_automation()` for test setup
+
+3. ✅ **Catch-up policies behavior:**
+   - **Skip** (default): Only run once on the next scheduled time, skip all missed runs
+   - **RunOnce**: Run once if any runs were missed, regardless of how many were missed
+   - **RunAll**: Run all missed schedules up to the `max_catch_up` limit
+
+### Test Results
+```
+Summary [2.819s] 258 tests run: 258 passed, 0 skipped
+```
+
+All clippy checks pass with no warnings.
 
 ## Phase 5: Pending
 
