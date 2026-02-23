@@ -407,7 +407,7 @@ pub async fn run_daemon(
         // Check each automation
         for automation in &enabled_automations {
             // Get last run time for this automation
-            let last_run = get_last_run_time(&automation.name, now).await;
+            let last_run = get_last_run_time(runner.store(), &automation.name, now).await;
 
             // Calculate next scheduled time
             let timezone = automation
@@ -482,18 +482,26 @@ pub async fn run_daemon(
 /// Gets the last run time for an automation.
 ///
 /// Returns the time of the most recent run, or the current time if no runs exist.
+#[tracing::instrument(level = "trace", ret, fields(automation_name = %automation_name))]
 async fn get_last_run_time(
-    _automation_name: &str,
+    store: &AutomationStore,
+    automation_name: &str,
     default: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
-    // For now, return a simple default
-    // In a full implementation, this would query the store
-    default
+    // Query the store for the most recent run
+    match store.get_runs(Some(automation_name), 1).await {
+        Ok(runs) if !runs.is_empty() => {
+            // Return the started_at time of the most recent run
+            runs[0].started_at
+        }
+        _ => default,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_automations_command_exists() {
@@ -501,5 +509,84 @@ mod tests {
         let _ = AutomationsArgs {
             command: AutomationsCommand::List,
         };
+    }
+
+    #[tokio::test]
+    async fn test_get_last_run_time_with_existing_runs() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        // Create some test runs
+        let now = chrono::Utc::now();
+        let _ = store
+            .insert_run(
+                "test-automation",
+                now - chrono::Duration::hours(2),
+                now - chrono::Duration::hours(2),
+            )
+            .await
+            .expect("first insert should succeed");
+
+        let second_run_time = now - chrono::Duration::minutes(30);
+        let _ = store
+            .insert_run("test-automation", second_run_time, second_run_time)
+            .await
+            .expect("second insert should succeed");
+
+        // Get the last run time
+        let default_time = now - chrono::Duration::days(1);
+        let last_run = get_last_run_time(&store, "test-automation", default_time).await;
+
+        // Should return the most recent run (30 minutes ago)
+        // We compare within a reasonable time window
+        let diff = (last_run - second_run_time).num_seconds().abs();
+        assert!(diff < 5, "Last run time should match the second run time");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_run_time_with_no_runs() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        let default_time = chrono::Utc::now();
+        let last_run = get_last_run_time(&store, "nonexistent-automation", default_time).await;
+
+        // Should return the default time when no runs exist
+        assert_eq!(last_run, default_time);
+    }
+
+    #[tokio::test]
+    async fn test_get_last_run_time_ignores_other_automations() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        // Create runs for a different automation
+        let now = chrono::Utc::now();
+        let _ = store
+            .insert_run(
+                "other-automation",
+                now - chrono::Duration::minutes(10),
+                now - chrono::Duration::minutes(10),
+            )
+            .await
+            .expect("insert should succeed");
+
+        let default_time = now - chrono::Duration::days(1);
+        let last_run = get_last_run_time(&store, "test-automation", default_time).await;
+
+        // Should return the default time since "test-automation" has no runs
+        assert_eq!(last_run, default_time);
     }
 }

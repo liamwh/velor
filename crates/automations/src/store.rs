@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool, sqlite::SqliteConnectOptions};
+use std::str::FromStr;
 
 /// Status of an automation run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -38,20 +39,34 @@ impl AutomationRunStatus {
             Self::Cancelled => "Cancelled",
         }
     }
+}
 
-    /// Parses a status string into an `AutomationRunStatus`.
-    #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for AutomationRunStatus {
+    type Err = ParseAutomationRunStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "Pending" => Some(Self::Pending),
-            "Running" => Some(Self::Running),
-            "Completed" => Some(Self::Completed),
-            "Failed" => Some(Self::Failed),
-            "Cancelled" => Some(Self::Cancelled),
-            _ => None,
+            "Pending" => Ok(Self::Pending),
+            "Running" => Ok(Self::Running),
+            "Completed" => Ok(Self::Completed),
+            "Failed" => Ok(Self::Failed),
+            "Cancelled" => Ok(Self::Cancelled),
+            _ => Err(ParseAutomationRunStatusError),
         }
     }
 }
+
+/// Error returned when parsing an `AutomationRunStatus` from a string fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseAutomationRunStatusError;
+
+impl std::fmt::Display for ParseAutomationRunStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid automation run status")
+    }
+}
+
+impl std::error::Error for ParseAutomationRunStatusError {}
 
 /// A record of an automation run.
 #[derive(Debug, Clone, Serialize)]
@@ -274,15 +289,15 @@ impl AutomationStore {
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some(locked_str) = locked_at {
-                if let Ok(locked) = DateTime::parse_from_rfc3339(&locked_str) {
-                    let locked = locked.with_timezone(&Utc);
-                    let stale_threshold = Utc::now() - chrono::Duration::hours(2);
-                    if locked < stale_threshold {
-                        // Lock is stale, remove it and retry
-                        self.release_lock(automation_name).await?;
-                        continue;
-                    }
+            if let Some(locked_str) = locked_at
+                && let Ok(locked) = DateTime::parse_from_rfc3339(&locked_str)
+            {
+                let locked = locked.with_timezone(&Utc);
+                let stale_threshold = Utc::now() - chrono::Duration::hours(2);
+                if locked < stale_threshold {
+                    // Lock is stale, remove it and retry
+                    self.release_lock(automation_name).await?;
+                    continue;
                 }
             }
             return Ok(None);
@@ -431,25 +446,25 @@ mod tests {
     fn test_status_from_str() {
         assert_eq!(
             AutomationRunStatus::from_str("Pending"),
-            Some(AutomationRunStatus::Pending)
+            Ok(AutomationRunStatus::Pending)
         );
         assert_eq!(
             AutomationRunStatus::from_str("Running"),
-            Some(AutomationRunStatus::Running)
+            Ok(AutomationRunStatus::Running)
         );
         assert_eq!(
             AutomationRunStatus::from_str("Completed"),
-            Some(AutomationRunStatus::Completed)
+            Ok(AutomationRunStatus::Completed)
         );
         assert_eq!(
             AutomationRunStatus::from_str("Failed"),
-            Some(AutomationRunStatus::Failed)
+            Ok(AutomationRunStatus::Failed)
         );
         assert_eq!(
             AutomationRunStatus::from_str("Cancelled"),
-            Some(AutomationRunStatus::Cancelled)
+            Ok(AutomationRunStatus::Cancelled)
         );
-        assert_eq!(AutomationRunStatus::from_str("Invalid"), None);
+        assert!(AutomationRunStatus::from_str("Invalid").is_err());
     }
 
     #[tokio::test]
