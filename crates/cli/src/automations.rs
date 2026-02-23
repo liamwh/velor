@@ -417,18 +417,55 @@ pub async fn run_daemon(
 
             match velor_automations::Scheduler::new(&automation.schedule, timezone) {
                 Ok(scheduler) => {
-                    let next_run = scheduler.next_after(last_run);
+                    // Determine which runs to execute based on catch-up policy
+                    let runs_to_execute = match automation.catch_up {
+                        velor_automations::CatchUpPolicy::Skip => {
+                            // Only run if the next scheduled time has passed
+                            let next_run = scheduler.next_after(last_run);
+                            if next_run <= now {
+                                vec![next_run]
+                            } else {
+                                vec![]
+                            }
+                        }
+                        velor_automations::CatchUpPolicy::RunOnce => {
+                            // Run once if any runs were missed
+                            let missed = scheduler.missed_runs_since(last_run, now, u32::MAX);
+                            if missed.is_empty() {
+                                vec![]
+                            } else {
+                                // Run only the first missed schedule
+                                vec![missed[0]]
+                            }
+                        }
+                        velor_automations::CatchUpPolicy::RunAll => {
+                            // Run all missed schedules up to max_catch_up
+                            scheduler.missed_runs_since(last_run, now, automation.max_catch_up)
+                        }
+                    };
 
-                    if next_run <= now {
-                        println!(
-                            "  ▶️  Running '{}' (scheduled for {})",
+                    if runs_to_execute.is_empty() {
+                        tracing::debug!(
+                            "  ⏸️  Skipping '{}' (next run at {})",
                             automation.name,
-                            next_run.format("%H:%M:%S")
+                            scheduler.next_after(last_run).format("%Y-%m-%d %H:%M:%S")
                         );
+                        continue;
+                    }
 
-                        // Run the automation
+                    println!(
+                        "  ▶️  Running '{}' {} time(s) (catch-up: {:?})",
+                        automation.name,
+                        runs_to_execute.len(),
+                        automation.catch_up
+                    );
+
+                    // Execute each scheduled run
+                    for scheduled_for in runs_to_execute {
+                        println!("      - Scheduled for {}", scheduled_for.format("%H:%M:%S"));
+
                         match runner
-                            .run_automation(automation, next_run, &cancel_token)
+                            .run_automation(automation, scheduled_for, &cancel_token)
                             .await
                         {
                             Ok(result) => {
@@ -439,21 +476,15 @@ pub async fn run_daemon(
                                     _ => "⏳",
                                 };
                                 println!(
-                                    "      {} Status: {}",
+                                    "        {} Status: {}",
                                     status_icon,
                                     result.status.as_str()
                                 );
                             }
                             Err(e) => {
-                                println!("      ❌ Error: {}", e);
+                                println!("        ❌ Error: {}", e);
                             }
                         }
-                    } else {
-                        tracing::debug!(
-                            "  ⏸️  Skipping '{}' (next run at {})",
-                            automation.name,
-                            next_run.format("%Y-%m-%d %H:%M:%S")
-                        );
                     }
                 }
                 Err(e) => {
@@ -502,6 +533,7 @@ async fn get_last_run_time(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use velor_automations::{Automation, CatchUpPolicy};
 
     #[test]
     fn test_automations_command_exists() {
@@ -588,5 +620,141 @@ mod tests {
 
         // Should return the default time since "test-automation" has no runs
         assert_eq!(last_run, default_time);
+    }
+
+    /// Helper function to create a test automation with the given catch-up policy.
+    fn create_test_automation(name: &str, schedule: &str, catch_up: CatchUpPolicy) -> Automation {
+        Automation {
+            name: name.to_string(),
+            description: "Test automation".to_string(),
+            schedule: schedule.to_string(),
+            timezone: "UTC".to_string(),
+            prompt: "once".to_string(),
+            enabled: true,
+            vars: std::collections::BTreeMap::new(),
+            catch_up,
+            max_catch_up: 10,
+            timeout_seconds: Some(60),
+            notify_on_success: false,
+            notify_on_failure: false,
+        }
+    }
+
+    /// Test that the catch-up policy is correctly used in the scheduling logic.
+    #[tokio::test]
+    async fn test_catch_up_policy_skip() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let _store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        // Create an automation with Skip policy
+        let automation = create_test_automation("test-skip", "0 * * * * *", CatchUpPolicy::Skip);
+
+        // Simulate a last run time of 1 hour ago
+        let now = chrono::Utc::now();
+        let last_run = now - chrono::Duration::hours(1);
+
+        // With Skip policy and a schedule of every minute, we should only get one run
+        let timezone = chrono_tz::UTC;
+        let scheduler = velor_automations::Scheduler::new(&automation.schedule, timezone)
+            .expect("scheduler should be created");
+
+        let next_run = scheduler.next_after(last_run);
+
+        // Skip policy only runs once if next_run <= now
+        let runs_to_execute = if next_run <= now {
+            vec![next_run]
+        } else {
+            vec![]
+        };
+
+        // Should have exactly one run (the next scheduled time)
+        assert_eq!(
+            runs_to_execute.len(),
+            1,
+            "Skip policy should only execute once"
+        );
+    }
+
+    /// Test that RunOnce policy executes only once even with multiple missed runs.
+    #[tokio::test]
+    async fn test_catch_up_policy_run_once() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let _store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        // Create an automation with RunOnce policy
+        let automation =
+            create_test_automation("test-run-once", "0 * * * * *", CatchUpPolicy::RunOnce);
+
+        // Simulate a last run time of 10 minutes ago with a schedule every minute
+        let now = chrono::Utc::now();
+        let last_run = now - chrono::Duration::minutes(10);
+
+        let timezone = chrono_tz::UTC;
+        let scheduler = velor_automations::Scheduler::new(&automation.schedule, timezone)
+            .expect("scheduler should be created");
+
+        // RunOnce policy should run once if any runs were missed
+        let missed = scheduler.missed_runs_since(last_run, now, u32::MAX);
+        let runs_to_execute = if missed.is_empty() {
+            vec![]
+        } else {
+            vec![missed[0]]
+        };
+
+        // Should have exactly one run (the first missed schedule)
+        assert_eq!(
+            runs_to_execute.len(),
+            1,
+            "RunOnce policy should only execute once"
+        );
+    }
+
+    /// Test that RunAll policy executes all missed runs up to max_catch_up.
+    #[tokio::test]
+    async fn test_catch_up_policy_run_all() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let _store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        // Create an automation with RunAll policy and max_catch_up of 5
+        let mut automation =
+            create_test_automation("test-run-all", "0 * * * * *", CatchUpPolicy::RunAll);
+        automation.max_catch_up = 5;
+
+        // Simulate a last run time of 10 minutes ago with a schedule every minute
+        let now = chrono::Utc::now();
+        let last_run = now - chrono::Duration::minutes(10);
+
+        let timezone = chrono_tz::UTC;
+        let scheduler = velor_automations::Scheduler::new(&automation.schedule, timezone)
+            .expect("scheduler should be created");
+
+        // RunAll policy should run all missed schedules up to max_catch_up
+        let runs_to_execute = scheduler.missed_runs_since(last_run, now, automation.max_catch_up);
+
+        // Should have at most 5 runs (max_catch_up)
+        assert!(
+            runs_to_execute.len() <= 5,
+            "RunAll policy should respect max_catch_up limit"
+        );
+
+        // Should have all the missed runs (since there are 10 minutes and we run every minute,
+        // we expect 10 runs but limited to 5 by max_catch_up)
+        assert_eq!(
+            runs_to_execute.len(),
+            5,
+            "RunAll policy should execute up to max_catch_up runs"
+        );
     }
 }
