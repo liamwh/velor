@@ -25,6 +25,52 @@ pub struct AutomationResult {
     pub error: Option<String>,
 }
 
+/// Cleanup handle for a git worktree.
+///
+/// When dropped, this will attempt to remove the worktree using `git worktree remove`.
+/// If the removal fails, an error will be logged but the drop will not panic.
+pub struct WorktreeCleanup {
+    /// The path to the worktree.
+    pub path: std::path::PathBuf,
+    /// The git root directory where the worktree was created.
+    git_root: std::path::PathBuf,
+}
+
+impl WorktreeCleanup {
+    /// Create a new worktree cleanup handle.
+    #[must_use]
+    pub const fn new(path: std::path::PathBuf, git_root: std::path::PathBuf) -> Self {
+        Self { path, git_root }
+    }
+
+    /// Explicitly clean up the worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worktree cannot be removed.
+    pub async fn cleanup(self) -> color_eyre::Result<()> {
+        // Use `git worktree remove` to properly remove the worktree
+        let status = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .current_dir(&self.git_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .await?;
+
+        if !status.success() {
+            return Err(color_eyre::eyre::eyre!(
+                "Failed to remove worktree at {:?}: git exited with {:?}",
+                self.path,
+                status.code()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Runs automations with concurrency control.
 pub struct AutomationRunner {
     store: AutomationStore,
@@ -57,6 +103,61 @@ impl AutomationRunner {
     #[must_use]
     pub const fn store(&self) -> &AutomationStore {
         &self.store
+    }
+
+    /// Set up a git worktree for isolated automation execution.
+    ///
+    /// If the directory is not a git repository, returns `Ok(None)` and the
+    /// automation will run directly in `git_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worktree cannot be created.
+    async fn setup_worktree(
+        &self,
+        automation: &Automation,
+    ) -> color_eyre::Result<Option<WorktreeCleanup>> {
+        let git_dir = self.git_root.join(".git");
+        if !git_dir.exists() {
+            tracing::debug!("Not a git repository, skipping worktree creation");
+            return Ok(None);
+        }
+
+        let wt_name = format!(
+            "automation-{}-{}",
+            automation.name,
+            Utc::now().format("%Y%m%d-%H%M%S")
+        );
+
+        // Put worktree in a sibling directory to git_root
+        let wt_path = self
+            .git_root
+            .parent()
+            .unwrap_or(&self.git_root)
+            .join(&wt_name);
+
+        tracing::debug!("Creating worktree '{}' at {:?}", wt_name, wt_path);
+
+        // Create worktree using git
+        let output = Command::new("git")
+            .args(["worktree", "add", "-d"])
+            .arg(&wt_path)
+            .current_dir(&self.git_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(color_eyre::eyre::eyre!(
+                "Failed to create worktree: git exited with {:?}: {}",
+                output.status.code(),
+                stderr
+            ));
+        }
+
+        Ok(Some(WorktreeCleanup::new(wt_path, self.git_root.clone())))
     }
 
     /// Run a single automation.
@@ -142,13 +243,22 @@ impl AutomationRunner {
             .update_run(run_id, AutomationRunStatus::Running, 0, None, None, None)
             .await?;
 
+        // Set up worktree for isolated execution
+        let worktree_cleanup = self.setup_worktree(automation).await?;
+        let work_dir = worktree_cleanup
+            .as_ref()
+            .map(|wc| &wc.path)
+            .unwrap_or(&self.git_root);
+
+        tracing::debug!("Running automation in {:?}", work_dir);
+
         // Determine timeout
         let timeout_duration = Duration::from_secs(automation.timeout_seconds.unwrap_or(3600));
 
         // Execute velor with timeout
         let result = match timeout(
             timeout_duration,
-            self.execute_velor(automation, cancel_token.clone()),
+            self.execute_velor(automation, work_dir, cancel_token.clone()),
         )
         .await
         {
@@ -168,6 +278,14 @@ impl AutomationRunner {
                 error: Some("Timed out".to_string()),
             },
         };
+
+        // Clean up worktree if it was created
+        if let Some(wc) = worktree_cleanup {
+            tracing::debug!("Cleaning up worktree at {:?}", wc.path);
+            if let Err(e) = wc.cleanup().await {
+                tracing::warn!("Failed to clean up worktree: {}", e);
+            }
+        }
 
         // Update run record
         self.store
@@ -195,6 +313,7 @@ impl AutomationRunner {
     async fn execute_velor(
         &self,
         automation: &Automation,
+        work_dir: &Path,
         cancel_token: CancellationToken,
     ) -> color_eyre::Result<AutomationResult> {
         // Check for cancellation before starting
@@ -212,7 +331,7 @@ impl AutomationRunner {
             .arg("once")
             .arg("--prompt")
             .arg(&automation.prompt)
-            .current_dir(&self.git_root)
+            .current_dir(work_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -321,5 +440,163 @@ mod tests {
             .await
             .expect("get_runs should succeed");
         assert_eq!(runs.len(), 0);
+    }
+
+    #[test]
+    fn test_worktree_cleanup_new() {
+        let path = std::path::PathBuf::from("/test/path");
+        let git_root = std::path::PathBuf::from("/git/root");
+
+        let cleanup = WorktreeCleanup::new(path.clone(), git_root.clone());
+
+        assert_eq!(cleanup.path, path);
+        assert_eq!(cleanup.git_root, git_root);
+    }
+
+    #[tokio::test]
+    async fn test_setup_worktree_returns_none_for_non_git_repo() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("test.db");
+
+        let store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        let runner = AutomationRunner::new(store, 3, temp_dir.path(), "velor".to_string(), 100_000);
+
+        // Create a test automation
+        let automation = crate::config::Automation {
+            name: "test".to_string(),
+            description: "Test automation".to_string(),
+            schedule: "0 * * * * *".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: "once".to_string(),
+            enabled: true,
+            vars: std::collections::BTreeMap::new(),
+            catch_up: crate::config::CatchUpPolicy::Skip,
+            max_catch_up: 10,
+            timeout_seconds: Some(60),
+            notify_on_success: false,
+            notify_on_failure: false,
+        };
+
+        // setup_worktree should return None since temp_dir is not a git repo
+        let result = runner
+            .setup_worktree(&automation)
+            .await
+            .expect("setup_worktree should succeed");
+
+        assert!(
+            result.is_none(),
+            "setup_worktree should return None for non-git repositories"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_setup_worktree_creates_worktree_for_git_repo() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+
+        // Initialize a git repository
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .await
+            .expect("git init should succeed");
+
+        // Configure git user for the test repo
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .await
+            .expect("git config should succeed");
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .await
+            .expect("git config should succeed");
+
+        // Create an initial commit
+        let readme_path = temp_dir.path().join("README.md");
+        tokio::fs::write(&readme_path, b"# Test\n")
+            .await
+            .expect("write should succeed");
+
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(temp_dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .await
+            .expect("git add should succeed");
+
+        Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .await
+            .expect("git commit should succeed");
+
+        let db_path = temp_dir.path().join("test.db");
+
+        let store = AutomationStore::open(&db_path)
+            .await
+            .expect("store should be created");
+
+        let runner = AutomationRunner::new(store, 3, temp_dir.path(), "velor".to_string(), 100_000);
+
+        // Create a test automation
+        let automation = crate::config::Automation {
+            name: "test-worktree".to_string(),
+            description: "Test automation".to_string(),
+            schedule: "0 * * * * *".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: "once".to_string(),
+            enabled: true,
+            vars: std::collections::BTreeMap::new(),
+            catch_up: crate::config::CatchUpPolicy::Skip,
+            max_catch_up: 10,
+            timeout_seconds: Some(60),
+            notify_on_success: false,
+            notify_on_failure: false,
+        };
+
+        // setup_worktree should create a worktree
+        let result = runner
+            .setup_worktree(&automation)
+            .await
+            .expect("setup_worktree should succeed");
+
+        assert!(
+            result.is_some(),
+            "setup_worktree should return Some(WorktreeCleanup) for git repositories"
+        );
+
+        let cleanup = result.unwrap();
+        let worktree_path = cleanup.path.clone();
+
+        // Verify the worktree was created
+        assert!(worktree_path.exists(), "worktree path should exist");
+
+        // Clean up the worktree
+        cleanup.cleanup().await.expect("cleanup should succeed");
+
+        // Verify the worktree was removed
+        assert!(
+            !worktree_path.exists(),
+            "worktree path should not exist after cleanup"
+        );
     }
 }
