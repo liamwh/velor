@@ -292,7 +292,10 @@ impl std::fmt::Debug for AcpSession {
             .field("session_id", &self.session_id)
             .field("cwd", &self.cwd)
             .field("output_len", &self.output.try_lock().ok().map(|x| x.len()))
-            .field("files_read_len", &self.files_read_this_turn.try_lock().ok().map(|x| x.len()))
+            .field(
+                "files_read_len",
+                &self.files_read_this_turn.try_lock().ok().map(|x| x.len()),
+            )
             .finish()
     }
 }

@@ -318,8 +318,8 @@ IMPORTANT:
 If, while implementing the feature, you notice the plan is complete, output exactly this text: {{complete_token}}
 """
 
-# Auto-mode prompt for iterative development with auto-implement-plan
-auto-implement-plan = """
+# Auto-mode prompt for iterative development with implement-plan
+implement-plan = """
 1. study {{pin}}.
 2. study {{implementation_plan}} and select the most important task to do next. Work ONLY on that ONE task. This should be the one YOU decide has the highest priority, not necessarily the first thing you see.
 3. study {{rust_rules_file}}
@@ -780,7 +780,11 @@ async fn run_once(
     tracing::info!("Rules enabled in config: {}", file_cfg.rules.enabled);
     let prompt_with_rules = if file_cfg.rules.enabled {
         let rules_cache = RulesCache::new(git_root.clone(), file_cfg.rules.directory.clone());
-        tracing::info!("Loading rules from: {}/{}", git_root.display(), file_cfg.rules.directory);
+        tracing::info!(
+            "Loading rules from: {}/{}",
+            git_root.display(),
+            file_cfg.rules.directory
+        );
         match rules_cache.get().await {
             Ok(rules_set) => {
                 let state = RulesState::new();
@@ -949,7 +953,11 @@ async fn run_auto(
     // Load rules if enabled for auto mode
     tracing::info!("Rules enabled in config: {}", file_cfg.rules.enabled);
     let rules_cache = if file_cfg.rules.enabled {
-        tracing::info!("Creating rules cache for {}/{}", git_root.display(), file_cfg.rules.directory);
+        tracing::info!(
+            "Creating rules cache for {}/{}",
+            git_root.display(),
+            file_cfg.rules.directory
+        );
         Some(RulesCache::new(
             git_root.clone(),
             file_cfg.rules.directory.clone(),
@@ -962,7 +970,10 @@ async fn run_auto(
         tracing::info!("Fetching rules from cache...");
         match cache.get().await {
             Ok(rules) => {
-                tracing::info!("Rules loaded successfully: {} total rules", rules.total_count());
+                tracing::info!(
+                    "Rules loaded successfully: {} total rules",
+                    rules.total_count()
+                );
                 Some(rules)
             }
             Err(e) => {

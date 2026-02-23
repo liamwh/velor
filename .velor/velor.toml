@@ -86,8 +86,8 @@ IMPORTANT:
 If, while implementing the feature, you notice the plan is complete, output exactly this text: {{complete_token}}
 """
 
-# Auto-mode prompt for iterative development with auto-implement-plan
-auto-implement-plan = """
+# Auto-mode prompt for iterative development with implement-plan
+implement-plan = """
 1. study {{pin}}.
 2. study {{plan}} and select the most important task to do next. Work ONLY on that ONE task. This should be the one YOU decide has the highest priority, not necessarily the first thing you see.
 3. study {{rust_rules_file}}
