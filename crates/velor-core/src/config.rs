@@ -4,12 +4,12 @@
 //! in the git repository root.
 
 use color_eyre::eyre::WrapErr;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Global persistence configuration (shared by multiple commands).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConversationDbConfig {
     /// Path to the shared SQLite database (relative to git root).
@@ -38,7 +38,7 @@ impl Default for ConversationDbConfig {
 }
 
 /// Configuration for the plan subcommand.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlanConfig {
     /// Directory for spec files (relative to git root).
@@ -70,7 +70,7 @@ impl Default for PlanConfig {
 }
 
 /// Parse mode for Telegram messages.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TelegramParseMode {
     /// MarkdownV2 formatting.
     #[default]
@@ -80,7 +80,7 @@ pub enum TelegramParseMode {
 }
 
 /// Configuration for Telegram notifications.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelegramConfig {
     /// Whether Telegram notifications are enabled.
@@ -112,7 +112,7 @@ impl Default for TelegramConfig {
 }
 
 /// Configuration for macOS notifications.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MacOSConfig {
     /// Whether macOS notifications are enabled.
@@ -132,7 +132,7 @@ impl Default for MacOSConfig {
 }
 
 /// Configuration for the rules system.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RulesConfig {
     /// Whether the rules system is enabled.
@@ -174,7 +174,7 @@ impl Default for RulesConfig {
 }
 
 /// Configuration for notifications.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationsConfig {
     /// Whether notifications are globally enabled.
@@ -200,7 +200,7 @@ pub struct NotificationsConfig {
 }
 
 /// Configuration for the automations feature.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutomationsConfig {
     /// Directory for automation definitions (relative to git root).
@@ -250,7 +250,7 @@ impl Default for NotificationsConfig {
 }
 
 /// Communication protocol for agent interaction.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// Spawn subprocess with stdin/stdout (original behavior).
@@ -261,7 +261,7 @@ pub enum Protocol {
 }
 
 /// Permission handling mode for ACP.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
     /// Automatically allow all permission requests.
@@ -274,7 +274,7 @@ pub enum PermissionMode {
 }
 
 /// Configuration for ACP (Agent Client Protocol) mode.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AcpConfig {
     /// Environment variable name for Anthropic API key.
@@ -298,7 +298,7 @@ impl Default for AcpConfig {
 }
 
 /// Configuration loaded from the TOML file.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileConfig {
     /// Default values for CLI options.
     #[serde(default)]
@@ -334,7 +334,7 @@ pub struct FileConfig {
 }
 
 /// Default values that can be overridden by CLI arguments.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Defaults {
     /// Communication protocol for agent interaction.
     #[serde(default)]
@@ -400,7 +400,7 @@ fn default_absolute_timeout_ms() -> u32 {
 }
 
 /// A named prompt template definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PromptDef {
     /// Inline string format: `prompt = "template string"`
