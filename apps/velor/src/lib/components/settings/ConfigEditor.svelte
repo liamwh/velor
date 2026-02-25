@@ -140,7 +140,7 @@
 <div class="config-editor">
 	<!-- Sub-tabs for config type -->
 	<nav class="config-tabs" aria-label="Configuration type">
-		{#each tabs as tab}
+		{#each tabs as tab (tab.id)}
 			<button
 				class="config-tab"
 				class:active={activeTab === tab.id}

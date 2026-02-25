@@ -57,7 +57,7 @@
 		</div>
 
 		<nav class="nav">
-			{#each navItems as item}
+			{#each navItems as item (item.id)}
 				<button
 					class="nav-item"
 					class:active={$page.url.pathname === item.id}
@@ -72,7 +72,7 @@
 		</nav>
 
 		<div class="quick-actions">
-			{#each quickActions as action}
+			{#each quickActions as action (action.id)}
 				<button
 					class="quick-action-btn"
 					onclick={() => navigate(action.id)}
