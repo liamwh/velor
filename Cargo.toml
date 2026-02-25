@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "apps/*"]
+members = ["crates/*", "apps/velor-cli", "apps/velor/src-tauri"]
 
 [workspace.lints.rust]
 missing_docs = { level = "warn", priority = 1 }
@@ -44,5 +44,10 @@ cron = "0.12"
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+
+# Tauri dependencies
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-build = { version = "2", features = [] }
 
 # Note: dev-dependencies are specified per-crate, not at workspace level
