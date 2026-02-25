@@ -17,6 +17,7 @@ import type {
 	AutomationRun,
 	AutomationRunsList,
 	ToggleAutomationRequest,
+	CreateAutomationRequest,
 	UpdateAutomationRequest,
 } from "$lib/types";
 
@@ -70,20 +71,28 @@ export async function listAutomations(): Promise<AutomationList> {
 	return await invoke<AutomationList>("list_automations");
 }
 
-export async function getAutomation(id: string): Promise<Automation> {
-	return await invoke<Automation>("get_automation", { id });
+export async function getAutomation(name: string): Promise<Automation> {
+	return await invoke<Automation>("get_automation", { name });
 }
 
-export async function toggleAutomation(request: ToggleAutomationRequest): Promise<Automation> {
-	return await invoke<Automation>("toggle_automation", { request });
+export async function toggleAutomation(request: ToggleAutomationRequest): Promise<void> {
+	await invoke("toggle_automation", { name: request.name, enabled: request.enabled });
 }
 
-export async function runAutomationNow(id: string): Promise<void> {
-	await invoke("run_automation_now", { id });
+export async function runAutomationNow(name: string): Promise<void> {
+	await invoke("run_automation_now", { name });
 }
 
-export async function getAutomationRuns(id: string, limit?: number): Promise<AutomationRunsList> {
-	return await invoke<AutomationRunsList>("get_automation_runs", { id, limit });
+export async function getAutomationRuns(name: string, limit?: number): Promise<AutomationRunsList> {
+	return await invoke<AutomationRunsList>("get_automation_runs", { name, limit });
+}
+
+export async function createAutomation(request: CreateAutomationRequest): Promise<void> {
+	await invoke("create_automation", { request });
+}
+
+export async function updateAutomation(request: UpdateAutomationRequest): Promise<void> {
+	await invoke("update_automation", { request });
 }
 
 export async function startDaemon(): Promise<void> {

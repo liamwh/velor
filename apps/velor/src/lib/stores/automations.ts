@@ -32,6 +32,17 @@ function createAutomationsStore() {
 	});
 
 	/**
+	 * Get all automations from state
+	 */
+	function getAutomations(): Automation[] {
+		let automations: Automation[] = [];
+		subscribe((state) => {
+			automations = state.automations;
+		})();
+		return automations;
+	}
+
+	/**
 	 * Load all automations
 	 */
 	async function load(): Promise<void> {
@@ -40,7 +51,7 @@ function createAutomationsStore() {
 			const response = await tauri.listAutomations();
 			update((state) => ({
 				...state,
-				automations: response.automations,
+				automations: response,
 				loading: false,
 			}));
 		} catch (e) {
@@ -53,12 +64,12 @@ function createAutomationsStore() {
 	}
 
 	/**
-	 * Get a single automation by ID
+	 * Get a single automation by name
 	 */
-	async function get(id: string): Promise<Automation | null> {
+	async function get(name: string): Promise<Automation | null> {
 		update((state) => ({ ...state, loading: true, error: null }));
 		try {
-			const automation = await tauri.getAutomation(id);
+			const automation = await tauri.getAutomation(name);
 			update((state) => ({
 				...state,
 				selectedAutomation: automation,
@@ -81,12 +92,17 @@ function createAutomationsStore() {
 	async function toggle(request: ToggleAutomationRequest): Promise<void> {
 		update((state) => ({ ...state, loading: true, error: null }));
 		try {
-			const updated = await tauri.toggleAutomation(request);
+			await tauri.toggleAutomation(request);
+			// Update local state
 			update((state) => ({
 				...state,
-				automations: state.automations.map((a) => (a.id === updated.id ? updated : a)),
+				automations: state.automations.map((a) =>
+					a.name === request.name ? { ...a, enabled: request.enabled } : a
+				),
 				selectedAutomation:
-					state.selectedAutomation?.id === updated.id ? updated : state.selectedAutomation,
+					state.selectedAutomation?.name === request.name
+						? { ...state.selectedAutomation, enabled: request.enabled }
+						: state.selectedAutomation,
 				loading: false,
 			}));
 		} catch (e) {
@@ -102,10 +118,10 @@ function createAutomationsStore() {
 	/**
 	 * Run an automation manually
 	 */
-	async function runNow(id: string): Promise<void> {
+	async function runNow(name: string): Promise<void> {
 		update((state) => ({ ...state, loading: true, error: null }));
 		try {
-			await tauri.runAutomationNow(id);
+			await tauri.runAutomationNow(name);
 			update((state) => ({ ...state, loading: false }));
 		} catch (e) {
 			update((state) => ({
@@ -120,13 +136,13 @@ function createAutomationsStore() {
 	/**
 	 * Load automation run history
 	 */
-	async function loadRuns(id: string, limit?: number): Promise<void> {
+	async function loadRuns(name: string, limit?: number): Promise<void> {
 		update((state) => ({ ...state, loading: true, error: null }));
 		try {
-			const response = await tauri.getAutomationRuns(id, limit);
+			const response = await tauri.getAutomationRuns(name, limit);
 			update((state) => ({
 				...state,
-				runs: response.runs,
+				runs: response,
 				loading: false,
 			}));
 		} catch (e) {
@@ -190,6 +206,7 @@ function createAutomationsStore() {
 
 	return {
 		subscribe,
+		getAutomations,
 		load,
 		get,
 		toggle,
