@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { config, prompts, executionStore, currentExecution, executionError } from '$lib/stores';
+	import { config, executionStore, currentExecution, executionError } from '$lib/stores';
 	import { EVENT_SERVICE } from '$lib/services/events';
 	import { ChatStream, ChatInput } from '$lib/components/chat';
-	import { X, RefreshCw, Trash2, AlertCircle } from 'lucide-svelte';
+	import { ExecutionStatus, ExecutionControls } from '$lib/components/execution';
+	import { AlertCircle, X } from 'lucide-svelte';
 	import type { ExecutionConfig } from '$lib/types';
 
 	// Load execution history on mount
@@ -66,14 +67,21 @@
 	}
 
 	// Available prompts for ChatInput
+	// TODO: Create a proper UI type for prompt selectors to avoid type casting
 	const availablePrompts = $derived(
 		$config?.prompts
-			? Object.entries($config.prompts).map(([name, prompt]) => ({
+			? (Object.entries($config.prompts).map(([name, prompt]) => ({
 					name,
+					vars: {},
 					...prompt,
 					is_template: name.startsWith('_') || false
-				}))
+				})) as any)
 			: []
+	);
+
+	// Loading state based on execution state
+	const isLoading = $derived(
+		$currentExecution?.state === 'running' || $currentExecution?.state === 'rendering'
 	);
 </script>
 
@@ -84,60 +92,23 @@
 
 		<!-- Chat Input -->
 		<div class="input-section">
-			{#if $currentExecution && ($currentExecution.state === 'running' || $currentExecution.state === 'rendering' || $currentExecution.state === 'retrying')}
-				<!-- Active Execution Controls -->
-				<div class="execution-controls">
-					<div class="execution-status">
-						<span class="status-indicator running"></span>
-						<span class="status-text">
-							Execution {$currentExecution.id.slice(0, 8)} is running
-						</span>
-					</div>
-					<div class="control-buttons">
-						<button
-							class="control-btn cancel-btn"
-							onclick={handleCancel}
-							title="Cancel execution"
-							aria-label="Cancel execution"
-						>
-							<X size={16} />
-							<span>Cancel</span>
-						</button>
-					</div>
-				</div>
-			{:else if $currentExecution && $currentExecution.state === 'failed'}
-				<!-- Failed Execution Controls -->
-				<div class="execution-controls failed">
-					<div class="execution-status">
-						<AlertCircle size={16} class="text-red-400" />
-						<span class="status-text">Execution failed: {$currentExecution.error || 'Unknown error'}</span>
-					</div>
-					<div class="control-buttons">
-						<button
-							class="control-btn secondary-btn"
-							onclick={handleRetry}
-							title="Retry execution"
-							aria-label="Retry execution"
-						>
-							<RefreshCw size={16} />
-							<span>Retry</span>
-						</button>
-						<button
-							class="control-btn secondary-btn"
-							onclick={handleClear}
-							title="Clear execution"
-							aria-label="Clear execution"
-						>
-							<Trash2 size={16} />
-							<span>Clear</span>
-						</button>
-					</div>
+			{#if $currentExecution}
+				<!-- Active or Terminal Execution Display -->
+				<div class="execution-display">
+					<ExecutionStatus execution={$currentExecution} showMetrics={false} compact={true} />
+					<ExecutionControls
+						execution={$currentExecution}
+						onCancel={handleCancel}
+						onRetry={handleRetry}
+						onClear={handleClear}
+						compact={true}
+					/>
 				</div>
 			{:else}
 				<!-- Normal Input -->
 				<ChatInput
 					prompts={availablePrompts}
-					loading={$currentExecution?.state === 'running' || $currentExecution?.state === 'rendering'}
+					loading={isLoading}
 					onStart={handleStart}
 				/>
 			{/if}
@@ -168,44 +139,8 @@
 		@apply border-t border-[var(--color-border)];
 	}
 
-	.execution-controls {
-		@apply flex items-center justify-between px-4 py-3 bg-[var(--color-bg-secondary)];
-	}
-
-	.execution-controls.failed {
-		@apply bg-red-950/30 border-t border-red-900/50;
-	}
-
-	.execution-status {
-		@apply flex items-center gap-2;
-	}
-
-	.status-indicator {
-		@apply w-2 h-2 rounded-full;
-	}
-
-	.status-indicator.running {
-		@apply bg-[var(--color-accent-primary)] animate-pulse;
-	}
-
-	.status-text {
-		@apply text-sm text-[var(--color-text-secondary)];
-	}
-
-	.control-buttons {
-		@apply flex items-center gap-2;
-	}
-
-	.control-btn {
-		@apply flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all;
-	}
-
-	.cancel-btn {
-		@apply bg-red-900/50 text-red-300 hover:bg-red-900/70;
-	}
-
-	.secondary-btn {
-		@apply bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)] hover:bg-[var(--color-border-hover)];
+	.execution-display {
+		@apply flex items-center justify-between px-4 py-3 bg-[var(--color-bg-secondary)] gap-4;
 	}
 
 	.error-banner {
