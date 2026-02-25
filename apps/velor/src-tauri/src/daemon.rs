@@ -15,8 +15,10 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use velor_automations::{Automation, AutomationRunner, AutomationResult, CatchUpPolicy, load_automations};
 use velor_automations::scheduler::Scheduler;
+use velor_automations::{
+    Automation, AutomationResult, AutomationRunner, CatchUpPolicy, load_automations,
+};
 
 /// Default tick interval for the daemon (60 seconds).
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
@@ -156,32 +158,26 @@ impl BackgroundDaemon {
 
         // Get required components
         let git_root = self.git_root.read().await;
-        let git_root = git_root.as_ref().ok_or_else(|| {
-            color_eyre::eyre::eyre!("Git root not set for daemon")
-        })?;
+        let git_root = git_root
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("Git root not set for daemon"))?;
         let store_opt = self.automation_store.read().await;
         let store = store_opt.as_ref().ok_or_else(|| {
             color_eyre::eyre::eyre!("Automation store not initialized for daemon")
         })?;
         let config_opt = self.config.read().await;
-        let config = config_opt.as_ref().ok_or_else(|| {
-            color_eyre::eyre::eyre!("Configuration not set for daemon")
-        })?;
+        let config = config_opt
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("Configuration not set for daemon"))?;
 
         let automations_dir = git_root.join(&config.automations.automations_dir);
 
         // Load all automations
         let automations = load_automations(&automations_dir).await?;
-        debug!(
-            count = automations.len(),
-            "Loaded automations for tick"
-        );
+        debug!(count = automations.len(), "Loaded automations for tick");
 
         // Filter enabled automations
-        let enabled_automations: Vec<_> = automations
-            .into_iter()
-            .filter(|a| a.enabled)
-            .collect();
+        let enabled_automations: Vec<_> = automations.into_iter().filter(|a| a.enabled).collect();
 
         if enabled_automations.is_empty() {
             debug!("No enabled automations to process");
@@ -217,10 +213,7 @@ impl BackgroundDaemon {
             return Ok(());
         }
 
-        info!(
-            count = due_automations.len(),
-            "Found due automations"
-        );
+        info!(count = due_automations.len(), "Found due automations");
 
         // Create runner and execute due automations
         let runner = AutomationRunner::new(
@@ -254,7 +247,8 @@ impl BackgroundDaemon {
                     );
 
                     // Emit event to frontend
-                    self.emit_automation_completed(&automation_name, &result).await;
+                    self.emit_automation_completed(&automation_name, &result)
+                        .await;
                 }
                 Err(e) => {
                     error!(
@@ -264,7 +258,8 @@ impl BackgroundDaemon {
                     );
 
                     // Emit error event to frontend
-                    self.emit_automation_failed(&automation_name, &e.to_string()).await;
+                    self.emit_automation_failed(&automation_name, &e.to_string())
+                        .await;
                 }
             }
         }
@@ -308,10 +303,7 @@ impl BackgroundDaemon {
             .unwrap_or(last_run);
 
         // Parse timezone
-        let tz: chrono_tz::Tz = automation
-            .timezone
-            .parse()
-            .unwrap_or(chrono_tz::UTC);
+        let tz: chrono_tz::Tz = automation.timezone.parse().unwrap_or(chrono_tz::UTC);
 
         // Create scheduler
         let scheduler = Scheduler::new(&automation.schedule, tz)?;
@@ -577,7 +569,10 @@ mod tests {
         // Should succeed even with no automations directory
         let result = daemon.tick().await;
 
-        assert!(result.is_ok(), "Tick should succeed without automations directory");
+        assert!(
+            result.is_ok(),
+            "Tick should succeed without automations directory"
+        );
     }
 
     #[tokio::test]
@@ -646,7 +641,10 @@ enabled = false
         // Should succeed without running disabled automation
         let result = daemon.tick().await;
 
-        assert!(result.is_ok(), "Tick should succeed with disabled automation");
+        assert!(
+            result.is_ok(),
+            "Tick should succeed with disabled automation"
+        );
     }
 
     #[tokio::test]
