@@ -10,33 +10,31 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-mod acp;
+// CLI-specific modules (not in velor-core)
 mod automations;
 mod cancellation;
-mod claude;
-mod config;
-mod git;
-mod notification;
 mod plan;
-mod retry;
-mod rules;
-mod template;
 mod tui;
+
+// Re-export from velor-core
+use velor_core as core;
 
 use cancellation::CancellationHandler;
 
 use automations::AutomationsArgs;
-use claude::{AgentRunner, require_claude_on_path};
-use config::FileConfig;
-use notification::{
-    NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify,
-};
 use plan::{PlanRunConfig, run_plan_generation};
-use retry::{ConversationHistory, RetryConfig, RetryError};
-#[allow(unused_imports)]
-use rules::{
-    RulesCache, RulesState, build_follow_up_prompt_delta, check_new_glob_matches_with_tracing,
-    get_rules_by_names, inject_rules, select_rules, select_rules_with_intelligent,
+
+use core::{
+    agent::{AgentRunner, require_claude_on_path},
+    config::FileConfig,
+    notification::{
+        NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify,
+    },
+    retry::{ConversationHistory, RetryConfig, RetryError},
+    rules::{
+        RulesCache, RulesState, build_follow_up_prompt_delta, get_rules_by_names, inject_rules,
+        select_rules,
+    },
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -593,7 +591,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let cli = Cli::parse_from(remaining_args);
 
     let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
-    let git_root = git::discover_git_root(&cwd).wrap_err("failed to discover git root")?;
+    let git_root = core::git::discover_git_root(&cwd).wrap_err("failed to discover git root")?;
 
     // Load home config (optional, may not exist)
     let home_cfg = FileConfig::load_if_exists(&FileConfig::home_config_path()?)
@@ -804,11 +802,11 @@ async fn run_once(
     );
 
     let cli_vars = merge_cli_vars(&common.set_vars, extracted_overrides);
-    let vars = template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
+    let vars = core::template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
 
     let template_str = resolve_prompt_template(&common, &file_cfg, &prompt_name)?;
 
-    let rendered = template::render_template(&template_str, &vars)?;
+    let rendered = core::template::render_template(&template_str, &vars)?;
 
     // Load and inject rules if enabled
     tracing::info!("Rules enabled in config: {}", file_cfg.rules.enabled);
@@ -936,7 +934,7 @@ async fn run_auto(
     );
 
     let cli_vars = merge_cli_vars(&common.set_vars, extracted_overrides);
-    let vars = template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
+    let vars = core::template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
 
     let template_str = resolve_prompt_template(&common, &file_cfg, &prompt_name)?;
 
@@ -944,7 +942,7 @@ async fn run_auto(
         // Render once with iteration=1 for dry run
         let mut vars = vars.clone();
         vars.insert("iteration".to_string(), "1".to_string());
-        let rendered = template::render_template(&template_str, &vars)?;
+        let rendered = core::template::render_template(&template_str, &vars)?;
         println!("{rendered}");
         return Ok(());
     }
@@ -1194,13 +1192,13 @@ fn build_runtime_vars(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "debug", ret, err)]
 async fn run_auto_iteration_with_session(
-    session: &mut acp::AcpSession,
+    session: &mut core::acp::AcpSession,
     prompt: &str,
-    rules_set: &rules::RulesSet,
+    rules_set: &core::rules::RulesSet,
     state: &Arc<Mutex<RulesState>>,
-    config: &config::RulesConfig,
+    config: &core::config::RulesConfig,
     iteration: u32,
-    intelligent_rules: Option<&[rules::Rule]>,
+    intelligent_rules: Option<&[core::rules::Rule]>,
 ) -> color_eyre::eyre::Result<String> {
     let mut injections = 0u32;
     let max = config.max_mid_iteration_injections;
@@ -1212,7 +1210,7 @@ async fn run_auto_iteration_with_session(
     // Select rules for initial prompt (always_apply, glob-based, and intelligent rules)
     let initial_rules = {
         let state_guard = state.lock().await;
-        rules::select_rules_with_intelligent(
+        core::rules::select_rules_with_intelligent(
             rules_set,
             &state_guard,
             intelligent_rules,
@@ -1268,7 +1266,7 @@ async fn run_auto_iteration_with_session(
         // Check for new glob matches using current delta (with detailed tracing)
         let new_rules_with_files = {
             let state_guard = state.lock().await;
-            rules::check_new_glob_matches_with_tracing(
+            core::rules::check_new_glob_matches_with_tracing(
                 rules_set,
                 &files_delta,
                 state_guard.injected_rules(),
@@ -1360,10 +1358,10 @@ async fn run_auto_loop(
     cwd: &std::path::Path,
     iterations: u32,
     cancel_handler: &CancellationHandler,
-    rules_set: Option<&rules::RulesSet>,
+    rules_set: Option<&core::rules::RulesSet>,
     git_root: &std::path::Path,
-    acp_config: &config::AcpConfig,
-    rules_config: &config::RulesConfig,
+    acp_config: &core::config::AcpConfig,
+    rules_config: &core::config::RulesConfig,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1407,14 +1405,14 @@ async fn run_auto_loop(
                 (current_iteration - 1).to_string(),
             );
 
-            template::render_template(template_str, &vars).wrap_err_with(|| {
+            core::template::render_template(template_str, &vars).wrap_err_with(|| {
                 format!("failed to render template for iteration {current_iteration}")
             })?
         } else {
             let mut vars = base_vars.clone();
             vars.insert("iteration".to_string(), current_iteration.to_string());
 
-            template::render_template(template_str, &vars).wrap_err_with(|| {
+            core::template::render_template(template_str, &vars).wrap_err_with(|| {
                 format!("failed to render template for iteration {current_iteration}")
             })?
         };
@@ -1583,11 +1581,11 @@ async fn run_auto_loop(
 #[allow(clippy::too_many_arguments)]
 async fn run_auto_iteration_acp(
     binary: &str,
-    acp_config: &config::AcpConfig,
+    acp_config: &core::config::AcpConfig,
     prompt: &str,
-    rules_set: &rules::RulesSet,
+    rules_set: &core::rules::RulesSet,
     state: &Arc<Mutex<RulesState>>,
-    config: &config::RulesConfig,
+    config: &core::config::RulesConfig,
     iteration: u32,
     cwd: &Path,
 ) -> color_eyre::eyre::Result<String> {
@@ -1631,7 +1629,7 @@ async fn run_auto_iteration_acp(
     };
 
     // Step 2: Create ACP session for this iteration
-    let mut session = acp::AcpSession::new(binary, acp_config, cwd).await?;
+    let mut session = core::acp::AcpSession::new(binary, acp_config, cwd).await?;
 
     // Step 3: Run iteration with multi-turn rule injection
     let output = run_auto_iteration_with_session(
@@ -1672,13 +1670,13 @@ async fn run_auto_iteration_acp(
 #[allow(clippy::too_many_arguments)]
 async fn select_intelligent_rules_acp(
     binary: &str,
-    acp_config: &config::AcpConfig,
-    intelligent_rules: &[rules::Rule],
+    acp_config: &core::config::AcpConfig,
+    intelligent_rules: &[core::rules::Rule],
     task_preview: &str,
     max_rules: usize,
     cwd: &Path,
-) -> color_eyre::eyre::Result<Vec<rules::Rule>> {
-    use rules::{build_intelligent_selection_prompt, parse_intelligent_selection_response};
+) -> color_eyre::eyre::Result<Vec<core::rules::Rule>> {
+    use core::rules::{build_intelligent_selection_prompt, parse_intelligent_selection_response};
     use std::collections::HashSet;
 
     if intelligent_rules.is_empty() {
@@ -1694,7 +1692,7 @@ async fn select_intelligent_rules_acp(
     tracing::debug!("Sending intelligent selection prompt...");
 
     // Create a short-lived session for selection
-    let mut session = acp::AcpSession::new(binary, acp_config, cwd).await?;
+    let mut session = core::acp::AcpSession::new(binary, acp_config, cwd).await?;
 
     // Run the selection prompt
     let turn_result = session
@@ -1755,7 +1753,7 @@ async fn execute_with_retry(
     config: &RetryConfig,
     cwd: &std::path::Path,
     cancel_token: &CancellationToken,
-) -> Result<claude::ClaudeRunResult, RetryError> {
+) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let retry_start = std::time::Instant::now();
 
@@ -1773,8 +1771,11 @@ async fn execute_with_retry(
             )));
         }
         if attempt > 1 {
-            let delay =
-                retry::calculate_backoff(attempt, config.base_backoff_ms, config.max_backoff_ms);
+            let delay = core::retry::calculate_backoff(
+                attempt,
+                config.base_backoff_ms,
+                config.max_backoff_ms,
+            );
             println!(
                 "⏳ Waiting {}ms before retry {}...",
                 delay.as_millis(),
@@ -1807,7 +1808,7 @@ async fn execute_with_retry(
                 last_error = e.to_string();
 
                 // Classify error as retryable or permanent
-                if retry::is_permanent_error(&e) {
+                if core::retry::is_permanent_error(&e) {
                     tracing::error!("permanent error detected on iteration {iteration}: {e}");
                     return Err(RetryError::Permanent(e.to_string()));
                 }

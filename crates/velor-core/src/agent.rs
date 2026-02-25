@@ -3,8 +3,11 @@
 //! This module provides types and traits for running AI agents with
 //! different communication protocols (subprocess vs ACP).
 
+use crate::acp;
 use crate::config::{AcpConfig, Protocol};
+use color_eyre::eyre::WrapErr;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -54,6 +57,60 @@ impl AgentRunner {
     #[allow(dead_code)]
     pub const fn is_subprocess(&self) -> bool {
         matches!(self, Self::Subprocess)
+    }
+
+    /// Runs the agent with the given parameters.
+    ///
+    /// This is an async method that dispatches to the appropriate implementation
+    /// based on the runner variant. For subprocess mode, the synchronous call
+    /// is wrapped in `spawn_blocking` to avoid blocking the async runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `binary` - Path to the agent binary (e.g., "claude-glm" or "claude-agent-acp")
+    /// * `permission_mode` - Permission mode for subprocess mode (e.g., "acceptEdits")
+    /// * `prompt` - The rendered prompt text to send
+    /// * `prompt_name` - Name of the prompt for logging
+    /// * `cwd` - Current working directory
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent cannot be executed, fails, or returns non-zero exit code.
+    #[tracing::instrument(level = "debug", fields(binary = %binary, prompt_name = %prompt_name, runner = ?self), ret, err)]
+    pub async fn run(
+        &self,
+        binary: &str,
+        permission_mode: &str,
+        prompt: &str,
+        prompt_name: &str,
+        cwd: &Path,
+    ) -> color_eyre::eyre::Result<ClaudeRunResult> {
+        match self {
+            Self::Subprocess => {
+                // Wrap sync subprocess call in spawn_blocking to avoid blocking async runtime
+                let binary = binary.to_string();
+                let permission_mode = permission_mode.to_string();
+                let prompt = prompt.to_string();
+                let prompt_name = prompt_name.to_string();
+
+                tokio::task::spawn_blocking(move || {
+                    run_claude(&binary, &permission_mode, &prompt, &prompt_name)
+                })
+                .await
+                .wrap_err("subprocess task failed")?
+            }
+            Self::Acp(config) => {
+                // ACP mode is natively async
+                tracing::info!("AgentRunner::run: entering ACP mode with binary {}", binary);
+                let acp_result = acp::run_acp(binary, prompt, prompt_name, config, cwd).await?;
+                tracing::info!("AgentRunner::run: ACP run completed");
+
+                // Convert AcpRunResult to ClaudeRunResult for compatibility
+                Ok(ClaudeRunResult {
+                    stdout: acp_result.stdout,
+                })
+            }
+        }
     }
 }
 

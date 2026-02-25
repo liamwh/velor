@@ -2,7 +2,7 @@
 //!
 //! This module provides CLI commands for managing and running scheduled automations.
 
-use crate::config::FileConfig;
+use crate::core::config::FileConfig;
 use clap::Args;
 use color_eyre::eyre::WrapErr;
 use std::path::PathBuf;
