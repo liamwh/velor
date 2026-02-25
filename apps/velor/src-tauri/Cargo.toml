@@ -19,6 +19,7 @@ velor-core = { path = "../../../crates/velor-core" }
 velor-automations = { path = "../../../crates/automations" }
 
 # Workspace dependencies
+chrono = { workspace = true }
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
 serde = { workspace = true }
@@ -28,6 +29,9 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+
+# Binary discovery
+which = "7"
 
 [dev-dependencies]
 # Workspace dev dependencies
