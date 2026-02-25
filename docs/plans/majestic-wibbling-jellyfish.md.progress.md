@@ -190,7 +190,12 @@
   - [x] ChatStream - Live streaming chat interface with auto-scroll and event aggregation
   - [x] ChatInput - Input component with prompt selector and variable editor
   - [x] Execution route page integrating all chat components
-- [ ] Automations: List, Card, Editor, Runs
+- [x] Automations: List, Card, Editor, Runs
+  - [x] AutomationCard - Card display with toggle, run, edit, and view runs actions
+  - [x] AutomationList - Grid view with search and filter controls
+  - [x] AutomationEditor - Form for creating/editing automations with 6-field cron
+  - [x] AutomationRuns - Modal displaying run history with status and output
+  - [x] Automations route page integrating all automation components
 - [ ] Settings: ConfigEditor, PromptEditor
 - [ ] Execution: Status, Controls
 
@@ -244,15 +249,20 @@
   - MainLayout, Sidebar, and Header components
   - Welcome page with configuration status
   - All 321 Rust tests passing
+- `df844e5` feat(gui): implement Phase 3.3 automation components for Velor GUI
+  - 9 files changed, 1877 insertions(+), 115 deletions(-)
+  - AutomationCard, AutomationList, AutomationEditor, AutomationRuns components
+  - Backend create_automation and update_automation commands
+  - Updated types to match velor-automations crate
+  - All 321 tests passing
 
 ---
 
 ## Next Steps
 
 1. **Phase 3**: Complete remaining frontend components
-   - Automation components (List, Card, Editor, Runs)
    - Settings components (ConfigEditor, PromptEditor)
-   - Execution status/controls
+   - Execution status/controls components
 2. **Integration**: End-to-end testing
 
 ---
