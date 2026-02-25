@@ -4,7 +4,7 @@
 	import { EVENT_SERVICE } from '$lib/services/events';
 	import { Scroll } from 'lucide-svelte';
 	import ChatMessage from './ChatMessage.svelte';
-	import type { ExecutionRecord, ExecutionEvent } from '$lib/types';
+	import type { ExecutionEvent } from '$lib/types';
 	import { ExecutionEventType } from '$lib/types';
 
 	interface Props {
@@ -18,10 +18,9 @@
 	let messagesContainer: HTMLElement;
 	let isScrolledToBottom = $state(true);
 	let isStreaming = $state(false);
-	let aggregatedOutput = $state<Map<number, string>>(new Map());
 
 	// Track the execution we're listening to
-	let currentExecutionId = $state<string | null>(null);
+	let _currentExecutionId = $state<string | null>(null);
 
 	// Computed messages from events
 	const displayEvents = $derived(() => {
@@ -68,19 +67,6 @@
 	// Manual scroll to bottom
 	async function scrollToBottomClick() {
 		await scrollToBottom(true);
-	}
-
-	// Aggregate output chunks per iteration for better display
-	function aggregateOutput(events: ExecutionEvent[]): Map<number, string> {
-		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- Local utility function, not reactive state
-		const output = new Map<number, string>();
-		for (const event of events) {
-			if (event.event_type === ExecutionEventType.OutputChunk && event.iteration !== undefined) {
-				const existing = output.get(event.iteration) || '';
-				output.set(event.iteration, existing + (event.output || ''));
-			}
-		}
-		return output;
 	}
 
 	// Process events and group output chunks
@@ -177,13 +163,13 @@
 	// Reactive: update current execution ID and streaming state
 	$effect(() => {
 		if ($currentExecution) {
-			currentExecutionId = $currentExecution.id;
+			_currentExecutionId = $currentExecution.id;
 			isStreaming =
 				$currentExecution.state === 'running' ||
 				$currentExecution.state === 'rendering' ||
 				$currentExecution.state === 'retrying';
 		} else {
-			currentExecutionId = null;
+			_currentExecutionId = null;
 			isStreaming = false;
 		}
 	});

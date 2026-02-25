@@ -6,7 +6,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
 	ConfigResponse,
-	ConfigFileType,
 	SaveConfigRequest,
 	ExecutionRecord,
 	ExecutionList,
@@ -14,7 +13,6 @@ import type {
 	StartExecutionResponse,
 	Automation,
 	AutomationList,
-	AutomationRun,
 	AutomationRunsList,
 	ToggleAutomationRequest,
 	CreateAutomationRequest,

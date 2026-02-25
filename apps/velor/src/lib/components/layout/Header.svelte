@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { gitRoot, config } from '$lib/stores';
-	import { FolderGit2, Cpu, Activity } from 'lucide-svelte';
+	import { FolderGit2, Activity } from 'lucide-svelte';
 
 	let currentGitRoot = $state<string | null>(null);
 	let promptCount = $state(0);

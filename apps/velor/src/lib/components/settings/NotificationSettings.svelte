@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { config, configStore } from '$lib/stores';
-	import type { Notifications } from '$lib/types';
 	import { Bell, Send, Check, AlertCircle, Volume2, Save } from 'lucide-svelte';
 
 	let isSaving = $state(false);

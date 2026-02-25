@@ -2,7 +2,6 @@
 	import type { ExecutionEvent } from '$lib/types';
 	import { ExecutionEventType } from '$lib/types';
 	import { Check, AlertCircle, Loader2, Copy } from 'lucide-svelte';
-	import { cn } from '$lib/utils';
 
 	interface Props {
 		event: ExecutionEvent;
@@ -22,19 +21,6 @@
 					: 'info'
 	);
 
-	// Get icon based on message type
-	const icon = $derived(() => {
-		switch (messageType) {
-			case 'output':
-				return null;
-			case 'error':
-				return AlertCircle;
-			case 'status':
-				return isStreaming ? Loader2 : Check;
-			default:
-				return null;
-		}
-	});
 
 	// Format timestamp
 	const formattedTime = $derived(() => {

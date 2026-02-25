@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { ExecutionState } from '$lib/types';
-	import type { ExecutionRecord, ExecutionConfig } from '$lib/types';
+	import type { ExecutionRecord } from '$lib/types';
 	import { X, RefreshCw, Trash2, Play } from 'lucide-svelte';
 
 	interface Props {
@@ -179,7 +179,7 @@
 	}
 
 	.execution-controls.failed {
-		@apply bg-red-950/20 px-3 py-2 rounded-lg border border-red-900/30;
+		@apply bg-[var(--color-state-failed-bg)] px-3 py-2 rounded-lg border border-[var(--color-state-failed-border)];
 	}
 
 	.control-btn {
@@ -191,7 +191,7 @@
 	}
 
 	.cancel-btn {
-		@apply bg-red-900/40 text-red-300 hover:bg-red-900/60 active:bg-red-900/70 border border-red-900/50;
+		@apply bg-[var(--color-btn-cancel-bg)] text-[var(--color-btn-cancel-text)] hover:bg-[var(--color-btn-cancel-hover)] active:bg-[var(--color-btn-cancel-active)] border border-[var(--color-btn-cancel-border)];
 	}
 
 	.retry-btn {
@@ -203,7 +203,7 @@
 	}
 
 	.start-btn {
-		@apply bg-green-900/40 text-green-300 hover:bg-green-900/60 active:bg-green-900/70 border border-green-900/50;
+		@apply bg-[var(--color-btn-start-bg)] text-[var(--color-btn-start-text)] hover:bg-[var(--color-btn-start-hover)] active:bg-[var(--color-btn-start-active)] border border-[var(--color-btn-start-border)];
 	}
 
 	.control-btn span {

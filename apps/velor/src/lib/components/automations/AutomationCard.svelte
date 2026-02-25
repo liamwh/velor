@@ -7,8 +7,7 @@
 		MoreVertical,
 		CheckCircle,
 		XCircle,
-		Clock,
-		AlertTriangle
+		Clock
 	} from 'lucide-svelte';
 	import type { Automation } from '$lib/types';
 

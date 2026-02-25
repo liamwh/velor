@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { executionStore } from '$lib/stores';
 	import type { ExecutionConfig, PromptTemplate } from '$lib/types';
-	import { Send, Loader2, Settings, FileCode } from 'lucide-svelte';
+	import { Send, Loader2, Settings } from 'lucide-svelte';
 
 	interface Props {
 		prompts: PromptTemplate[];
@@ -68,14 +68,6 @@
 		}
 	}
 
-	// Handle Enter key (Shift+Enter for newline)
-	function handleKeydown(event: KeyboardEvent) {
-		if (event.key === 'Enter' && !event.shiftKey) {
-			event.preventDefault();
-			handleSubmit();
-		}
-	}
-
 	// Add a new variable
 	function addVariable() {
 		if (newVarKey.trim()) {
@@ -107,7 +99,7 @@
 			disabled={loading}
 			aria-label="Select prompt template"
 		>
-			{#each availablePrompts() as prompt}
+			{#each availablePrompts() as prompt (prompt.name)}
 				<option value={prompt}>{prompt.name}</option>
 			{/each}
 		</select>
@@ -158,7 +150,7 @@
 			{#if templateVars().length > 0}
 				<div class="var-section">
 					<span class="var-section-title">Template Defaults</span>
-					{#each templateVars() as { key, default: defaultValue }}
+					{#each templateVars() as { key, default: defaultValue } (key)}
 						<div class="var-item var-item-readonly">
 							<span class="var-key">{key}</span>
 							<span class="var-value">{String(defaultValue)}</span>
@@ -171,7 +163,7 @@
 			{#if Object.keys(customVars).length > 0}
 				<div class="var-section">
 					<span class="var-section-title">Custom Overrides</span>
-					{#each Object.entries(customVars) as [key, value]}
+					{#each Object.entries(customVars) as [key] (key)}
 						<div class="var-item">
 							<span class="var-key">{key}</span>
 							<input

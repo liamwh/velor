@@ -22,7 +22,7 @@ interface AutomationsState {
  * Create the automations store
  */
 function createAutomationsStore() {
-	const { subscribe, set, update } = writable<AutomationsState>({
+	const { subscribe, update } = writable<AutomationsState>({
 		automations: [],
 		selectedAutomation: null,
 		runs: [],

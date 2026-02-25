@@ -2,8 +2,8 @@
  * Configuration store for Velor GUI
  */
 
-import { writable, derived, get } from "svelte/store";
-import type { VelorConfig, ConfigResponse } from "$lib/types";
+import { writable, derived } from "svelte/store";
+import type { VelorConfig } from "$lib/types";
 import * as tauri from "$lib/services/tauri";
 
 /**
@@ -22,7 +22,7 @@ interface ConfigState {
  * Create the config store
  */
 function createConfigStore() {
-	const { subscribe, set, update } = writable<ConfigState>({
+	const { subscribe, update } = writable<ConfigState>({
 		config: null,
 		homeConfig: null,
 		repoConfig: null,
