@@ -119,3 +119,15 @@ directory = ".agents/rules"
 max_mid_iteration_injections = 2
 intelligent_selection = false
 intelligent_selection_max_rules = 5
+
+# Notifications configuration
+[notifications]
+enabled = true
+notify_on_success = true
+notify_on_max_iterations = true
+notify_on_failure = true
+output_preview_chars = 500
+
+[notifications.macos]
+enabled = true
+sound = "default"
