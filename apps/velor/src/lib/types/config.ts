@@ -12,6 +12,25 @@ export interface Prompt {
 }
 
 /**
+ * Executable prompt template for the GUI
+ * This is a more structured type for prompt templates that can be executed
+ */
+export interface PromptTemplate {
+	/** Unique name/identifier of the prompt */
+	name: string;
+	/** Human-readable description */
+	description?: string;
+	/** The prompt template content or table */
+	template: string;
+	/** Custom completion token (optional) */
+	complete_token?: string;
+	/** Whether this is a template or an executable prompt */
+	is_template?: boolean;
+	/** Default variables for this prompt */
+	vars?: Record<string, string | number | boolean>;
+}
+
+/**
  * Prompts section of config
  */
 export interface Prompts {

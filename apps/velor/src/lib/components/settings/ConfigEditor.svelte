@@ -133,7 +133,7 @@
 	}
 
 	const currentTab = $derived(tabs.find((t) => t.id === activeTab));
-	const canSave = $derived(activeTab !== 'effective' && !isSaving);
+	const canSave = $derived((activeTab === 'home' || activeTab === 'project') && !isSaving);
 	const hasContent = $derived(editorContent.length > 0);
 </script>
 

@@ -87,7 +87,9 @@
 			</div>
 			<div class="header-actions">
 				<button class="icon-btn" onclick={loadRuns} aria-label="Refresh" title="Refresh">
-					<RefreshCw size={18} class:spinning={loading} />
+					<span class:spinning={loading}>
+						<RefreshCw size={18} />
+					</span>
 				</button>
 				<button class="icon-btn" onclick={onClose} aria-label="Close">
 					<X size={20} />

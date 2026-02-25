@@ -7,7 +7,6 @@
 
 	let viewMode: ViewMode = $state('list');
 	let selectedPromptName = $state('');
-	let saveStatus = $derived({ type: 'none', message: '' });
 
 	// Form state for creating/editing prompts
 	let formData = $state({
@@ -40,11 +39,12 @@
 					completeToken: '',
 					isAdvanced: false
 				};
-			} else if (prompt && typeof prompt === 'object') {
+			} else if (prompt && typeof prompt === 'object' && 'template' in prompt) {
+				const promptObj = prompt as { template: string; complete_token?: string };
 				formData = {
 					name: promptName,
-					template: prompt.template || '',
-					completeToken: prompt.complete_token || '',
+					template: promptObj.template || '',
+					completeToken: promptObj.complete_token || '',
 					isAdvanced: true
 				};
 			}
@@ -68,7 +68,7 @@
 		return true;
 	}
 
-	function getPromptForSave(): Prompt {
+	function getPromptForSave(): string | { template: string; complete_token?: string } {
 		if (formData.isAdvanced && formData.completeToken) {
 			return {
 				template: formData.template,
@@ -84,15 +84,20 @@
 		isSaving = true;
 
 		try {
-			// Get current configs
-			const homeConfig = await configStore.load() || await (async () => {
-				const { getHomeConfig } = await import('$lib/services/tauri'));
-				return getHomeConfig();
-			})();
+			// Load the config store first
+			await configStore.load();
+
+			// Get current home config directly
+			let homeConfig = '';
+			try {
+				const { getHomeConfig } = await import('$lib/services/tauri');
+				homeConfig = await getHomeConfig();
+			} catch {
+				// Use empty config if none exists
+			}
 
 			// Parse and update the TOML config
 			let configContent = homeConfig || '';
-			const newPrompt = getPromptForSave();
 
 			// Simple TOML manipulation - in a real app, use a proper TOML parser
 			// For now, we'll append the new prompt to the config
@@ -150,12 +155,22 @@
 	const promptTemplate = $derived(() => {
 		if (!selectedPrompt) return '';
 		return typeof selectedPrompt === 'string' ? selectedPrompt : selectedPrompt.template || '';
-	})();
+	});
 
 	const promptCompleteToken = $derived(() => {
 		if (!selectedPrompt || typeof selectedPrompt === 'string') return '';
-		return selectedPrompt.complete_token || '';
-	})();
+		return (selectedPrompt as { complete_token?: string }).complete_token || '';
+	});
+
+	// Helper function to get template for a specific prompt name
+	function getPromptTemplate(name: string): string {
+		const prompt = prompts[name];
+		if (!prompt) return 'No template content';
+		if (typeof prompt === 'string') return prompt;
+		// Type guard for object type
+		if ('template' in prompt) return (prompt as { template: string }).template || 'No template content';
+		return 'No template content';
+	}
 </script>
 
 <div class="prompt-editor">
@@ -190,7 +205,7 @@
 								<h3>{name}</h3>
 							</div>
 							<p class="card-preview">
-								{promptTemplate[name] || 'No template content'}
+								{getPromptTemplate(name)}
 							</p>
 							<div class="card-actions">
 								<button class="action-btn edit" onclick={() => setViewMode('edit', name)} aria-label="Edit prompt">
@@ -247,11 +262,11 @@
 					<textarea
 						id="prompt-template"
 						bind:value={formData.template}
-						placeholder="Enter your prompt template here... Use {{variable}} for dynamic content."
+						placeholder={'Enter your prompt template here... Use {{variable}} for dynamic content.'}
 						rows="12"
 						required
 					></textarea>
-					<span class="hint">Use {{variable_name}} syntax for template variables</span>
+					<span class="hint">Use {'{{'}variable_name{'}}'} syntax for template variables</span>
 				</div>
 
 				<div class="form-group">

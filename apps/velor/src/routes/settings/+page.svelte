@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { configStore, homeConfig, repoConfig, configLoading, configError } from '$lib/stores';
+	import { configStore, configLoading, configError } from '$lib/stores';
 	import ConfigEditor from '$lib/components/settings/ConfigEditor.svelte';
 	import PromptEditor from '$lib/components/settings/PromptEditor.svelte';
 	import NotificationSettings from '$lib/components/settings/NotificationSettings.svelte';
@@ -41,6 +41,7 @@
 	<!-- Tab Navigation -->
 	<nav class="tabs" aria-label="Settings tabs">
 		{#each tabs as tab}
+			{@const Icon = tab.icon}
 			<button
 				class="tab"
 				class:active={activeTab === tab.id}
@@ -49,7 +50,7 @@
 				aria-selected={activeTab === tab.id}
 				role="tab"
 			>
-				<svelte:component this={tab.icon} size={18} />
+				<Icon size={18} />
 				<span>{tab.label}</span>
 			</button>
 		{/each}
@@ -57,16 +58,16 @@
 
 	<!-- Tab Content -->
 	<main class="settings-content">
-		{#if configLoading()}
+		{#if $configLoading}
 			<div class="loading-state">
 				<div class="spinner"></div>
 				<p>Loading configuration...</p>
 			</div>
-		{:else if configError()}
+		{:else if $configError}
 			<div class="error-state">
 				<span class="error-icon">⚠</span>
 				<h3>Error Loading Configuration</h3>
-				<p>{configError()}</p>
+				<p>{$configError}</p>
 				<button onclick={() => configStore.load()} class="retry-btn">Retry</button>
 			</div>
 		{:else}

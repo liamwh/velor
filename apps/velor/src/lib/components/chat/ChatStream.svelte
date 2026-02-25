@@ -5,6 +5,7 @@
 	import { Scroll } from 'lucide-svelte';
 	import ChatMessage from './ChatMessage.svelte';
 	import type { ExecutionRecord, ExecutionEvent } from '$lib/types';
+	import { ExecutionEventType } from '$lib/types';
 
 	interface Props {
 		executionId?: string;
@@ -73,7 +74,7 @@
 	function aggregateOutput(events: ExecutionEvent[]): Map<number, string> {
 		const output = new Map<number, string>();
 		for (const event of events) {
-			if (event.event_type === 'output_chunk' && event.iteration !== undefined) {
+			if (event.event_type === ExecutionEventType.OutputChunk && event.iteration !== undefined) {
 				const existing = output.get(event.iteration) || '';
 				output.set(event.iteration, existing + (event.output || ''));
 			}
@@ -86,24 +87,24 @@
 		const events = displayEvents();
 		const result: ExecutionEvent[] = [];
 		let currentOutput = '';
-		let lastIteration: number | null = null;
+		let lastIteration: number | undefined = undefined;
 
 		for (let i = 0; i < events.length; i++) {
 			const event = events[i];
 
-			if (event.event_type === 'output_chunk') {
+			if (event.event_type === ExecutionEventType.OutputChunk) {
 				// Aggregate consecutive output chunks
 				if (lastIteration !== event.iteration) {
 					if (currentOutput) {
 						result.push({
-							event_type: 'output_chunk',
+							event_type: ExecutionEventType.OutputChunk,
 							timestamp: events[i - 1]?.timestamp || event.timestamp,
 							output: currentOutput,
 							iteration: lastIteration
 						});
 					}
 					currentOutput = event.output || '';
-					lastIteration = event.iteration ?? null;
+					lastIteration = event.iteration;
 				} else {
 					currentOutput += event.output || '';
 				}
@@ -111,13 +112,13 @@
 				// Flush any pending output
 				if (currentOutput) {
 					result.push({
-						event_type: 'output_chunk',
+						event_type: ExecutionEventType.OutputChunk,
 						timestamp: event.timestamp,
 						output: currentOutput,
-						iteration: lastIteration ?? undefined
+						iteration: lastIteration
 					});
 					currentOutput = '';
-					lastIteration = null;
+					lastIteration = undefined;
 				}
 				result.push(event);
 			}
@@ -126,10 +127,10 @@
 		// Don't forget the last chunk
 		if (currentOutput) {
 			result.push({
-				event_type: 'output_chunk',
+				event_type: ExecutionEventType.OutputChunk,
 				timestamp: events[events.length - 1]?.timestamp || new Date().toISOString(),
 				output: currentOutput,
-				iteration: lastIteration ?? undefined
+				iteration: lastIteration
 			});
 		}
 
