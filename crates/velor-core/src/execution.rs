@@ -369,7 +369,7 @@ impl ExecutionRecord {
     /// Returns the duration of the execution so far.
     #[must_use]
     pub fn duration(&self) -> Duration {
-        let end = self.ended_at.unwrap_or_else(|| Utc::now());
+        let end = self.ended_at.unwrap_or_else(Utc::now);
         end.signed_duration_since(self.started_at)
             .to_std()
             .unwrap_or(Duration::ZERO)

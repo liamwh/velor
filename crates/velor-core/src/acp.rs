@@ -990,12 +990,14 @@ mod integration_tests {
             "test prompt",
             "test_prompt",
             &config,
-            std::env::current_dir().unwrap().as_path(),
+            std::env::current_dir()
+                .expect("failed to get current directory")
+                .as_path(),
         )
         .await;
 
         assert!(result.is_err(), "run_acp should fail without API key");
-        let err = result.unwrap_err();
+        let err = result.expect_err("result should be an error");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("API key") || err_msg.contains("environment variable"),
@@ -1024,7 +1026,9 @@ mod integration_tests {
             "test prompt",
             "test_prompt",
             &config,
-            std::env::current_dir().unwrap().as_path(),
+            std::env::current_dir()
+                .expect("failed to get current directory")
+                .as_path(),
         )
         .await;
 

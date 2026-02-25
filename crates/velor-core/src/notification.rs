@@ -6,8 +6,12 @@
 use color_eyre::eyre::{WrapErr, eyre};
 use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
+use url::Url;
 
 use crate::config::{MacOSConfig, NotificationsConfig, TelegramConfig, TelegramParseMode};
+
+/// Default Telegram API base URL.
+const DEFAULT_TELEGRAM_API_URL: &str = "https://api.telegram.org";
 
 /// Result of a completed run for notifications.
 #[derive(Debug, Clone)]
@@ -148,10 +152,13 @@ impl TelegramNotifier {
         let api_base_url = config
             .api_base_url
             .as_ref()
-            .map(|s| s.parse::<url::Url>())
+            .map(|s| s.parse::<Url>())
             .transpose()
             .wrap_err("invalid Telegram API base URL")?
-            .unwrap_or_else(|| "https://api.telegram.org".parse().unwrap());
+            .unwrap_or_else(|| {
+                Url::parse(DEFAULT_TELEGRAM_API_URL)
+                    .expect("default Telegram API URL should be valid")
+            });
 
         Ok(Self {
             bot_token,
@@ -895,7 +902,7 @@ mod wiremock_tests {
 
             let result = notifier.notify(&payload);
             assert!(result.is_err());
-            let err = result.unwrap_err();
+            let err = result.expect_err("result should be an error");
             assert!(err.to_string().contains("429"));
 
             unsafe {
@@ -921,7 +928,7 @@ mod wiremock_tests {
 
         let result = TelegramNotifier::new(&config, 500);
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("result should be an error");
         assert!(err.to_string().contains("MISSING_TELEGRAM_TOKEN"));
     }
 
