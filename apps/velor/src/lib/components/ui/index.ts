@@ -1,4 +1,9 @@
 /**
  * UI components placeholder
- * Will be populated by shadcn-svelte components
+ * shadcn-svelte components will be added here via the CLI
  */
+
+// No components yet - add shadcn-svelte components using:
+// bunx shadcn-svelte@latest add [component]
+
+export {};

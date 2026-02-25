@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { X, Plus, Trash2, Clock, Save } from 'lucide-svelte';
-	import { configStore } from '$lib/stores';
+	import { configStore, config } from '$lib/stores';
 	import * as tauri from '$lib/services/tauri';
 	import type { Automation, CreateAutomationRequest, UpdateAutomationRequest } from '$lib/types';
 
@@ -24,10 +24,14 @@
 		vars: [] as { key: string; value: string }[]
 	});
 
-	let availablePrompts = $state<string[]>([]);
 	let errors = $state<Record<string, string>>({});
 	let isSaving = $state(false);
 	let isEdit = $state(false);
+
+	// Derived available prompts from config
+	const availablePrompts = $derived(() => {
+		return Object.keys($config?.prompts || {});
+	});
 
 	// Common cron presets (6-field: seconds minutes hours day month weekday)
 	const cronPresets = [
@@ -57,8 +61,7 @@
 
 	onMount(async () => {
 		// Load available prompts
-		const config = await configStore.getConfig();
-		availablePrompts = Object.keys(config.config.prompts || {});
+		await configStore.load();
 
 		if (automation) {
 			// Edit mode - populate form
@@ -231,7 +234,7 @@
 					aria-invalid={!!errors.prompt}
 				>
 					<option value="">Select a prompt...</option>
-					{#each availablePrompts as prompt}
+					{#each availablePrompts() as prompt}
 						<option value={prompt}>{prompt}</option>
 					{/each}
 				</select>
@@ -253,7 +256,7 @@
 						placeholder="0 0 9 * * *"
 						aria-invalid={!!errors.schedule}
 					/>
-					<select class="form-select preset-select" onchange={(e) => setPreset(e.target.value)}>
+					<select class="form-select preset-select" onchange={(e) => setPreset((e.target as HTMLSelectElement).value)}>
 						{#each cronPresets as preset}
 							<option value={preset.value}>{preset.label}</option>
 						{/each}

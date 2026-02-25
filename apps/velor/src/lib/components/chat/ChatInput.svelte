@@ -1,23 +1,28 @@
 <script lang="ts">
 	import { executionStore } from '$lib/stores';
-	import type { ExecutionConfig, Prompt } from '$lib/types';
+	import type { ExecutionConfig, PromptTemplate } from '$lib/types';
 	import { Send, Loader2, Settings, FileCode } from 'lucide-svelte';
 
 	interface Props {
-		prompts: Prompt[];
+		prompts: PromptTemplate[];
 		loading?: boolean;
 		onStart?: (config: ExecutionConfig) => void;
 	}
 
 	let { prompts = [], loading = false, onStart }: Props = $props();
 
-	let selectedPrompt = $state<Prompt | undefined>(
-		prompts.find((p) => p.name === 'default') || prompts[0]
-	);
+	let selectedPrompt = $state<PromptTemplate | undefined>(undefined);
 	let customVars = $state<Record<string, string>>({});
 	let showVarEditor = $state(false);
 	let newVarKey = $state('');
 	let newVarValue = $state('');
+
+	// Initialize selected prompt when prompts change
+	$effect(() => {
+		if (!selectedPrompt || !prompts.includes(selectedPrompt)) {
+			selectedPrompt = prompts.find((p) => p.name === 'default') || prompts[0];
+		}
+	});
 
 	// Get available prompts (non-template ones)
 	const availablePrompts = $derived(() => {
@@ -53,7 +58,7 @@
 
 		const config: ExecutionConfig = {
 			prompt_name: selectedPrompt.name,
-			vars: combinedVars
+			vars: combinedVars()
 		};
 
 		if (onStart) {

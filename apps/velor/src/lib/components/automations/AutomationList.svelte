@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { Plus, Search, Filter, Calendar as CalendarIcon } from 'lucide-svelte';
-	import { automationsStore, automationsLoading, automationsError } from '$lib/stores';
+	import { automationsStore, automations, automationsLoading, automationsError } from '$lib/stores';
 	import AutomationCard from './AutomationCard.svelte';
 	import type { Automation } from '$lib/types';
 
@@ -17,32 +17,27 @@
 	let filterEnabled: 'all' | 'enabled' | 'disabled' = $state('all');
 	let runningAutomations = $state<Set<string>>(new Set());
 
-	// Subscribe to store
-	let storeState = $state(automationsStore.get());
-	automationsStore.subscribe((state) => {
-		storeState = state;
-	});
-
-	const automations = $derived(storeState.automations);
-	const loading = $derived(storeState.loading);
-	const error = $derived(storeState.error);
+	// Use the derived stores directly
+	const automationsList = $derived($automations);
+	const loading = $derived($automationsLoading);
+	const error = $derived($automationsError);
 
 	// Filter automations based on search and filter
 	const filteredAutomations = $derived(() => {
-		let result = automations;
+		let result = automationsList;
 
 		// Filter by enabled state
 		if (filterEnabled === 'enabled') {
-			result = result.filter((a) => a.enabled);
+			result = result.filter((a: Automation) => a.enabled);
 		} else if (filterEnabled === 'disabled') {
-			result = result.filter((a) => !a.enabled);
+			result = result.filter((a: Automation) => !a.enabled);
 		}
 
 		// Filter by search query
 		if (searchQuery.trim()) {
 			const query = searchQuery.toLowerCase();
 			result = result.filter(
-				(a) =>
+				(a: Automation) =>
 					a.name.toLowerCase().includes(query) ||
 					a.description?.toLowerCase().includes(query) ||
 					a.prompt.toLowerCase().includes(query)
@@ -50,7 +45,7 @@
 		}
 
 		// Sort: enabled first, then by name
-		return result.sort((a, b) => {
+		return result.sort((a: Automation, b: Automation) => {
 			if (a.enabled !== b.enabled) {
 				return a.enabled ? -1 : 1;
 			}
@@ -76,11 +71,15 @@
 			await automationsStore.runNow(name);
 			// Clear running state after a delay
 			setTimeout(() => {
-				runningAutomations = new Set(runningAutomations).filter((x) => x !== name);
+				const newSet = new Set(runningAutomations);
+				newSet.delete(name);
+				runningAutomations = newSet;
 			}, 5000);
 		} catch (e) {
 			console.error('Failed to run automation:', e);
-			runningAutomations = new Set(runningAutomations).filter((x) => x !== name);
+			const newSet = new Set(runningAutomations);
+			newSet.delete(name);
+			runningAutomations = newSet;
 		}
 	}
 

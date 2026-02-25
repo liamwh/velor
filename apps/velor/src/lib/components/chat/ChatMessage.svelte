@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { ExecutionEvent } from '$lib/types';
+	import { ExecutionEventType } from '$lib/types';
 	import { Check, AlertCircle, Loader2, Copy } from 'lucide-svelte';
 	import { cn } from '$lib/utils';
 
@@ -12,11 +13,11 @@
 
 	// Determine message type based on event
 	const messageType = $derived(
-		event.event_type === 'output_chunk'
+		event.event_type === ExecutionEventType.OutputChunk
 			? 'output'
-			: event.event_type === 'error'
+			: event.event_type === ExecutionEventType.Error
 				? 'error'
-				: event.event_type === 'state_changed'
+				: event.event_type === ExecutionEventType.StateChanged
 					? 'status'
 					: 'info'
 	);
@@ -75,7 +76,7 @@
 {:else if messageType === 'error'}
 	<div class="message message-error">
 		<div class="message-icon error-icon">
-			<svelte:component this={icon} size={16} />
+			<AlertCircle size={16} />
 		</div>
 		<div class="message-content">
 			<div class="error-text">{event.error || 'An error occurred'}</div>
@@ -86,8 +87,12 @@
 	</div>
 {:else if messageType === 'status'}
 	<div class="message message-status">
-		<div class="message-icon status-icon">
-			<svelte:component this={icon} size={16} class:spinning={isStreaming} />
+		<div class="message-icon status-icon" class:spinning={isStreaming}>
+			{#if isStreaming}
+				<Loader2 size={16} />
+			{:else}
+				<Check size={16} />
+			{/if}
 		</div>
 		<div class="message-content">
 			{#if event.state}
@@ -114,7 +119,7 @@
 	<div class="message message-info">
 		<div class="message-content">
 			<div class="info-text">
-				{#if event.event_type === 'iteration_completed'}
+				{#if event.event_type === ExecutionEventType.IterationCompleted}
 					Iteration {event.iteration} completed
 				{:else}
 					{event.event_type}
