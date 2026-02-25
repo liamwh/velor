@@ -34,7 +34,7 @@ globset = { workspace = true }
 regex = { workspace = true }
 
 # Automations crate dependency
-velor-automations = { path = "../automations" }
+velor-automations = { path = "../../crates/automations" }
 
 # Timezone support (for automations)
 chrono-tz = { workspace = true }
