@@ -180,9 +180,16 @@
 - [x] automations.ts - Automations store with daemon control
 - [x] index.ts - Central store exports
 
-### 3.2 Components (PENDING)
-- [ ] Layout: Sidebar, Header, MainLayout
-- [ ] Chat: ChatMessage, ChatStream, ChatInput
+### 3.2 Components ⏳ IN PROGRESS
+- [x] Layout: Sidebar, Header, MainLayout
+  - [x] MainLayout - Root layout combining sidebar and main content area
+  - [x] Sidebar - Navigation with daemon toggle, quick actions, settings button
+  - [x] Header - Top header showing git root and config status
+- [x] Chat: ChatMessage, ChatStream, ChatInput
+  - [x] ChatMessage - Single message bubble with different types (output, error, status, info)
+  - [x] ChatStream - Live streaming chat interface with auto-scroll and event aggregation
+  - [x] ChatInput - Input component with prompt selector and variable editor
+  - [x] Execution route page integrating all chat components
 - [ ] Automations: List, Card, Editor, Runs
 - [ ] Settings: ConfigEditor, PromptEditor
 - [ ] Execution: Status, Controls
@@ -228,6 +235,25 @@
   - Added daemon.rs with BackgroundDaemon struct
   - Updated commands with real start_daemon/stop_daemon
   - All 317 tests passing
+- `f337dde` feat(gui): implement Phase 3.1 frontend setup for SvelteKit
+  - SvelteKit project initialization with Tailwind CSS
+  - shadcn-svelte dependencies and configuration
+  - Dark theme CSS variables matching plan specification
+- `b162d1c` feat(gui): implement Phase 3.2 layout components for Velor GUI
+  - 13 files changed, 466 insertions(+), 150 deletions(-)
+  - MainLayout, Sidebar, and Header components
+  - Welcome page with configuration status
+  - All 321 Rust tests passing
+
+---
+
+## Next Steps
+
+1. **Phase 3**: Complete remaining frontend components
+   - Automation components (List, Card, Editor, Runs)
+   - Settings components (ConfigEditor, PromptEditor)
+   - Execution status/controls
+2. **Integration**: End-to-end testing
 
 ---
 

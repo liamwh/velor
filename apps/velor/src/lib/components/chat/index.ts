@@ -1,5 +1,8 @@
 /**
- * Chat components placeholder
+ * Chat components for Velor GUI
+ * Provides a live streaming chat interface for agent executions
  */
 
-// Chat components will be exported here
+export { default as ChatMessage } from './ChatMessage.svelte';
+export { default as ChatStream } from './ChatStream.svelte';
+export { default as ChatInput } from './ChatInput.svelte';
