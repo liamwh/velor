@@ -524,22 +524,104 @@ pub async fn get_automation_runs(
 
 /// Starts the background daemon for scheduled automations.
 ///
-/// Note: This is a placeholder. The actual daemon implementation
-/// will be done in Phase 2.3.
+/// The daemon will run in a background task, periodically checking for
+/// automations that are due to run based on their cron schedules.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The daemon is already running
+/// - Git root is not configured
+/// - Automation store is not initialized
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn start_daemon(state: State<'_, Arc<AppState>>) -> CommandResult<()> {
+    // Check if daemon is already running
+    if state.is_daemon_running().await {
+        return Err("Daemon is already running".to_string());
+    }
+
+    // Check required components
+    let git_root = state
+        .git_root()
+        .await
+        .ok_or("Git root not configured. Cannot start daemon.")?;
+
+    let automation_store = state
+        .automation_store()
+        .await
+        .ok_or("Automation store not initialized. Cannot start daemon.")?;
+
+    let config = state.merged_config().await;
+
+    // Configure the daemon
+    let daemon = state.daemon();
+    daemon.set_git_root(git_root).await;
+    daemon.set_automation_store(automation_store).await;
+    daemon.set_config(config).await;
+
+    // Create cancel token
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    state.set_daemon_cancel_token(Some(cancel_token.clone())).await;
+
+    // Clone the inner Arc for the spawned task
+    let state_inner = Arc::clone(&state);
+    let daemon_clone = Arc::clone(&daemon);
+
+    // Spawn daemon task in background
+    tokio::spawn(async move {
+        info!("Background daemon task started");
+
+        let result = daemon_clone.run(cancel_token.clone()).await;
+
+        // Mark daemon as not running
+        state_inner.set_daemon_running(false).await;
+        state_inner.set_daemon_cancel_token(None).await;
+
+        match result {
+            Ok(_) => {
+                info!("Background daemon stopped gracefully");
+            }
+            Err(e) => {
+                error!("Background daemon stopped with error: {}", e);
+            }
+        }
+    });
+
+    // Mark daemon as running
     state.set_daemon_running(true).await;
-    info!("Daemon started");
+
+    info!("Daemon started successfully");
     Ok(())
 }
 
 /// Stops the background daemon.
+///
+/// This will signal the daemon to stop after the current tick completes.
+/// The daemon may take up to one tick interval to fully stop.
+///
+/// # Errors
+///
+/// Returns an error if the daemon is not running.
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn stop_daemon(state: State<'_, Arc<AppState>>) -> CommandResult<()> {
-    state.set_daemon_running(false).await;
-    info!("Daemon stopped");
+    // Check if daemon is running
+    if !state.is_daemon_running().await {
+        return Err("Daemon is not running".to_string());
+    }
+
+    // Cancel the daemon
+    if let Some(cancel_token) = state.daemon_cancel_token().await {
+        cancel_token.cancel();
+        info!("Daemon cancel signal sent");
+    } else {
+        return Err("Daemon cancel token not found".to_string());
+    }
+
+    // Note: We don't immediately set daemon_running to false
+    // The daemon task will set it when it actually stops
+    info!("Daemon stop requested");
     Ok(())
 }
 

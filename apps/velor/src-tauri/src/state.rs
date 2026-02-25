@@ -14,10 +14,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument};
 
 use velor_automations::AutomationStore;
 use velor_core::{ExecutionConfig, ExecutionId, ExecutionRecord, FileConfig, PromptDef};
+
+use crate::daemon::BackgroundDaemon;
 
 /// Active execution with its cancel token.
 #[derive(Debug, Clone)]
@@ -73,6 +76,10 @@ pub struct AppState {
     execution_history: Arc<RwLock<Vec<ExecutionRecord>>>,
     /// Automation store for scheduled tasks.
     automation_store: Arc<RwLock<Option<AutomationStore>>>,
+    /// Background daemon for scheduled automations.
+    daemon: Arc<BackgroundDaemon>,
+    /// Daemon cancel token for graceful shutdown.
+    daemon_cancel_token: Arc<RwLock<Option<CancellationToken>>>,
     /// Daemon running flag.
     daemon_running: Arc<RwLock<bool>>,
 }
@@ -95,6 +102,8 @@ impl AppState {
             active_executions: Arc::new(RwLock::new(HashMap::new())),
             execution_history: Arc::new(RwLock::new(Vec::new())),
             automation_store: Arc::new(RwLock::new(None)),
+            daemon: Arc::new(BackgroundDaemon::new()),
+            daemon_cancel_token: Arc::new(RwLock::new(None)),
             daemon_running: Arc::new(RwLock::new(false)),
         }
     }
@@ -296,6 +305,22 @@ impl AppState {
     #[instrument(skip(self), level = "trace", ret)]
     pub async fn is_daemon_running(&self) -> bool {
         *self.daemon_running.read().await
+    }
+
+    /// Returns a reference to the background daemon.
+    pub fn daemon(&self) -> Arc<BackgroundDaemon> {
+        Arc::clone(&self.daemon)
+    }
+
+    /// Sets the daemon cancel token.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn set_daemon_cancel_token(&self, token: Option<CancellationToken>) {
+        *self.daemon_cancel_token.write().await = token;
+    }
+
+    /// Returns the daemon cancel token if set.
+    pub async fn daemon_cancel_token(&self) -> Option<CancellationToken> {
+        self.daemon_cancel_token.read().await.clone()
     }
 
     /// Returns all available prompts from the merged config.
