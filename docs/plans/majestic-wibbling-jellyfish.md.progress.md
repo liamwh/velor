@@ -202,7 +202,18 @@
   - [x] NotificationSettings - Configure Telegram and macOS notifications
   - [x] Settings route page with tab navigation
   - [x] Sidebar updated with proper SvelteKit routing (goto, $page store)
-- [ ] Execution: Status, Controls
+- [x] Execution: Status, Controls
+  - [x] ExecutionStatus - Display execution state with appropriate icons and styling
+  - [x] ExecutionStatus - Shows metrics (iteration, duration, retries, output chars)
+  - [x] ExecutionStatus - Supports compact mode for inline display
+  - [x] ExecutionStatus - State-aware: Pending, Running, Retrying, Completed, Failed, Cancelled
+  - [x] ExecutionStatus - Error message display for failed executions
+  - [x] ExecutionControls - Action buttons (cancel, retry, clear) based on execution state
+  - [x] ExecutionControls - Supports compact mode for smaller displays
+  - [x] ExecutionControls - Loading state handling
+  - [x] ExecutionControls - Disabled state management
+  - [x] Execution route page refactored to use new components
+  - [x] All 321 Rust tests passing
 
 ---
 
@@ -267,18 +278,27 @@
   - NotificationSettings: Configure Telegram and macOS notifications
   - Sidebar updated to use proper SvelteKit routing (goto, $page store)
   - All 321 Rust tests passing
+- `98861c0` feat(gui): implement Phase 3.2 Execution components for Velor GUI
+  - 4 files changed, 535 insertions(+), 93 deletions(-)
+  - ExecutionStatus: Displays execution state with appropriate icons and styling
+  - ExecutionControls: Action buttons (cancel, retry, clear) based on execution state
+  - Refactored executions route to use new components
+  - All 321 Rust tests passing
 
 ---
 
 ## Next Steps
 
-1. **Phase 3**: Complete remaining frontend components
-   - Execution status/controls components (ExecutionStatus, ExecutionControls)
-2. **Integration**: End-to-end testing
+1. **Integration**: End-to-end testing
+2. **Bug Fixes**: Fix pre-existing Svelte type errors in settings page
 
 ---
 
-## Next Steps
+## Phase 3 Summary: Frontend ✅ COMPLETED
 
-1. **Phase 3**: Build SvelteKit frontend with shadcn-svelte
-2. **Integration**: End-to-end testing
+All Phase 3 frontend components have been implemented:
+- Layout: Sidebar, Header, MainLayout ✅
+- Chat: ChatMessage, ChatStream, ChatInput ✅
+- Automations: AutomationCard, AutomationList, AutomationEditor, AutomationRuns ✅
+- Settings: ConfigEditor, PromptEditor, NotificationSettings ✅
+- Execution: ExecutionStatus, ExecutionControls ✅
