@@ -208,3 +208,8 @@ export class EventService {
  * Global event service instance
  */
 export const eventService = new EventService();
+
+/**
+ * Alias for easier imports
+ */
+export const EVENT_SERVICE = eventService;

@@ -1,5 +1,13 @@
 <script lang="ts">
 	import './app.css';
+	import { onMount } from 'svelte';
+	import { configStore } from '$lib/stores';
+	import MainLayout from '$lib/components/layout/MainLayout.svelte';
+
+	// Load configuration on app mount
+	onMount(() => {
+		configStore.load();
+	});
 </script>
 
 <svelte:head>
@@ -9,4 +17,6 @@
 	<title>Velor - AI Agent CLI</title>
 </svelte:head>
 
-<slot />
+<MainLayout>
+	<slot />
+</MainLayout>
