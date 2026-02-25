@@ -368,16 +368,8 @@ pub async fn get_execution_history(
 
     // Sort by event timestamp (most recent first) and apply limit
     all.sort_by(|a, b| {
-        let a_time = a
-            .events
-            .last()
-            .map(|e| event_timestamp(e))
-            .unwrap_or_default();
-        let b_time = b
-            .events
-            .last()
-            .map(|e| event_timestamp(e))
-            .unwrap_or_default();
+        let a_time = a.events.last().map(event_timestamp).unwrap_or_default();
+        let b_time = b.events.last().map(event_timestamp).unwrap_or_default();
         b_time.cmp(&a_time)
     });
 

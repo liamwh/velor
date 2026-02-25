@@ -71,7 +71,7 @@ pub fn run() {
 
             // Initialize system tray
             let app_handle = app.handle();
-            if let Err(e) = build_tray(&app_handle) {
+            if let Err(e) = build_tray(app_handle) {
                 tracing::warn!("Failed to initialize system tray: {}", e);
             }
 

@@ -1110,7 +1110,8 @@ alwaysApply: true
 ---
 This is the content."#;
 
-        let (yaml, markdown) = split_frontmatter(content).unwrap();
+        let (yaml, markdown) =
+            split_frontmatter(content).expect("split_frontmatter should succeed");
         assert!(yaml.contains("description: Test rule"));
         assert!(yaml.contains("globs: *.rs"));
         assert_eq!(markdown.trim(), "This is the content.");
@@ -1121,7 +1122,8 @@ This is the content."#;
     fn test_split_frontmatter_none() {
         let content = "Just some markdown content";
 
-        let (yaml, markdown) = split_frontmatter(content).unwrap();
+        let (yaml, markdown) =
+            split_frontmatter(content).expect("split_frontmatter should succeed");
         assert!(yaml.is_empty());
         assert_eq!(markdown, content);
     }
@@ -1131,7 +1133,8 @@ This is the content."#;
     fn test_split_frontmatter_leading_empty() {
         let content = "\n\n---\ndescription: Test\n---\ncontent";
 
-        let (yaml, markdown) = split_frontmatter(content).unwrap();
+        let (yaml, markdown) =
+            split_frontmatter(content).expect("split_frontmatter should succeed");
         assert!(yaml.contains("description: Test"));
         assert_eq!(markdown.trim(), "content");
     }
@@ -1141,7 +1144,8 @@ This is the content."#;
     fn test_split_frontmatter_unclosed() {
         let content = "---\ndescription: Test\nNo closing delimiter";
 
-        let (yaml, markdown) = split_frontmatter(content).unwrap();
+        let (yaml, markdown) =
+            split_frontmatter(content).expect("split_frontmatter should succeed");
         // Should treat entire content as markdown when no closing delimiter
         assert!(yaml.is_empty());
         assert_eq!(markdown, content);
@@ -1243,7 +1247,7 @@ This is the content."#;
         let git_root = Path::new("/home/user/project");
         let absolute = Path::new("/home/user/project/src/main.rs");
 
-        let result = path_relative_to(git_root, absolute).unwrap();
+        let result = path_relative_to(git_root, absolute).expect("path_relative_to should succeed");
         assert_eq!(result, "src/main.rs");
     }
 
@@ -1253,7 +1257,7 @@ This is the content."#;
         let git_root = Path::new("/home/user/project");
         let absolute = Path::new("/home/user/project/deeply/nested/module.rs");
 
-        let result = path_relative_to(git_root, absolute).unwrap();
+        let result = path_relative_to(git_root, absolute).expect("path_relative_to should succeed");
         assert_eq!(result, "deeply/nested/module.rs");
     }
 
@@ -1309,7 +1313,13 @@ This is the content."#;
         assert!(result.contains("Rule content"));
         assert!(result.contains("Original prompt"));
         // Rules come before prompt
-        assert!(result.find("Rule content").unwrap() < result.find("Original prompt").unwrap());
+        let rule_pos = result
+            .find("Rule content")
+            .expect("Rule content should be found");
+        let prompt_pos = result
+            .find("Original prompt")
+            .expect("Original prompt should be found");
+        assert!(rule_pos < prompt_pos);
     }
 
     /// Test inject_rules with no rules returns original prompt.
@@ -1484,7 +1494,8 @@ This is the content."#;
         allowed.insert("python");
         allowed.insert("javascript");
 
-        let result = parse_intelligent_selection_response(output, &allowed).unwrap();
+        let result =
+            parse_intelligent_selection_response(output, &allowed).expect("parse should succeed");
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"rust".to_string()));
@@ -1499,7 +1510,8 @@ This is the content."#;
         allowed.insert("rust");
         allowed.insert("python");
 
-        let result = parse_intelligent_selection_response(output, &allowed).unwrap();
+        let result =
+            parse_intelligent_selection_response(output, &allowed).expect("parse should succeed");
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"rust".to_string()));
@@ -1513,7 +1525,8 @@ This is the content."#;
         let output = r#"{"rules":[],"reasoning":"none"}"#;
         let allowed = HashSet::new();
 
-        let result = parse_intelligent_selection_response(output, &allowed).unwrap();
+        let result =
+            parse_intelligent_selection_response(output, &allowed).expect("parse should succeed");
 
         assert_eq!(result.len(), 0);
     }
@@ -1529,7 +1542,8 @@ This is the content."#;
 
 That's it."#;
 
-        let result: IntelligentSelectionResponse = extract_json_from_markdown(text).unwrap();
+        let result: IntelligentSelectionResponse =
+            extract_json_from_markdown(text).expect("extract should succeed");
 
         assert_eq!(result.rules.len(), 2);
         assert!(result.rules.contains(&"rust".to_string()));
@@ -1541,7 +1555,8 @@ That's it."#;
     fn test_extract_json_from_markdown_plain_json() {
         let text = r#"{"rules":["rust"],"reasoning":"test"}"#;
 
-        let result: IntelligentSelectionResponse = extract_json_from_markdown(text).unwrap();
+        let result: IntelligentSelectionResponse =
+            extract_json_from_markdown(text).expect("extract should succeed");
 
         assert_eq!(result.rules.len(), 1);
         assert_eq!(result.rules[0], "rust");
@@ -1554,7 +1569,8 @@ That's it."#;
 {"rules":["rust"],"reasoning":"test"}
 ```"#;
 
-        let result: IntelligentSelectionResponse = extract_json_from_markdown(text).unwrap();
+        let result: IntelligentSelectionResponse =
+            extract_json_from_markdown(text).expect("extract should succeed");
 
         assert_eq!(result.rules.len(), 1);
         assert_eq!(result.rules[0], "rust");
@@ -1707,7 +1723,7 @@ mod proptest_tests {
         fn test_split_frontmatter_preserves_content(content in ".*") {
             let result = split_frontmatter(&content);
             // Should never error
-            let (_yaml, markdown) = result.unwrap();
+            let (_yaml, markdown) = result.expect("split_frontmatter should succeed");
             // Markdown should always be non-empty unless content is whitespace-only
             // When frontmatter is not found, markdown == content
             // When frontmatter is found, markdown is the content after closing ---
@@ -1761,9 +1777,11 @@ mod integration_tests {
     /// Test discovering rules from a directory.
     #[tokio::test]
     async fn test_discover_rules() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create a test rule file
         let rule_path = rules_dir.join("test.mdc");
@@ -1774,11 +1792,13 @@ globs:
 alwaysApply: false
 ---
 This is test content."#;
-        fs::write(&rule_path, content).await.unwrap();
+        fs::write(&rule_path, content)
+            .await
+            .expect("failed to write rule file");
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         assert_eq!(rules_set.glob_based.len(), 1);
         assert_eq!(rules_set.glob_based[0].name, "test");
@@ -1788,13 +1808,15 @@ This is test content."#;
     /// Test discovering rules with empty directory.
     #[tokio::test]
     async fn test_discover_rules_empty() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         assert_eq!(rules_set.total_count(), 0);
     }
@@ -1802,14 +1824,14 @@ This is test content."#;
     /// Test discovering rules creates directory if missing.
     #[tokio::test]
     async fn test_discover_rules_creates_directory() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
 
         assert!(!rules_dir.exists());
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         assert!(rules_dir.exists());
         assert_eq!(rules_set.total_count(), 0);
@@ -1818,7 +1840,7 @@ This is test content."#;
     /// Test parse_rule_file with valid content.
     #[tokio::test]
     async fn test_parse_rule_file_valid() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rule_path = temp_dir.path().join("test.mdc");
 
         let content = r#"---
@@ -1829,9 +1851,13 @@ globs:
 alwaysApply: true
 ---
 Use strict typing in Rust."#;
-        fs::write(&rule_path, content).await.unwrap();
+        fs::write(&rule_path, content)
+            .await
+            .expect("failed to write rule file");
 
-        let rule = parse_rule_file(&rule_path, temp_dir.path()).await.unwrap();
+        let rule = parse_rule_file(&rule_path, temp_dir.path())
+            .await
+            .expect("failed to parse rule file");
 
         assert_eq!(rule.name, "test");
         assert_eq!(rule.description, "A test rule");
@@ -1843,13 +1869,17 @@ Use strict typing in Rust."#;
     /// Test parse_rule_file with no frontmatter.
     #[tokio::test]
     async fn test_parse_rule_file_no_frontmatter() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rule_path = temp_dir.path().join("test.mdc");
 
         let content = "Just some content";
-        fs::write(&rule_path, content).await.unwrap();
+        fs::write(&rule_path, content)
+            .await
+            .expect("failed to write rule file");
 
-        let rule = parse_rule_file(&rule_path, temp_dir.path()).await.unwrap();
+        let rule = parse_rule_file(&rule_path, temp_dir.path())
+            .await
+            .expect("failed to parse rule file");
 
         assert_eq!(rule.name, "test");
         assert_eq!(rule.description, "test");
@@ -1861,9 +1891,11 @@ Use strict typing in Rust."#;
     /// Test RulesCache loads and caches rules.
     #[tokio::test]
     async fn test_rules_cache() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         let rule_path = rules_dir.join("cache_test.mdc");
         let content = r#"---
@@ -1873,16 +1905,18 @@ globs:
 alwaysApply: true
 ---
 Content"#;
-        fs::write(&rule_path, content).await.unwrap();
+        fs::write(&rule_path, content)
+            .await
+            .expect("failed to write rule file");
 
         let cache = RulesCache::new(temp_dir.path().to_path_buf(), ".agents/rules".to_string());
 
         // First access loads rules
-        let rules1 = cache.get().await.unwrap();
+        let rules1 = cache.get().await.expect("failed to get cached rules");
         assert_eq!(rules1.total_count(), 1);
 
         // Second access uses cached rules
-        let rules2 = cache.get().await.unwrap();
+        let rules2 = cache.get().await.expect("failed to get cached rules");
         assert_eq!(rules2.total_count(), 1);
     }
 
@@ -1892,9 +1926,11 @@ Content"#;
     /// that happens within a single iteration in ACP mode.
     #[tokio::test]
     async fn test_glob_based_rule_activation_flow() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create an always-apply rule
         let always_rule_path = rules_dir.join("always.mdc");
@@ -1904,7 +1940,9 @@ globs: []
 alwaysApply: true
 ---
 This rule should always be applied."#;
-        fs::write(&always_rule_path, always_content).await.unwrap();
+        fs::write(&always_rule_path, always_content)
+            .await
+            .expect("failed to write rule file");
 
         // Create a glob-based rule for Rust files
         let rust_rule_path = rules_dir.join("rust.mdc");
@@ -1916,7 +1954,9 @@ globs:
 alwaysApply: false
 ---
 Use strict typing in Rust."#;
-        fs::write(&rust_rule_path, rust_content).await.unwrap();
+        fs::write(&rust_rule_path, rust_content)
+            .await
+            .expect("failed to write rule file");
 
         // Create a glob-based rule for Python files
         let python_rule_path = rules_dir.join("python.mdc");
@@ -1927,12 +1967,14 @@ globs:
 alwaysApply: false
 ---
 Use type hints in Python."#;
-        fs::write(&python_rule_path, python_content).await.unwrap();
+        fs::write(&python_rule_path, python_content)
+            .await
+            .expect("failed to write rule file");
 
         // Load rules
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         assert_eq!(rules_set.always_apply.len(), 1);
         assert_eq!(rules_set.glob_based.len(), 2);
@@ -1997,9 +2039,11 @@ Use type hints in Python."#;
     /// Test intelligent selection prompt building and response parsing.
     #[tokio::test]
     async fn test_intelligent_selection_end_to_end() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create intelligent rules (no always_apply, no globs)
         let test_plan_rule_path = rules_dir.join("test_plan.mdc");
@@ -2011,7 +2055,7 @@ alwaysApply: false
 Write tests before implementation."#;
         fs::write(&test_plan_rule_path, test_plan_content)
             .await
-            .unwrap();
+            .expect("failed to write rule file");
 
         let api_design_rule_path = rules_dir.join("api_design.mdc");
         let api_design_content = r#"---
@@ -2022,12 +2066,12 @@ alwaysApply: false
 Use proper HTTP status codes."#;
         fs::write(&api_design_rule_path, api_design_content)
             .await
-            .unwrap();
+            .expect("failed to write rule file");
 
         // Load rules
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         assert_eq!(rules_set.intelligent.len(), 2);
 
@@ -2048,7 +2092,8 @@ Use proper HTTP status codes."#;
         allowed.insert("test_plan");
         allowed.insert("api_design");
 
-        let parsed = parse_intelligent_selection_response(json_response, &allowed).unwrap();
+        let parsed = parse_intelligent_selection_response(json_response, &allowed)
+            .expect("parse should succeed");
         assert_eq!(parsed.len(), 1);
         assert!(parsed.contains(&"test_plan".to_string()));
 
@@ -2056,7 +2101,8 @@ Use proper HTTP status codes."#;
         let json_response_with_invalid =
             r#"{"rules":["test_plan","unknown_rule"],"reasoning":"test"}"#;
         let parsed_filtered =
-            parse_intelligent_selection_response(json_response_with_invalid, &allowed).unwrap();
+            parse_intelligent_selection_response(json_response_with_invalid, &allowed)
+                .expect("parse should succeed");
         assert_eq!(parsed_filtered.len(), 1);
         assert!(!parsed_filtered.iter().any(|r| r == "unknown_rule"));
 
@@ -2068,14 +2114,16 @@ Use proper HTTP status codes."#;
 ```
 
 That's it."#;
-        let parsed_md = parse_intelligent_selection_response(markdown_response, &allowed).unwrap();
+        let parsed_md = parse_intelligent_selection_response(markdown_response, &allowed)
+            .expect("parse should succeed");
         assert_eq!(parsed_md.len(), 2);
         assert!(parsed_md.contains(&"api_design".to_string()));
         assert!(parsed_md.contains(&"test_plan".to_string()));
 
         // Test empty response
         let empty_response = r#"{"rules":[],"reasoning":"none"}"#;
-        let parsed_empty = parse_intelligent_selection_response(empty_response, &allowed).unwrap();
+        let parsed_empty = parse_intelligent_selection_response(empty_response, &allowed)
+            .expect("parse should succeed");
         assert_eq!(parsed_empty.len(), 0);
     }
 
@@ -2124,9 +2172,11 @@ That's it."#;
     /// Test state persistence across multiple iterations.
     #[tokio::test]
     async fn test_rules_state_persistence_across_iterations() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create glob-based rules
         let rust_rule_path = rules_dir.join("rust.mdc");
@@ -2140,7 +2190,7 @@ alwaysApply: false
 Use Rust best practices."#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         let js_rule_path = rules_dir.join("js.mdc");
         fs::write(
@@ -2153,11 +2203,11 @@ alwaysApply: false
 Use JavaScript best practices."#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         // Simulate state across iterations
         let mut state = RulesState::new();
@@ -2199,9 +2249,11 @@ Use JavaScript best practices."#,
     /// Test select_rules_with_intelligent with all rule types.
     #[tokio::test]
     async fn test_select_rules_with_intelligent_comprehensive() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create all rule types
         fs::write(
@@ -2214,7 +2266,7 @@ alwaysApply: true
 Always content"#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         fs::write(
             rules_dir.join("globbed.mdc"),
@@ -2226,7 +2278,7 @@ alwaysApply: false
 Glob content"#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         fs::write(
             rules_dir.join("intelligent.mdc"),
@@ -2238,11 +2290,11 @@ alwaysApply: false
 Intelligent content"#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         let mut state = RulesState::new();
 
@@ -2259,7 +2311,10 @@ Intelligent content"#,
         assert!(selected_with_glob.rules.iter().any(|r| r.name == "globbed"));
 
         // With intelligent rules provided, all three types are selected
-        let intelligent_rule = rules_set.intelligent.first().unwrap();
+        let intelligent_rule = rules_set
+            .intelligent
+            .first()
+            .expect("intelligent rules should not be empty");
         let selected_all = select_rules_with_intelligent(
             &rules_set,
             &state,
@@ -2272,9 +2327,11 @@ Intelligent content"#,
     /// Test max_mid_iteration_injections cap enforcement.
     #[tokio::test]
     async fn test_max_mid_iteration_injections_cap() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create multiple glob-based rules that match different files
         for i in 0..5 {
@@ -2290,12 +2347,12 @@ Content {}"#,
             );
             fs::write(rules_dir.join(format!("{}.mdc", name)), content)
                 .await
-                .unwrap();
+                .expect("failed to write rule file");
         }
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         let mut state = RulesState::new();
 
@@ -2341,9 +2398,11 @@ Content {}"#,
     /// and the mapping between files and rules is correctly tracked.
     #[tokio::test]
     async fn test_glob_based_injection_with_tracing() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create glob-based rules for different file types
         fs::write(
@@ -2358,7 +2417,7 @@ alwaysApply: false
 Use consistent TOML formatting."#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         fs::write(
             rules_dir.join("markdown.mdc"),
@@ -2372,11 +2431,11 @@ alwaysApply: false
 Use proper Markdown syntax."#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         let mut state = RulesState::new();
 
@@ -2428,9 +2487,11 @@ Use proper Markdown syntax."#,
     /// Test the match_globs_for_files_with_reason method for tracing output.
     #[tokio::test]
     async fn test_match_globs_for_files_with_reason() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let rules_dir = temp_dir.path().join(".agents").join("rules");
-        fs::create_dir_all(&rules_dir).await.unwrap();
+        fs::create_dir_all(&rules_dir)
+            .await
+            .expect("failed to create rules dir");
 
         // Create test rules
         fs::write(
@@ -2445,11 +2506,11 @@ alwaysApply: false
 Config file rules"#,
         )
         .await
-        .unwrap();
+        .expect("failed to write rule file");
 
         let rules_set = discover_rules(temp_dir.path(), ".agents/rules")
             .await
-            .unwrap();
+            .expect("failed to discover rules");
 
         let mut state = RulesState::new();
 

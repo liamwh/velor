@@ -500,8 +500,10 @@ mod tests {
             PromptDef::Inline("test template".to_string()),
         );
 
-        let mut config = FileConfig::default();
-        config.prompts = prompts;
+        let config = FileConfig {
+            prompts,
+            ..Default::default()
+        };
 
         *state.merged_config.write().await = config;
 
@@ -524,8 +526,10 @@ mod tests {
             PromptDef::Inline("my template".to_string()),
         );
 
-        let mut config = FileConfig::default();
-        config.prompts = prompts;
+        let config = FileConfig {
+            prompts,
+            ..Default::default()
+        };
 
         *state.merged_config.write().await = config;
 
@@ -550,8 +554,10 @@ mod tests {
         vars.insert("key1".to_string(), "value1".to_string());
         vars.insert("key2".to_string(), "value2".to_string());
 
-        let mut config = FileConfig::default();
-        config.vars = vars;
+        let config = FileConfig {
+            vars,
+            ..Default::default()
+        };
 
         *state.merged_config.write().await = config;
 
@@ -755,8 +761,10 @@ mod proptest_tests {
             let state = AppState::new();
 
             let result = rt.block_on(async {
-                let mut config = FileConfig::default();
-                config.vars = vars.clone();
+                let config = FileConfig {
+                    vars: vars.clone(),
+                    ..Default::default()
+                };
 
                 *state.merged_config.write().await = config;
 
@@ -784,8 +792,10 @@ mod proptest_tests {
                     prompt_map.insert(k.clone(), PromptDef::Inline(v.clone()));
                 }
 
-                let mut config = FileConfig::default();
-                config.prompts = prompt_map;
+                let config = FileConfig {
+                    prompts: prompt_map,
+                    ..Default::default()
+                };
 
                 *state.merged_config.write().await = config;
 

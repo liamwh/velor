@@ -85,51 +85,52 @@ fn enhance_template_error(
     };
 
     // Header section
-    writeln!(report, "  Error location: {line_info}").unwrap();
-    writeln!(report, "  Error kind: {detail}").unwrap();
+    writeln!(report, "  Error location: {line_info}").expect("failed to write to string");
+    writeln!(report, "  Error kind: {detail}").expect("failed to write to string");
 
     // Missing variable section
     if let Some(var_name) = &missing_var {
-        writeln!(report).unwrap();
-        writeln!(report, "  Missing variable: `{var_name}`").unwrap();
+        writeln!(report).expect("failed to write to string");
+        writeln!(report, "  Missing variable: `{var_name}`").expect("failed to write to string");
     }
 
     // Available variables section
-    writeln!(report).unwrap();
-    writeln!(report, "  Available variables ({}):", vars.len()).unwrap();
+    writeln!(report).expect("failed to write to string");
+    writeln!(report, "  Available variables ({}):", vars.len()).expect("failed to write to string");
     if vars.is_empty() {
-        writeln!(report, "    (none)").unwrap();
+        writeln!(report, "    (none)").expect("failed to write to string");
     } else {
         for key in vars.keys() {
-            writeln!(report, "    - {key}").unwrap();
+            writeln!(report, "    - {key}").expect("failed to write to string");
         }
     }
 
     // Context section with template snippet
     if let Some(line_num) = err.line() {
-        writeln!(report).unwrap();
-        writeln!(report, "  Template context (line {line_num}):").unwrap();
+        writeln!(report).expect("failed to write to string");
+        writeln!(report, "  Template context (line {line_num}):")
+            .expect("failed to write to string");
         let template_lines: Vec<&str> = template.lines().collect();
         if let Some(line_content) = template_lines.get(line_num.saturating_sub(1)) {
-            writeln!(report, "    {}", line_content.trim()).unwrap();
+            writeln!(report, "    {}", line_content.trim()).expect("failed to write to string");
         }
     }
 
     // Suggestion section
-    writeln!(report).unwrap();
-    writeln!(report, "  Suggestion:").unwrap();
+    writeln!(report).expect("failed to write to string");
+    writeln!(report, "  Suggestion:").expect("failed to write to string");
     if let Some(var_name) = &missing_var {
         writeln!(
             report,
             "    Add `{var_name}` to the [vars] section in .velor/velor.toml"
         )
-        .unwrap();
+        .expect("failed to write to string");
     } else {
         writeln!(
             report,
             "    Check the template at the error location for syntax issues"
         )
-        .unwrap();
+        .expect("failed to write to string");
     }
 
     color_eyre::eyre::eyre!("{report}\n\n  Original error: {err}")
