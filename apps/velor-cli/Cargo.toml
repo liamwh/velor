@@ -1,5 +1,5 @@
 [package]
-name = "velor-agent-cli"
+name = "velor-cli"
 version = "0.1.0"
 edition = "2024"
 license = "UNLICENSED"
@@ -46,5 +46,5 @@ tokio = { workspace = true }
 wiremock = { workspace = true }
 
 [[bin]]
-name = "velor"
+name = "vel"
 path = "src/main.rs"
