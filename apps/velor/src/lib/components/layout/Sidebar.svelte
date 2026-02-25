@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import { automationsStore, daemonRunning } from '$lib/stores';
 	import { EVENT_SERVICE } from '$lib/services/events';
 	import {
@@ -12,8 +14,6 @@
 		History,
 		Play
 	} from 'lucide-svelte';
-
-	let currentRoute = $state('/');
 
 	// Listen for daemon events from backend
 	onMount(async () => {
@@ -34,15 +34,14 @@
 	}
 
 	async function navigate(route: string) {
-		currentRoute = route;
-		// In a full SvelteKit app, this would use goto()
-		// For now, we'll emit an event or use a store
+		await goto(route);
 	}
 
 	const navItems = [
 		{ id: '/', label: 'Home', icon: Home },
 		{ id: '/executions', label: 'Executions', icon: History },
 		{ id: '/automations', label: 'Automations', icon: Calendar },
+		{ id: '/settings', label: 'Settings', icon: Settings },
 	];
 
 	const quickActions = [
@@ -61,7 +60,7 @@
 			{#each navItems as item}
 				<button
 					class="nav-item"
-					class:active={currentRoute === item.id}
+					class:active={$page.url.pathname === item.id}
 					onclick={() => navigate(item.id)}
 					aria-label={item.label}
 					title={item.label}
@@ -103,15 +102,6 @@
 				<span>Start</span>
 			{/if}
 			<span class="daemon-indicator" class:active={$daemonRunning}></span>
-		</button>
-
-		<button
-			class="settings-btn"
-			onclick={() => navigate('/settings')}
-			aria-label="Settings"
-			title="Settings"
-		>
-			<Settings size={20} />
 		</button>
 	</div>
 </aside>
