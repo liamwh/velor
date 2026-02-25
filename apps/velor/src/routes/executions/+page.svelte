@@ -67,16 +67,34 @@
 	}
 
 	// Available prompts for ChatInput
-	// TODO: Create a proper UI type for prompt selectors to avoid type casting
 	const availablePrompts = $derived(
-		$config?.prompts
-			? (Object.entries($config.prompts).map(([name, prompt]) => ({
+		(function() {
+			if (!$config?.prompts) return [];
+
+			return Object.entries($config.prompts).map(([name, prompt]) => {
+				// Handle both string and object prompt formats
+				let template: string;
+				let completeToken: string | undefined;
+
+				if (typeof prompt === 'string') {
+					template = prompt;
+				} else if (prompt && typeof prompt === 'object' && 'template' in prompt) {
+					const promptObj = prompt as { template: string; complete_token?: string };
+					template = promptObj.template;
+					completeToken = promptObj.complete_token;
+				} else {
+					template = '';
+				}
+
+				return {
 					name,
 					vars: {},
-					...prompt,
+					template,
+					complete_token: completeToken,
 					is_template: name.startsWith('_') || false
-				})) as any)
-			: []
+				};
+			});
+		})()
 	);
 
 	// Loading state based on execution state

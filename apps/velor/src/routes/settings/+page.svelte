@@ -9,7 +9,6 @@
 	type Tab = 'config' | 'prompts' | 'notifications';
 
 	let activeTab: Tab = $state('config');
-	let mounted = $state(false);
 
 	const tabs = [
 		{ id: 'config' as Tab, label: 'Configuration', icon: Settings },
@@ -18,7 +17,6 @@
 	];
 
 	onMount(() => {
-		mounted = true;
 		configStore.load();
 	});
 

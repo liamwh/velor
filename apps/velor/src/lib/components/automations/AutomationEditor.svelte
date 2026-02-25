@@ -234,7 +234,7 @@
 					aria-invalid={!!errors.prompt}
 				>
 					<option value="">Select a prompt...</option>
-					{#each availablePrompts() as prompt}
+					{#each availablePrompts() as prompt (prompt)}
 						<option value={prompt}>{prompt}</option>
 					{/each}
 				</select>
@@ -257,7 +257,7 @@
 						aria-invalid={!!errors.schedule}
 					/>
 					<select class="form-select preset-select" onchange={(e) => setPreset((e.target as HTMLSelectElement).value)}>
-						{#each cronPresets as preset}
+						{#each cronPresets as preset (preset.value)}
 							<option value={preset.value}>{preset.label}</option>
 						{/each}
 					</select>
@@ -274,7 +274,7 @@
 			<div class="form-group">
 				<label for="timezone">Timezone</label>
 				<select id="timezone" bind:value={formData.timezone} class="form-select">
-					{#each commonTimezones as tz}
+					{#each commonTimezones as tz (tz)}
 						<option value={tz}>{tz}</option>
 					{/each}
 				</select>
@@ -301,7 +301,7 @@
 					</button>
 				</div>
 				<div class="vars-list">
-					{#each formData.vars as v, index}
+					{#each formData.vars as v, index (index)}
 						<div class="var-row">
 							<input
 								type="text"

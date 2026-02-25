@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Plus, Search, Filter, Calendar as CalendarIcon } from 'lucide-svelte';
+	import { Plus, Search, Calendar as CalendarIcon } from 'lucide-svelte';
 	import { automationsStore, automations, automationsLoading, automationsError } from '$lib/stores';
 	import AutomationCard from './AutomationCard.svelte';
 	import type { Automation } from '$lib/types';

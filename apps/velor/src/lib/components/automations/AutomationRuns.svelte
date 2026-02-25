@@ -55,16 +55,6 @@
 		return new Date(timestamp).toLocaleString();
 	}
 
-	function formatDuration(started: string, completed: string | undefined): string {
-		if (!completed) return '—';
-		const start = new Date(started).getTime();
-		const end = new Date(completed).getTime();
-		const duration = end - start;
-		if (duration < 1000) return `${duration}ms`;
-		if (duration < 60000) return `${(duration / 1000).toFixed(1)}s`;
-		return `${(duration / 60000).toFixed(1)}m`;
-	}
-
 	function getRelativeTime(timestamp: string): string {
 		const now = Date.now();
 		const then = new Date(timestamp).getTime();

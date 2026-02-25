@@ -3,7 +3,7 @@
  */
 
 import { writable, derived } from "svelte/store";
-import type { ExecutionRecord, ExecutionConfig, StartExecutionRequest } from "$lib/types";
+import type { ExecutionRecord, ExecutionConfig } from "$lib/types";
 import * as tauri from "$lib/services/tauri";
 
 /**
@@ -20,7 +20,7 @@ interface ExecutionState {
  * Create the execution store
  */
 function createExecutionStore() {
-	const { subscribe, set, update } = writable<ExecutionState>({
+	const { subscribe, update } = writable<ExecutionState>({
 		current: null,
 		history: [],
 		loading: false,

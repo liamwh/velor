@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { config, configStore } from '$lib/stores';
-	import type { Prompt, Prompts } from '$lib/types';
-	import { Plus, Trash2, Save, FileText, Check, AlertCircle } from 'lucide-svelte';
+	import { Plus, Trash2, Save, FileText, AlertCircle } from 'lucide-svelte';
 
 	type ViewMode = 'list' | 'create' | 'edit';
 
@@ -66,16 +65,6 @@
 			return false;
 		}
 		return true;
-	}
-
-	function getPromptForSave(): string | { template: string; complete_token?: string } {
-		if (formData.isAdvanced && formData.completeToken) {
-			return {
-				template: formData.template,
-				complete_token: formData.completeToken
-			};
-		}
-		return formData.template;
 	}
 
 	async function savePrompt() {
@@ -147,20 +136,6 @@
 	function cancel() {
 		setViewMode('list');
 	}
-
-	const selectedPrompt = $derived(
-		selectedPromptName ? prompts[selectedPromptName] : null
-	);
-
-	const promptTemplate = $derived(() => {
-		if (!selectedPrompt) return '';
-		return typeof selectedPrompt === 'string' ? selectedPrompt : selectedPrompt.template || '';
-	});
-
-	const promptCompleteToken = $derived(() => {
-		if (!selectedPrompt || typeof selectedPrompt === 'string') return '';
-		return (selectedPrompt as { complete_token?: string }).complete_token || '';
-	});
 
 	// Helper function to get template for a specific prompt name
 	function getPromptTemplate(name: string): string {
@@ -266,7 +241,7 @@
 						rows="12"
 						required
 					></textarea>
-					<span class="hint">Use {'{{'}variable_name{'}}'} syntax for template variables</span>
+					<span class="hint">Use {`{{variable_name}}`} syntax for template variables</span>
 				</div>
 
 				<div class="form-group">

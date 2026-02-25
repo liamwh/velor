@@ -195,7 +195,7 @@ export class EventService {
 	 * Remove all event listeners
 	 */
 	unlistenAll(): void {
-		for (const [event, unlisteners] of this.listeners.entries()) {
+		for (const [_event, unlisteners] of this.listeners.entries()) {
 			for (const unlisten of unlisteners) {
 				unlisten();
 			}
