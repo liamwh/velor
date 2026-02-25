@@ -562,7 +562,7 @@ mod tests {
 
         // Create home config
         let home_path = temp_dir.path().join("home.toml");
-        let mut home_content = String::from(
+        let home_content = String::from(
             r#"
 [vars]
 home_var = "from_home"
