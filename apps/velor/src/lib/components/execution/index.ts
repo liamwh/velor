@@ -1,5 +1,7 @@
 /**
- * Execution components placeholder
+ * Execution components
+ * Reusable components for displaying execution status and controls
  */
 
-// Execution components will be exported here
+export { default as ExecutionStatus } from './ExecutionStatus.svelte';
+export { default as ExecutionControls } from './ExecutionControls.svelte';
