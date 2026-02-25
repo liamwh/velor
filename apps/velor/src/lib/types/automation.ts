@@ -4,153 +4,154 @@
  */
 
 /**
- * Automation ID (UUID v4)
+ * Catch-up policy for missed runs
  */
-export type AutomationId = string;
-
-/**
- * Automation schedule
- */
-export interface AutomationSchedule {
-	/** Cron expression */
-	cron: string;
-	/** Timezone (IANA) */
-	timezone: string;
-}
-
-/**
- * Automation status
- */
-export enum AutomationStatus {
-	Enabled = "enabled",
-	Disabled = "disabled",
-	Running = "running",
-	Failed = "failed"
-}
+export type CatchUpPolicy = "Skip" | "RunOnce" | "RunAll";
 
 /**
  * Automation configuration
+ * Matches the Rust Automation struct from velor-automations
  */
 export interface Automation {
-	/** Unique automation ID */
-	id: AutomationId;
-	/** Human-readable name */
+	/** Unique name of the automation (used as identifier) */
 	name: string;
-	/** Description */
-	description?: string;
-	/** Schedule configuration */
-	schedule: AutomationSchedule;
-	/** Prompt template name */
-	prompt_name: string;
-	/** Template variables */
-	vars: Record<string, string | number | boolean>;
-	/** Whether the automation is enabled */
+	/** Human-readable description */
+	description: string;
+	/** Cron schedule expression (6-field: seconds minutes hours day month weekday) */
+	schedule: string;
+	/** Timezone for the schedule (IANA tz database name) */
+	timezone: string;
+	/** Prompt template name or inline content */
+	prompt: string;
+	/** Whether this automation is enabled */
 	enabled: boolean;
-	/** Catch-up policy */
-	catch_up_policy: "skip" | "run_once" | "run_all";
-	/** Created timestamp */
-	created_at: string;
-	/** Updated timestamp */
-	updated_at: string;
+	/** Variables to pass to the prompt */
+	vars: Record<string, string>;
+	/** Policy for handling missed runs */
+	catch_up: CatchUpPolicy;
+	/** Maximum number of catch-up runs to execute */
+	max_catch_up: number;
+	/** Timeout for this automation (seconds, optional) */
+	timeout_seconds?: number;
+	/** Send notification on success */
+	notify_on_success: boolean;
+	/** Send notification on failure */
+	notify_on_failure: boolean;
 }
 
 /**
  * Automation run status
  */
-export enum AutomationRunStatus {
-	Pending = "pending",
-	Running = "running",
-	Completed = "completed",
-	Failed = "failed",
-	Skipped = "skipped"
-}
+export type AutomationRunStatus = "Pending" | "Running" | "Completed" | "Failed" | "Cancelled";
 
 /**
  * Automation run record
+ * Matches the Rust AutomationRun struct from velor-automations
  */
 export interface AutomationRun {
-	/** Unique run ID */
-	id: string;
-	/** Automation ID */
-	automation_id: AutomationId;
-	/** Scheduled timestamp */
-	scheduled_at: string;
-	/** Started timestamp */
-	started_at?: string;
-	/** Completed timestamp */
+	/** Unique identifier for this run */
+	id: number;
+	/** Name of the automation that was run */
+	automation_name: string;
+	/** When this run was scheduled to occur */
+	scheduled_for: string;
+	/** When this run actually started */
+	started_at: string;
+	/** When this run completed (if terminal) */
 	completed_at?: string;
-	/** Run status */
+	/** The current status of this run */
 	status: AutomationRunStatus;
-	/** Output preview */
-	output_preview?: string;
-	/** Error message if failed */
+	/** Number of iterations completed before termination */
+	iterations_completed: number;
+	/** Exit code from the automation process (if available) */
+	exit_code?: number;
+	/** Duration of the run in milliseconds (if terminal) */
+	duration_ms?: number;
+	/** Standard output from the automation run (truncated if needed) */
+	output?: string;
+	/** Standard error from the automation run (if any) */
 	error?: string;
 }
 
 /**
  * Automation list response
+ * The backend returns a Vec<Automation> directly
  */
-export interface AutomationList {
-	/** List of automations */
-	automations: Automation[];
-	/** Total count */
-	total: number;
-}
+export type AutomationList = Automation[];
 
 /**
  * Automation runs list response
  */
-export interface AutomationRunsList {
-	/** List of runs */
-	runs: AutomationRun[];
-	/** Total count */
-	total: number;
-}
+export type AutomationRunsList = AutomationRun[];
 
 /**
  * Create automation request
  */
 export interface CreateAutomationRequest {
-	/** Human-readable name */
+	/** Unique name of the automation */
 	name: string;
-	/** Description */
+	/** Human-readable description */
 	description?: string;
-	/** Schedule configuration */
-	schedule: AutomationSchedule;
+	/** Cron schedule expression (6-field) */
+	schedule: string;
+	/** Timezone for the schedule */
+	timezone?: string;
 	/** Prompt template name */
-	prompt_name: string;
-	/** Template variables */
-	vars: Record<string, string | number | boolean>;
-	/** Catch-up policy */
-	catch_up_policy?: "skip" | "run_once" | "run_all";
+	prompt: string;
+	/** Whether this automation is enabled */
+	enabled?: boolean;
+	/** Variables to pass to the prompt */
+	vars?: Record<string, string>;
+	/** Policy for handling missed runs */
+	catch_up?: CatchUpPolicy;
+	/** Maximum number of catch-up runs */
+	max_catch_up?: number;
+	/** Timeout in seconds */
+	timeout_seconds?: number;
+	/** Send notification on success */
+	notify_on_success?: boolean;
+	/** Send notification on failure */
+	notify_on_failure?: boolean;
 }
 
 /**
  * Update automation request
  */
 export interface UpdateAutomationRequest {
-	/** Automation ID */
-	id: AutomationId;
-	/** Human-readable name */
+	/** Current automation name (used as identifier) */
+	current_name: string;
+	/** New unique name of the automation */
 	name?: string;
-	/** Description */
+	/** Human-readable description */
 	description?: string;
-	/** Schedule configuration */
-	schedule?: AutomationSchedule;
+	/** Cron schedule expression (6-field) */
+	schedule?: string;
+	/** Timezone for the schedule */
+	timezone?: string;
 	/** Prompt template name */
-	prompt_name?: string;
-	/** Template variables */
-	vars?: Record<string, string | number | boolean>;
-	/** Catch-up policy */
-	catch_up_policy?: "skip" | "run_once" | "run_all";
+	prompt?: string;
+	/** Whether this automation is enabled */
+	enabled?: boolean;
+	/** Variables to pass to the prompt */
+	vars?: Record<string, string>;
+	/** Policy for handling missed runs */
+	catch_up?: CatchUpPolicy;
+	/** Maximum number of catch-up runs */
+	max_catch_up?: number;
+	/** Timeout in seconds */
+	timeout_seconds?: number;
+	/** Send notification on success */
+	notify_on_success?: boolean;
+	/** Send notification on failure */
+	notify_on_failure?: boolean;
 }
 
 /**
  * Toggle automation request
  */
 export interface ToggleAutomationRequest {
-	/** Automation ID */
-	id: AutomationId;
+	/** Automation name (used as identifier) */
+	name: string;
 	/** Whether to enable or disable */
 	enabled: boolean;
 }

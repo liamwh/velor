@@ -8,11 +8,12 @@
 //! - Notification: Notification testing
 //! - System: System utilities
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info, instrument, warn};
 
-use velor_automations::{Automation, load_automations};
+use velor_automations::{Automation, CatchUpPolicy, load_automations};
 use velor_core::{
     ExecutionConfig, ExecutionEvent, ExecutionId, ExecutionMetrics, FileConfig, build_notifiers,
 };
@@ -65,6 +66,66 @@ pub struct AutomationDetail {
     pub recent_runs: u32,
     /// Last run status if any.
     pub last_run_status: Option<String>,
+}
+
+/// Request to create a new automation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CreateAutomationRequest {
+    /// Unique name of the automation.
+    pub name: String,
+    /// Human-readable description.
+    pub description: Option<String>,
+    /// Cron schedule expression (6-field).
+    pub schedule: String,
+    /// Timezone for the schedule.
+    pub timezone: Option<String>,
+    /// Prompt template name.
+    pub prompt: String,
+    /// Whether this automation is enabled.
+    pub enabled: Option<bool>,
+    /// Variables to pass to the prompt.
+    pub vars: Option<BTreeMap<String, String>>,
+    /// Policy for handling missed runs.
+    pub catch_up: Option<CatchUpPolicy>,
+    /// Maximum number of catch-up runs.
+    pub max_catch_up: Option<u32>,
+    /// Timeout in seconds.
+    pub timeout_seconds: Option<u64>,
+    /// Send notification on success.
+    pub notify_on_success: Option<bool>,
+    /// Send notification on failure.
+    pub notify_on_failure: Option<bool>,
+}
+
+/// Request to update an existing automation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UpdateAutomationRequest {
+    /// Current automation name (used as identifier).
+    pub current_name: String,
+    /// New unique name of the automation.
+    pub name: Option<String>,
+    /// Human-readable description.
+    pub description: Option<String>,
+    /// Cron schedule expression (6-field).
+    pub schedule: Option<String>,
+    /// Timezone for the schedule.
+    pub timezone: Option<String>,
+    /// Prompt template name.
+    pub prompt: Option<String>,
+    /// Whether this automation is enabled.
+    pub enabled: Option<bool>,
+    /// Variables to pass to the prompt.
+    pub vars: Option<BTreeMap<String, String>>,
+    /// Policy for handling missed runs.
+    pub catch_up: Option<CatchUpPolicy>,
+    /// Maximum number of catch-up runs.
+    pub max_catch_up: Option<u32>,
+    /// Timeout in seconds.
+    pub timeout_seconds: Option<u64>,
+    /// Send notification on success.
+    pub notify_on_success: Option<bool>,
+    /// Send notification on failure.
+    pub notify_on_failure: Option<bool>,
 }
 
 /// Helper to extract timestamp from an event.
@@ -520,6 +581,159 @@ pub async fn get_automation_runs(
         .map_err(|e| format!("Failed to get automation runs: {}", e))?;
 
     Ok(runs)
+}
+
+/// Creates a new automation.
+///
+/// # Arguments
+///
+/// * `request` - The automation creation request.
+#[tauri::command]
+#[instrument(skip(state, request), level = "debug")]
+pub async fn create_automation(
+    state: State<'_, Arc<AppState>>,
+    request: CreateAutomationRequest,
+) -> CommandResult<()> {
+    let git_root = state.git_root().await.ok_or("No git root set")?;
+
+    let merged = state.merged_config().await;
+    let automations_dir = git_root.join(&merged.automations.automations_dir);
+
+    // Ensure automations directory exists
+    tokio::fs::create_dir_all(&automations_dir)
+        .await
+        .map_err(|e| format!("Failed to create automations directory: {}", e))?;
+
+    let file_path = automations_dir.join(format!("{}.toml", request.name));
+
+    // Check if automation already exists
+    if file_path.exists() {
+        return Err(format!("Automation '{}' already exists", request.name));
+    }
+
+    // Build automation from request
+    let automation = Automation {
+        name: request.name.clone(),
+        description: request.description.unwrap_or_default(),
+        schedule: request.schedule,
+        timezone: request
+            .timezone
+            .unwrap_or_else(|| merged.automations.default_timezone.clone()),
+        prompt: request.prompt,
+        enabled: request.enabled.unwrap_or(true),
+        vars: request.vars.unwrap_or_default(),
+        catch_up: request.catch_up.unwrap_or_default(),
+        max_catch_up: request.max_catch_up.unwrap_or(10),
+        timeout_seconds: request.timeout_seconds,
+        notify_on_success: request.notify_on_success.unwrap_or(true),
+        notify_on_failure: request.notify_on_failure.unwrap_or(true),
+    };
+
+    // Serialize and write
+    let toml_str = toml::to_string_pretty(&automation)
+        .map_err(|e| format!("Failed to serialize automation: {}", e))?;
+
+    tokio::fs::write(&file_path, toml_str)
+        .await
+        .map_err(|e| format!("Failed to write automation file: {}", e))?;
+
+    info!(name = %request.name, "Automation created");
+    Ok(())
+}
+
+/// Updates an existing automation.
+///
+/// # Arguments
+///
+/// * `request` - The automation update request.
+#[tauri::command]
+#[instrument(skip(state, request), level = "debug")]
+pub async fn update_automation(
+    state: State<'_, Arc<AppState>>,
+    request: UpdateAutomationRequest,
+) -> CommandResult<()> {
+    let git_root = state.git_root().await.ok_or("No git root set")?;
+
+    let merged = state.merged_config().await;
+    let automations_dir = git_root.join(&merged.automations.automations_dir);
+
+    let file_path = automations_dir.join(format!("{}.toml", request.current_name));
+
+    // Read existing file
+    let content = tokio::fs::read_to_string(&file_path)
+        .await
+        .map_err(|e| format!("Failed to read automation file: {}", e))?;
+
+    // Parse existing automation
+    let mut automation: Automation =
+        toml::from_str(&content).map_err(|e| format!("Failed to parse automation file: {}", e))?;
+
+    // Apply updates
+    if let Some(name) = request.name {
+        automation.name = name;
+    }
+    if let Some(description) = request.description {
+        automation.description = description;
+    }
+    if let Some(schedule) = request.schedule {
+        automation.schedule = schedule;
+    }
+    if let Some(timezone) = request.timezone {
+        automation.timezone = timezone;
+    }
+    if let Some(prompt) = request.prompt {
+        automation.prompt = prompt;
+    }
+    if let Some(enabled) = request.enabled {
+        automation.enabled = enabled;
+    }
+    if let Some(vars) = request.vars {
+        automation.vars = vars;
+    }
+    if let Some(catch_up) = request.catch_up {
+        automation.catch_up = catch_up;
+    }
+    if let Some(max_catch_up) = request.max_catch_up {
+        automation.max_catch_up = max_catch_up;
+    }
+    if let Some(timeout_seconds) = request.timeout_seconds {
+        automation.timeout_seconds = Some(timeout_seconds);
+    }
+    if let Some(notify_on_success) = request.notify_on_success {
+        automation.notify_on_success = notify_on_success;
+    }
+    if let Some(notify_on_failure) = request.notify_on_failure {
+        automation.notify_on_failure = notify_on_failure;
+    }
+
+    // If name changed, rename the file
+    let new_file_path = if automation.name != request.current_name {
+        automations_dir.join(format!("{}.toml", automation.name))
+    } else {
+        file_path.clone()
+    };
+
+    // Serialize and write
+    let toml_str = toml::to_string_pretty(&automation)
+        .map_err(|e| format!("Failed to serialize automation: {}", e))?;
+
+    // Remove old file if renamed
+    if new_file_path != file_path {
+        tokio::fs::remove_file(&file_path)
+            .await
+            .map_err(|e| format!("Failed to remove old automation file: {}", e))?;
+    }
+
+    tokio::fs::write(&new_file_path, toml_str)
+        .await
+        .map_err(|e| format!("Failed to write automation file: {}", e))?;
+
+    info!(
+        old_name = %request.current_name,
+        new_name = %automation.name,
+        "Automation updated"
+    );
+    Ok(())
 }
 
 /// Starts the background daemon for scheduled automations.
