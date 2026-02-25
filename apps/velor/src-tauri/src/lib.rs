@@ -9,12 +9,14 @@
 pub mod commands;
 pub mod daemon;
 pub mod state;
+pub mod tray;
 
 use std::sync::Arc;
 use tauri::Manager;
 use tracing::info;
 
 use state::AppState;
+use tray::build_tray;
 
 // Import all commands for use in invoke_handler
 use commands::{
@@ -66,6 +68,12 @@ pub fn run() {
             });
 
             app.manage(Arc::new(app_state));
+
+            // Initialize system tray
+            let app_handle = app.handle();
+            if let Err(e) = build_tray(&app_handle) {
+                tracing::warn!("Failed to initialize system tray: {}", e);
+            }
 
             info!("Application state initialized");
             Ok(())

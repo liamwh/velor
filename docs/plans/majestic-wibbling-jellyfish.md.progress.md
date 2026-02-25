@@ -44,7 +44,7 @@
 
 ---
 
-## Phase 2: Tauri Backend ⏳ IN PROGRESS
+## Phase 2: Tauri Backend ✅ COMPLETED
 
 ### 2.1 Tauri Commands ✅
 - [x] Config Commands
@@ -99,10 +99,28 @@
 - [x] Comprehensive testing (16 unit tests + 2 property tests)
 - [x] Export AutomationResult from velor-automations
 
-### 2.4 System Tray
-- [ ] Create `tray.rs`
-- [ ] Menu items: Open, Start/Stop Daemon, Quit
-- [ ] Show/hide window functionality
+### 2.4 System Tray ✅
+- [x] Create `tray.rs`
+  - TrayIconBuilder with ID "main"
+  - Menu items: Show/Hide, Start Daemon, Stop Daemon, Quit
+  - Left-click tray icon to toggle window visibility
+  - Right-click tray icon for menu
+- [x] Menu items: Show/Hide, Start/Stop Daemon, Quit
+  - Show/Hide toggles main window visibility
+  - Start/Stop daemon emits events to frontend
+  - Quit exits the application
+- [x] Show/hide window functionality
+  - Menu item text updates based on window state ("Show Velor" vs "Hide Velor")
+  - Tray icon click toggles window visibility
+  - Menu rebuild function for state updates
+- [x] Daemon state integration
+  - Start/Stop menu items enabled/disabled based on daemon state
+  - update_tray_state() function for state synchronization
+- [x] Testing (4 unit tests)
+  - test_tray_ids_are_unique
+  - test_tray_ids_non_empty
+  - test_tray_id_is_non_empty
+  - test_action_ids_distinct
 
 ---
 
@@ -175,6 +193,5 @@
 
 ## Next Steps
 
-1. **Phase 2.4**: System tray implementation
-2. **Phase 3**: Build SvelteKit frontend with shadcn-svelte
-3. **Integration**: End-to-end testing
+1. **Phase 3**: Build SvelteKit frontend with shadcn-svelte
+2. **Integration**: End-to-end testing

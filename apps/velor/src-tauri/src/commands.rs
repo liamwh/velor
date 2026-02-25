@@ -562,7 +562,9 @@ pub async fn start_daemon(state: State<'_, Arc<AppState>>) -> CommandResult<()> 
 
     // Create cancel token
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    state.set_daemon_cancel_token(Some(cancel_token.clone())).await;
+    state
+        .set_daemon_cancel_token(Some(cancel_token.clone()))
+        .await;
 
     // Clone the inner Arc for the spawned task
     let state_inner = Arc::clone(&state);
