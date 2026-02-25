@@ -124,28 +124,68 @@
 
 ---
 
-## Phase 3: Frontend (SvelteKit + shadcn-svelte) ⏳ PENDING
+## Phase 3: Frontend (SvelteKit + shadcn-svelte) ⏳ IN PROGRESS
 
-### 3.1 Setup
-- [ ] Initialize SvelteKit with Tailwind CSS
-- [ ] Install shadcn-svelte
-- [ ] Configure dark theme
+### 3.1 Setup ✅
+- [x] Initialize SvelteKit with Tailwind CSS
+  - Installed tailwindcss@4.2.1, @tailwindcss/typography, postcss, autoprefixer
+  - Created app.css with @theme configuration and dark theme colors
+  - Fixed tsconfig.json and vite.config.js for SvelteKit compatibility
+  - Added svelte.config.js with $lib alias
+- [x] Install shadcn-svelte dependencies
+  - Installed bits-ui, clsx, tailwind-merge, tailwind-variants, lucide-svelte
+  - Created components.json configuration
+  - Created lib/utils.ts with cn() utility function
+- [x] Configure dark theme
+  - Defined CSS variables matching plan specification
+  - Background: #121212, #1E1E1E, #2A2A2A
+  - Text: #FFFFFF, #B0B0B0, #707070
+  - Accent: #3B82F6 (blue)
 
-### 3.2 Components
+### 3.2 Directory Structure ✅
+- [x] Created lib directory structure:
+  - components/ui - shadcn-svelte UI components
+  - components/layout - Layout components (Sidebar, Header, MainLayout)
+  - components/chat - Chat interface components
+  - components/automations - Automation management components
+  - components/settings - Settings/editor components
+  - components/execution - Execution status/controls
+  - stores - Svelte stores for state management
+  - types - TypeScript type definitions
+  - services - Tauri API wrappers and event listeners
+
+### 3.3 Types ✅
+- [x] config.ts - VelorConfig, Prompt, Vars, Notifications types
+- [x] execution.ts - ExecutionState, ExecutionEvent, ExecutionRecord types
+- [x] automation.ts - Automation, AutomationRun, Schedule types
+- [x] index.ts - Central type exports
+
+### 3.4 Services ✅
+- [x] tauri.ts - Type-safe Tauri command wrappers
+  - Config commands (get_config, save_config, etc.)
+  - Execution commands (start_execution, cancel_execution, etc.)
+  - Automation commands (list_automations, toggle_automation, etc.)
+  - Notification commands (test_notification)
+  - System commands (discover_git_root, check_binary_available)
+- [x] events.ts - Event service for Tauri events
+  - EventService class with typed listeners
+  - Execution events (started, updated, completed, failed)
+  - Automation events (triggered, completed, failed)
+  - Daemon events (started, stopped)
+  - Error events
+
+### 3.5 Stores ✅
+- [x] config.ts - Configuration store with load/save functionality
+- [x] execution.ts - Execution store for managing active/past executions
+- [x] automations.ts - Automations store with daemon control
+- [x] index.ts - Central store exports
+
+### 3.2 Components (PENDING)
 - [ ] Layout: Sidebar, Header, MainLayout
 - [ ] Chat: ChatMessage, ChatStream, ChatInput
 - [ ] Automations: List, Card, Editor, Runs
 - [ ] Settings: ConfigEditor, PromptEditor
 - [ ] Execution: Status, Controls
-
-### 3.3 Stores
-- [ ] config.ts
-- [ ] execution.ts
-- [ ] automations.ts
-
-### 3.4 Services
-- [ ] tauri.ts - Tauri command wrappers
-- [ ] events.ts - Event listeners
 
 ---
 
