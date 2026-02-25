@@ -67,16 +67,19 @@
 
 	async function handleRun(name: string) {
 		try {
+			// eslint-disable-next-line svelte/prefer-svelte-reactivity -- Local copy for mutation
 			runningAutomations = new Set(runningAutomations).add(name);
 			await automationsStore.runNow(name);
 			// Clear running state after a delay
 			setTimeout(() => {
+				// eslint-disable-next-line svelte/prefer-svelte-reactivity -- Local copy for mutation
 				const newSet = new Set(runningAutomations);
 				newSet.delete(name);
 				runningAutomations = newSet;
 			}, 5000);
 		} catch (e) {
 			console.error('Failed to run automation:', e);
+			// eslint-disable-next-line svelte/prefer-svelte-reactivity -- Local copy for mutation
 			const newSet = new Set(runningAutomations);
 			newSet.delete(name);
 			runningAutomations = newSet;

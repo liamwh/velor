@@ -40,7 +40,7 @@
 
 	<!-- Tab Navigation -->
 	<nav class="tabs" aria-label="Settings tabs">
-		{#each tabs as tab}
+		{#each tabs as tab (tab.id)}
 			{@const Icon = tab.icon}
 			<button
 				class="tab"

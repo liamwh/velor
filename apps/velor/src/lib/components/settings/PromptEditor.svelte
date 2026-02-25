@@ -196,7 +196,7 @@
 				</div>
 			{:else}
 				<div class="prompts-grid">
-					{#each promptNames as name}
+					{#each promptNames as name (name)}
 						<div class="prompt-card">
 							<div class="card-header">
 								<div class="prompt-icon">

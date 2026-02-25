@@ -72,6 +72,7 @@
 
 	// Aggregate output chunks per iteration for better display
 	function aggregateOutput(events: ExecutionEvent[]): Map<number, string> {
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- Local utility function, not reactive state
 		const output = new Map<number, string>();
 		for (const event of events) {
 			if (event.event_type === ExecutionEventType.OutputChunk && event.iteration !== undefined) {
