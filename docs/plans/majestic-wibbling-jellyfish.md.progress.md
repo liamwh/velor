@@ -196,7 +196,12 @@
   - [x] AutomationEditor - Form for creating/editing automations with 6-field cron
   - [x] AutomationRuns - Modal displaying run history with status and output
   - [x] Automations route page integrating all automation components
-- [ ] Settings: ConfigEditor, PromptEditor
+- [x] Settings: ConfigEditor, PromptEditor, NotificationSettings
+  - [x] ConfigEditor - TOML config editor with Effective/Global/Project tabs
+  - [x] PromptEditor - Create and edit prompt templates with custom completion tokens
+  - [x] NotificationSettings - Configure Telegram and macOS notifications
+  - [x] Settings route page with tab navigation
+  - [x] Sidebar updated with proper SvelteKit routing (goto, $page store)
 - [ ] Execution: Status, Controls
 
 ---
@@ -255,14 +260,20 @@
   - Backend create_automation and update_automation commands
   - Updated types to match velor-automations crate
   - All 321 tests passing
+- `c0cb980` feat(gui): implement Phase 3.3 Settings components for Velor GUI
+  - 6 files changed, 1432 insertions(+), 18 deletions(-)
+  - ConfigEditor: View and edit merged effective, global, and project TOML configs
+  - PromptEditor: Create and edit prompt templates with custom completion tokens
+  - NotificationSettings: Configure Telegram and macOS notifications
+  - Sidebar updated to use proper SvelteKit routing (goto, $page store)
+  - All 321 Rust tests passing
 
 ---
 
 ## Next Steps
 
 1. **Phase 3**: Complete remaining frontend components
-   - Settings components (ConfigEditor, PromptEditor)
-   - Execution status/controls components
+   - Execution status/controls components (ExecutionStatus, ExecutionControls)
 2. **Integration**: End-to-end testing
 
 ---
