@@ -12,6 +12,6 @@ pub mod store;
 
 // Re-exports for convenience
 pub use config::{Automation, AutomationsConfig, CatchUpPolicy, load_automations};
-pub use runner::AutomationRunner;
+pub use runner::{AutomationRunner, AutomationResult, WorktreeCleanup};
 pub use scheduler::Scheduler;
 pub use store::{AutomationRun, AutomationRunStatus, AutomationStore};

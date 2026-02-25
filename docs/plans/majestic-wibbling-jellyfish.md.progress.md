@@ -82,10 +82,22 @@
 - [x] Daemon running flag
 - [x] Comprehensive testing (16 unit tests + 3 property tests)
 
-### 2.3 Background Daemon
-- [ ] Create `daemon.rs`
-- [ ] Tick loop for scheduled automations
-- [ ] Event emission to frontend
+### 2.3 Background Daemon ✅
+- [x] Create `daemon.rs` with BackgroundDaemon struct
+  - Tick loop for scheduled automations (60s interval)
+  - Integration with AutomationRunner for execution
+  - Last run time tracking per automation
+  - Catch-up policy support (Skip, RunOnce, RunAll)
+  - Event emission placeholders for frontend
+- [x] Update AppState with daemon and cancel token
+  - `daemon()` accessor method
+  - `set_daemon_cancel_token()` and `daemon_cancel_token()`
+- [x] Update start_daemon/stop_daemon commands
+  - Real implementation with background task spawning
+  - Proper error handling for required components
+  - Graceful shutdown via cancel token
+- [x] Comprehensive testing (16 unit tests + 2 property tests)
+- [x] Export AutomationResult from velor-automations
 
 ### 2.4 System Tray
 - [ ] Create `tray.rs`
@@ -152,12 +164,17 @@
   - 4 files changed, 867 insertions(+), 15 deletions(-)
   - Phase 2.2 complete (App State)
   - Added Serialize support to config types
+- `23d0672` feat(gui): implement Tauri commands for Velor GUI backend
+  - 8 files changed, 1800+ insertions(+)
+  - Phase 2.3 complete (Background Daemon)
+  - Added daemon.rs with BackgroundDaemon struct
+  - Updated commands with real start_daemon/stop_daemon
+  - All 317 tests passing
 
 ---
 
 ## Next Steps
 
-1. **Phase 2.3**: Background daemon implementation
-2. **Phase 2.4**: System tray implementation
-3. **Phase 3**: Build SvelteKit frontend with shadcn-svelte
-4. **Integration**: End-to-end testing
+1. **Phase 2.4**: System tray implementation
+2. **Phase 3**: Build SvelteKit frontend with shadcn-svelte
+3. **Integration**: End-to-end testing
