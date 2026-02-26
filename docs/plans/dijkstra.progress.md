@@ -134,9 +134,49 @@
 
 ---
 
-## Remaining Phases
+### Phase 6: UI Components (DONE)
 
-### Phase 6: UI Components (NOT STARTED)
-- Connect AutomationEditor to create/update stores
-- Create SessionsList and SessionDetail components
-- Update `/executions` page with real data
+**Status**: Completed
+**Commit**: a777c9a
+
+**Changes Made**:
+- Created `SessionsList` component with:
+  - Table view of execution history from SQLite
+  - State badges with color-coded icons (completed, failed, cancelled, running)
+  - Search by session ID and prompt name
+  - Filter by state (all, active, completed, failed)
+  - Pagination with "Load More" support
+  - Delete confirmation dialog
+  - Statistics bar showing session counts
+- Created `SessionDetail` component with:
+  - Full output display from session events
+  - Event timeline with timestamps
+  - Metrics display (duration, iterations, retries, output chars)
+  - Error section for failed sessions
+  - Retry and delete actions
+- Updated `/executions` page:
+  - Replaced placeholder with SessionsList
+  - Added SessionDetail modal for viewing session details
+  - Integrated with existing execution store
+- Added delete functionality to automations:
+  - Delete button in AutomationCard menu
+  - Confirmation dialog overlay
+  - Handle delete in AutomationList store
+
+**Files Added**:
+- `apps/velor/src/lib/components/sessions/SessionsList.svelte`
+- `apps/velor/src/lib/components/sessions/SessionDetail.svelte`
+- `apps/velor/src/lib/components/sessions/index.ts`
+
+**Files Modified**:
+- `apps/velor/src/routes/executions/+page.svelte`
+- `apps/velor/src/lib/components/automations/AutomationCard.svelte`
+- `apps/velor/src/lib/components/automations/AutomationList.svelte`
+
+**Impact**: Completes the full UI implementation for the Velor GUI. Users can now view execution history, inspect session details, and manage automations with full CRUD operations. All planned phases are now complete.
+
+---
+
+## Plan Complete
+
+All 6 phases of the Velor UI Implementation Plan have been completed successfully.
