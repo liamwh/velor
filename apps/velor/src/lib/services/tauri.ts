@@ -11,6 +11,7 @@ import type {
 	ExecutionList,
 	StartExecutionRequest,
 	StartExecutionResponse,
+	SessionStats,
 	Automation,
 	AutomationList,
 	AutomationRunsList,
@@ -62,6 +63,26 @@ export async function getExecutionHistory(limit?: number): Promise<ExecutionList
 }
 
 /**
+ * Session Commands
+ */
+
+export async function listSessions(limit?: number, offset?: number): Promise<ExecutionRecord[]> {
+	return await invoke<ExecutionRecord[]>("list_sessions", { limit, offset });
+}
+
+export async function getSession(id: string): Promise<ExecutionRecord | null> {
+	return await invoke<ExecutionRecord | null>("get_session", { id });
+}
+
+export async function deleteSession(id: string): Promise<void> {
+	await invoke("delete_session", { id });
+}
+
+export async function getSessionStats(): Promise<SessionStats> {
+	return await invoke<SessionStats>("get_session_stats");
+}
+
+/**
  * Automation Commands
  */
 
@@ -91,6 +112,10 @@ export async function createAutomation(request: CreateAutomationRequest): Promis
 
 export async function updateAutomation(request: UpdateAutomationRequest): Promise<void> {
 	await invoke("update_automation", { request });
+}
+
+export async function deleteAutomation(name: string): Promise<void> {
+	await invoke("delete_automation", { name });
 }
 
 export async function startDaemon(): Promise<void> {

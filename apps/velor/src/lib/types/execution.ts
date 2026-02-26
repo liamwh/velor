@@ -133,3 +133,19 @@ export interface StartExecutionResponse {
 	/** Initial state */
 	state: ExecutionState;
 }
+
+/**
+ * Statistics about execution sessions
+ */
+export interface SessionStats {
+	/** Total number of sessions */
+	total: number;
+	/** Number of completed sessions */
+	completed: number;
+	/** Number of failed sessions */
+	failed: number;
+	/** Number of cancelled sessions */
+	cancelled: number;
+	/** Number of active (non-terminal) sessions */
+	active: number;
+}
