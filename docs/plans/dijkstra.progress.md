@@ -51,12 +51,37 @@
 
 ---
 
-## Remaining Phases
+### Phase 3: New Backend Commands (DONE)
 
-### Phase 3: New Backend Commands (NOT STARTED)
-- Add `list_sessions`, `get_session`, `delete_session`, `get_session_stats` commands
-- Add `delete_automation` command
-- Register in `lib.rs`
+**Status**: Completed
+
+**Changes Made**:
+- Added session management commands to `commands.rs`:
+  - `list_sessions(limit, offset)` - List sessions with pagination
+  - `get_session(id)` - Get a specific session by ID
+  - `delete_session(id)` - Delete a session (idempotent)
+  - `get_session_stats()` - Get aggregated session statistics
+- Added `delete_automation(name)` command for automation deletion (idempotent)
+- Registered all new commands in `lib.rs` invoke_handler
+- Added import for `SessionStats` and `ExecutionRecord` types
+- Added 5 new unit tests for command serialization and deserialization
+
+**Files Modified**:
+- `apps/velor/src-tauri/src/commands.rs`
+- `apps/velor/src-tauri/src/lib.rs`
+
+**Tests Added**:
+- `test_session_stats_serialization` - Verify SessionStats JSON serialization
+- `test_session_stats_default` - Verify default values
+- `test_create_automation_request_deserialization` - Verify request parsing
+- `test_update_automation_request_deserialization` - Verify update request parsing
+- Enhanced existing tests with assertion messages
+
+**Impact**: Exposes session management and automation deletion to the frontend, enabling full CRUD operations for sessions and automations via Tauri IPC.
+
+---
+
+## Remaining Phases
 
 ### Phase 4: Frontend Service Layer (NOT STARTED)
 - Add session and automation service functions to `src/lib/services/tauri.ts`

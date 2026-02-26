@@ -15,9 +15,11 @@ use tracing::{error, info, instrument, warn};
 
 use velor_automations::{Automation, CatchUpPolicy, load_automations};
 use velor_core::{
-    ExecutionConfig, ExecutionEvent, ExecutionId, ExecutionMetrics, FileConfig, build_notifiers,
+    ExecutionConfig, ExecutionEvent, ExecutionId, ExecutionMetrics, ExecutionRecord, FileConfig,
+    build_notifiers,
 };
 
+use crate::session_store::SessionStats;
 use crate::state::AppState;
 
 /// Result type for commands that can fail.
@@ -900,6 +902,146 @@ pub async fn check_binary_available(binary: String) -> CommandResult<bool> {
     Ok(which::which(&binary).is_ok())
 }
 
+// ============================================================================
+// Session Commands
+// ============================================================================
+
+/// Lists execution sessions from the persistent store.
+///
+/// # Arguments
+///
+/// * `limit` - Maximum number of sessions to return (default: 50).
+/// * `offset` - Number of sessions to skip for pagination (default: 0).
+///
+/// Returns sessions ordered by start time, most recent first.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn list_sessions(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> CommandResult<Vec<ExecutionRecord>> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    let limit = limit.unwrap_or(50);
+    let offset = offset.unwrap_or(0);
+
+    let sessions = store
+        .list_sessions(limit, offset)
+        .await
+        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+
+    info!(limit, offset, count = sessions.len(), "Sessions listed");
+    Ok(sessions)
+}
+
+/// Gets a specific execution session by ID.
+///
+/// # Arguments
+///
+/// * `id` - The session ID to retrieve.
+///
+/// Returns the session record if found, or null if not found.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn get_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> CommandResult<Option<ExecutionRecord>> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    let session = store
+        .get_session(&id)
+        .await
+        .map_err(|e| format!("Failed to get session: {}", e))?;
+
+    Ok(session)
+}
+
+/// Deletes an execution session from the persistent store.
+///
+/// This operation is idempotent - deleting a non-existent session
+/// will succeed without error.
+///
+/// # Arguments
+///
+/// * `id` - The session ID to delete.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn delete_session(state: State<'_, Arc<AppState>>, id: String) -> CommandResult<()> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    store
+        .delete_session(&id)
+        .await
+        .map_err(|e| format!("Failed to delete session: {}", e))?;
+
+    info!(id, "Session deleted");
+    Ok(())
+}
+
+/// Gets statistics about execution sessions.
+///
+/// Returns counts of total, completed, failed, cancelled, and active sessions.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn get_session_stats(state: State<'_, Arc<AppState>>) -> CommandResult<SessionStats> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    let stats = store
+        .get_session_stats()
+        .await
+        .map_err(|e| format!("Failed to get session stats: {}", e))?;
+
+    Ok(stats)
+}
+
+// ============================================================================
+// Automation Management Commands
+// ============================================================================
+
+/// Deletes an automation by name.
+///
+/// This operation removes the automation file from disk. It is idempotent -
+/// attempting to delete a non-existent automation will succeed without error.
+///
+/// # Arguments
+///
+/// * `name` - The name of the automation to delete.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn delete_automation(state: State<'_, Arc<AppState>>, name: String) -> CommandResult<()> {
+    let git_root = state.git_root().await.ok_or("No git root set")?;
+
+    let merged = state.merged_config().await;
+    let automations_dir = git_root.join(&merged.automations.automations_dir);
+    let file_path = automations_dir.join(format!("{}.toml", name));
+
+    // Delete the file if it exists (idempotent)
+    if file_path.exists() {
+        tokio::fs::remove_file(&file_path)
+            .await
+            .map_err(|e| format!("Failed to delete automation file: {}", e))?;
+        info!(name, "Automation deleted");
+    } else {
+        info!(name, "Automation file not found, nothing to delete");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,7 +1055,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response);
-        assert!(json.is_ok());
+        assert!(json.is_ok(), "ConfigResponse should serialize to JSON");
     }
 
     #[test]
@@ -930,7 +1072,10 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response);
-        assert!(json.is_ok());
+        assert!(
+            json.is_ok(),
+            "ExecutionStatusResponse should serialize to JSON"
+        );
     }
 
     #[test]
@@ -956,6 +1101,77 @@ mod tests {
         };
 
         let json = serde_json::to_string(&detail);
-        assert!(json.is_ok());
+        assert!(json.is_ok(), "AutomationDetail should serialize to JSON");
+    }
+
+    #[test]
+    fn test_session_stats_serialization() {
+        let stats = SessionStats {
+            total: 100,
+            completed: 75,
+            failed: 15,
+            cancelled: 5,
+            active: 5,
+        };
+
+        let json = serde_json::to_string(&stats);
+        assert!(json.is_ok(), "SessionStats should serialize to JSON");
+
+        let json_str = json.unwrap();
+        assert!(
+            json_str.contains("\"total\":100"),
+            "JSON should contain total count"
+        );
+        assert!(
+            json_str.contains("\"completed\":75"),
+            "JSON should contain completed count"
+        );
+    }
+
+    #[test]
+    fn test_create_automation_request_deserialization() {
+        let json = r#"{
+            "name": "test-automation",
+            "description": "Test description",
+            "schedule": "0 0 * * * *",
+            "prompt": "test-prompt",
+            "enabled": true
+        }"#;
+
+        let request: CreateAutomationRequest = serde_json::from_str(json)
+            .expect("CreateAutomationRequest should deserialize from JSON");
+
+        assert_eq!(request.name, "test-automation");
+        assert_eq!(request.description, Some("Test description".to_string()));
+        assert_eq!(request.schedule, "0 0 * * * *");
+        assert_eq!(request.prompt, "test-prompt");
+        assert_eq!(request.enabled, Some(true));
+    }
+
+    #[test]
+    fn test_update_automation_request_deserialization() {
+        let json = r#"{
+            "current_name": "old-name",
+            "name": "new-name",
+            "enabled": false
+        }"#;
+
+        let request: UpdateAutomationRequest = serde_json::from_str(json)
+            .expect("UpdateAutomationRequest should deserialize from JSON");
+
+        assert_eq!(request.current_name, "old-name");
+        assert_eq!(request.name, Some("new-name".to_string()));
+        assert_eq!(request.enabled, Some(false));
+    }
+
+    #[test]
+    fn test_session_stats_default() {
+        let stats = SessionStats::default();
+
+        assert_eq!(stats.total, 0, "Default total should be 0");
+        assert_eq!(stats.completed, 0, "Default completed should be 0");
+        assert_eq!(stats.failed, 0, "Default failed should be 0");
+        assert_eq!(stats.cancelled, 0, "Default cancelled should be 0");
+        assert_eq!(stats.active, 0, "Default active should be 0");
     }
 }
