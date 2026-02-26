@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod daemon;
+pub mod session_store;
 pub mod state;
 pub mod tray;
 
@@ -63,6 +64,11 @@ pub fn run() {
                     let db_path = root.join(".velor").join("automations.db");
                     if let Err(e) = app_state.init_automation_store(db_path).await {
                         tracing::warn!("Failed to initialize automation store: {}", e);
+                    }
+                    // Initialize session store in the same database
+                    let session_db_path = root.join(".velor").join("sessions.db");
+                    if let Err(e) = app_state.init_session_store(session_db_path).await {
+                        tracing::warn!("Failed to initialize session store: {}", e);
                     }
                 }
             });
