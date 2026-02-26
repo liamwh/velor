@@ -1,15 +1,20 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { config, executionStore, currentExecution, executionError } from '$lib/stores';
+	import { config, executionStore, currentExecution, executionError, sessionsStore } from '$lib/stores';
 	import { EVENT_SERVICE } from '$lib/services/events';
-	import { ChatStream, ChatInput } from '$lib/components/chat';
+	import { ChatInput } from '$lib/components/chat';
 	import { ExecutionStatus, ExecutionControls } from '$lib/components/execution';
+	import { SessionsList, SessionDetail } from '$lib/components/sessions';
 	import { AlertCircle, X } from 'lucide-svelte';
-	import type { ExecutionConfig } from '$lib/types';
+	import type { ExecutionConfig, ExecutionRecord } from '$lib/types';
+
+	let showSessionDetail = $state(false);
+	let sessionToView = $state<ExecutionRecord | null>(null);
 
 	// Load execution history on mount
 	onMount(async () => {
 		await executionStore.loadHistory(20);
+		await sessionsStore.load(20);
 
 		// Listen for execution events
 		await EVENT_SERVICE.onExecutionStarted(({ execution }) => {
@@ -24,11 +29,13 @@
 			executionStore.updateCurrent(execution);
 			// Reload history to include this execution
 			executionStore.loadHistory(20);
+			sessionsStore.refresh(20);
 		});
 
 		await EVENT_SERVICE.onExecutionFailed(({ execution }) => {
 			executionStore.updateCurrent(execution);
 			executionStore.loadHistory(20);
+			sessionsStore.refresh(20);
 		});
 	});
 
@@ -64,6 +71,28 @@
 	// Clear error
 	function clearError() {
 		executionStore.clearCurrent();
+	}
+
+	// View a session from the history
+	function handleViewSession(session: ExecutionRecord) {
+		sessionToView = session;
+		showSessionDetail = true;
+	}
+
+	// Close session detail
+	function handleCloseSessionDetail() {
+		showSessionDetail = false;
+		sessionToView = null;
+	}
+
+	// Retry from session detail
+	function handleRetryFromSession(promptName: string) {
+		const config: ExecutionConfig = {
+			prompt_name: promptName,
+			vars: {}
+		};
+		executionStore.start(config);
+		handleCloseSessionDetail();
 	}
 
 	// Available prompts for ChatInput
@@ -103,16 +132,18 @@
 	);
 </script>
 
-<div class="executions-page">
-	<div class="chat-container">
-		<!-- Chat Stream -->
-		<ChatStream showMetrics={true} autoScroll={true} />
+<div class="h-full flex flex-col">
+	<!-- Session History Section -->
+	<div class="flex-1 overflow-hidden">
+		<SessionsList onSelect={handleViewSession} />
+	</div>
 
-		<!-- Chat Input -->
-		<div class="input-section">
-			{#if $currentExecution}
-				<!-- Active or Terminal Execution Display -->
-				<div class="execution-display">
+	<!-- Active Execution Section -->
+	{#if $currentExecution}
+		<div class="border-t border-border">
+			<div class="p-4">
+				<h3 class="text-sm font-medium text-muted-foreground mb-2">Current Execution</h3>
+				<div class="flex items-center justify-between bg-card rounded-lg p-3 gap-4">
 					<ExecutionStatus execution={$currentExecution} showMetrics={false} compact={true} />
 					<ExecutionControls
 						execution={$currentExecution}
@@ -122,54 +153,35 @@
 						compact={true}
 					/>
 				</div>
-			{:else}
-				<!-- Normal Input -->
-				<ChatInput
-					prompts={availablePrompts}
-					loading={isLoading}
-					onStart={handleStart}
-				/>
-			{/if}
+			</div>
 		</div>
-	</div>
+	{:else}
+		<!-- Chat Input for starting new executions -->
+		<div class="border-t border-border">
+			<ChatInput prompts={availablePrompts} loading={isLoading} onStart={handleStart} />
+		</div>
+	{/if}
 
 	{#if $executionError}
-		<div class="error-banner">
+		<div class="flex items-center gap-3 px-4 py-3 bg-red-950/50 border-t border-red-900/50 text-red-300">
 			<AlertCircle size={16} />
-			<span>{$executionError}</span>
-			<button class="close-btn" onclick={clearError} aria-label="Dismiss error">
+			<span class="flex-1 text-sm">{$executionError}</span>
+			<button
+				class="p-1 rounded hover:bg-red-900/50 transition-colors"
+				onclick={clearError}
+				aria-label="Dismiss error"
+			>
 				<X size={14} />
 			</button>
 		</div>
 	{/if}
 </div>
 
-<style>
-	.executions-page {
-		@apply h-full flex flex-col;
-	}
-
-	.chat-container {
-		@apply flex-1 flex flex-col overflow-hidden;
-	}
-
-	.input-section {
-		@apply border-t border-[var(--color-border)];
-	}
-
-	.execution-display {
-		@apply flex items-center justify-between px-4 py-3 bg-[var(--color-bg-secondary)] gap-4;
-	}
-
-	.error-banner {
-		@apply flex items-center gap-3 px-4 py-3 bg-red-950/50 border-t border-red-900/50 text-red-300;
-	}
-
-	.error-banner span {
-		@apply flex-1 text-sm;
-	}
-
-	.close-btn {
-		@apply p-1 rounded hover:bg-red-900/50 transition-colors;
-	}
-</style>
+<!-- Session Detail Modal -->
+{#if showSessionDetail && sessionToView}
+	<SessionDetail
+		session={sessionToView}
+		onClose={handleCloseSessionDetail}
+		onRetry={handleRetryFromSession}
+	/>
+{/if}
