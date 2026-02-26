@@ -54,6 +54,7 @@
 ### Phase 3: New Backend Commands (DONE)
 
 **Status**: Completed
+**Commit**: edf9bb8
 
 **Changes Made**:
 - Added session management commands to `commands.rs`:
@@ -81,10 +82,29 @@
 
 ---
 
-## Remaining Phases
+### Phase 4: Frontend Service Layer (DONE)
 
-### Phase 4: Frontend Service Layer (NOT STARTED)
-- Add session and automation service functions to `src/lib/services/tauri.ts`
+**Status**: Completed
+**Commit**: 847796d
+
+**Changes Made**:
+- Added `SessionStats` interface to `src/lib/types/execution.ts`
+- Added session management service functions to `src/lib/services/tauri.ts`:
+  - `listSessions(limit?, offset?)` - List sessions with pagination
+  - `getSession(id)` - Get a specific session by ID
+  - `deleteSession(id)` - Delete a session
+  - `getSessionStats()` - Get aggregated session statistics
+- Added `deleteAutomation(name)` service function
+
+**Files Modified**:
+- `apps/velor/src/lib/types/execution.ts`
+- `apps/velor/src/lib/services/tauri.ts`
+
+**Impact**: Provides type-safe TypeScript wrappers for the new backend commands, enabling frontend components to call session management and automation deletion functions.
+
+---
+
+## Remaining Phases
 
 ### Phase 5: Frontend Stores (NOT STARTED)
 - Create `src/lib/stores/sessions.ts`
