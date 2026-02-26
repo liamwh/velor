@@ -104,11 +104,37 @@
 
 ---
 
-## Remaining Phases
+### Phase 5: Frontend Stores (DONE)
 
-### Phase 5: Frontend Stores (NOT STARTED)
-- Create `src/lib/stores/sessions.ts`
-- Update `src/lib/stores/automations.ts` with CRUD methods
+**Status**: Completed
+**Commit**: a3c080d
+
+**Changes Made**:
+- Created `src/lib/stores/sessions.ts` with full reactive state management:
+  - `SessionsState` interface with pagination support
+  - `load(limit)` - Load first page of sessions
+  - `loadMore(limit)` - Load additional pages (infinite scroll support)
+  - `get(id)` - Fetch a specific session by ID
+  - `delete(id)` - Delete a session (with local state update)
+  - `refresh()` - Reload first page
+  - `select(session)` - Select session for detail view
+  - Derived stores: `sessions`, `selectedSession`, `sessionStats`, `sessionsLoading`, `sessionsError`, `sessionsHasMore`
+- Updated `src/lib/stores/automations.ts` with CRUD methods:
+  - `create(request: CreateAutomationRequest)` - Create new automation
+  - `update(request: UpdateAutomationRequest)` - Update existing automation
+  - `delete(name: string)` - Delete automation by name
+- Updated `src/lib/stores/index.ts` to export sessions store
+
+**Files Modified**:
+- `apps/velor/src/lib/stores/sessions.ts` (NEW)
+- `apps/velor/src/lib/stores/automations.ts`
+- `apps/velor/src/lib/stores/index.ts`
+
+**Impact**: Provides reactive state management for sessions with pagination, enabling the UI to display historical execution data efficiently. Completes the frontend data layer for automations with full CRUD support.
+
+---
+
+## Remaining Phases
 
 ### Phase 6: UI Components (NOT STARTED)
 - Connect AutomationEditor to create/update stores
