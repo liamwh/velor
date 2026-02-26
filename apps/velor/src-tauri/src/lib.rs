@@ -20,10 +20,10 @@ use tray::build_tray;
 
 // Import all commands for use in invoke_handler
 use commands::{
-    cancel_execution, check_binary_available, discover_git_root, get_automation,
+    cancel_execution, check_binary_available, create_automation, discover_git_root, get_automation,
     get_automation_runs, get_config, get_execution_history, get_execution_status, get_home_config,
     get_repo_config, list_automations, run_automation_now, save_config, start_daemon,
-    start_execution, stop_daemon, test_notification, toggle_automation,
+    start_execution, stop_daemon, test_notification, toggle_automation, update_automation,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -92,6 +92,8 @@ pub fn run() {
             // Automation commands
             list_automations,
             get_automation,
+            create_automation,
+            update_automation,
             toggle_automation,
             run_automation_now,
             get_automation_runs,
