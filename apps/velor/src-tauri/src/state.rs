@@ -21,6 +21,7 @@ use velor_automations::AutomationStore;
 use velor_core::{ExecutionConfig, ExecutionId, ExecutionRecord, FileConfig, PromptDef};
 
 use crate::daemon::BackgroundDaemon;
+use crate::session_store::SessionStore;
 
 /// Active execution with its cancel token.
 #[derive(Debug, Clone)]
@@ -76,6 +77,8 @@ pub struct AppState {
     execution_history: Arc<RwLock<Vec<ExecutionRecord>>>,
     /// Automation store for scheduled tasks.
     automation_store: Arc<RwLock<Option<AutomationStore>>>,
+    /// Session store for execution history persistence.
+    session_store: Arc<RwLock<Option<SessionStore>>>,
     /// Background daemon for scheduled automations.
     daemon: Arc<BackgroundDaemon>,
     /// Daemon cancel token for graceful shutdown.
@@ -102,6 +105,7 @@ impl AppState {
             active_executions: Arc::new(RwLock::new(HashMap::new())),
             execution_history: Arc::new(RwLock::new(Vec::new())),
             automation_store: Arc::new(RwLock::new(None)),
+            session_store: Arc::new(RwLock::new(None)),
             daemon: Arc::new(BackgroundDaemon::new()),
             daemon_cancel_token: Arc::new(RwLock::new(None)),
             daemon_running: Arc::new(RwLock::new(false)),
@@ -294,6 +298,51 @@ impl AppState {
         self.automation_store.read().await.clone()
     }
 
+    /// Initializes the session store with the given database path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn init_session_store(&self, db_path: PathBuf) -> Result<()> {
+        debug!(?db_path, "Initializing session store");
+
+        let store = SessionStore::open(&db_path).await?;
+        *self.session_store.write().await = Some(store);
+
+        debug!("Session store initialized");
+        Ok(())
+    }
+
+    /// Returns the session store if initialized.
+    pub async fn session_store(&self) -> Option<SessionStore> {
+        self.session_store.read().await.clone()
+    }
+
+    /// Persists an execution record to the session store.
+    ///
+    /// This method should be called when an execution state changes to ensure
+    /// the record is persisted to SQLite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session store is not initialized or the insert fails.
+    #[instrument(skip(self, record), level = "debug")]
+    pub async fn persist_session(&self, record: &ExecutionRecord) -> Result<()> {
+        let store = self.session_store.read().await;
+
+        if let Some(store) = store.as_ref() {
+            // Check if session exists
+            if store.get_session(record.id.as_str()).await?.is_some() {
+                store.update_session(record).await?;
+            } else {
+                store.insert_session(record).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Sets the daemon running state.
     #[instrument(skip(self), level = "debug")]
     pub async fn set_daemon_running(&self, running: bool) {
@@ -396,6 +445,7 @@ mod tests {
         assert!(state.active_executions.try_read().is_ok());
         assert!(state.execution_history.try_read().is_ok());
         assert!(state.automation_store.try_read().is_ok());
+        assert!(state.session_store.try_read().is_ok());
         assert!(state.daemon_running.try_read().is_ok());
 
         // Verify defaults
@@ -407,6 +457,7 @@ mod tests {
             assert!(state.active_executions().await.is_empty());
             assert!(state.execution_history().await.is_empty());
             assert!(state.automation_store().await.is_none());
+            assert!(state.session_store().await.is_none());
             assert!(!state.is_daemon_running().await);
         });
     }
@@ -723,6 +774,41 @@ only_home = "value"
 
         // Verify database was created
         assert!(db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_init_session_store() {
+        let state = AppState::new();
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("sessions.db");
+
+        state.init_session_store(db_path.clone()).await.unwrap();
+
+        let store = state.session_store().await;
+        assert!(store.is_some());
+
+        // Verify database was created
+        assert!(db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_persist_session() {
+        let state = AppState::new();
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let db_path = temp_dir.path().join("sessions.db");
+
+        state.init_session_store(db_path.clone()).await.unwrap();
+
+        let config = ExecutionConfig::new("test-prompt".to_string());
+        let record = ExecutionRecord::new(config);
+
+        // Persist should succeed
+        state.persist_session(&record).await.unwrap();
+
+        // Verify it was persisted
+        let store = state.session_store().await.unwrap();
+        let retrieved = store.get_session(record.id.as_str()).await.unwrap();
+        assert!(retrieved.is_some());
     }
 }
 
