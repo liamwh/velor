@@ -3,7 +3,13 @@
  */
 
 import { writable, derived } from "svelte/store";
-import type { Automation, AutomationRun, ToggleAutomationRequest } from "$lib/types";
+import type {
+	Automation,
+	AutomationRun,
+	ToggleAutomationRequest,
+	CreateAutomationRequest,
+	UpdateAutomationRequest,
+} from "$lib/types";
 import * as tauri from "$lib/services/tauri";
 
 /**
@@ -204,6 +210,69 @@ function createAutomationsStore() {
 		update((state) => ({ ...state, selectedAutomation: null }));
 	}
 
+	/**
+	 * Create a new automation
+	 */
+	async function create(request: CreateAutomationRequest): Promise<void> {
+		update((state) => ({ ...state, loading: true, error: null }));
+		try {
+			await tauri.createAutomation(request);
+			// Reload automations to get the new one
+			await load();
+		} catch (e) {
+			update((state) => ({
+				...state,
+				loading: false,
+				error: e instanceof Error ? e.message : String(e),
+			}));
+			throw e;
+		}
+	}
+
+	/**
+	 * Update an existing automation
+	 */
+	async function updateAutomation(request: UpdateAutomationRequest): Promise<void> {
+		update((state) => ({ ...state, loading: true, error: null }));
+		try {
+			await tauri.updateAutomation(request);
+			// Reload automations to get the updated one
+			await load();
+		} catch (e) {
+			update((state) => ({
+				...state,
+				loading: false,
+				error: e instanceof Error ? e.message : String(e),
+			}));
+			throw e;
+		}
+	}
+
+	/**
+	 * Delete an automation by name
+	 */
+	async function deleteAutomation(name: string): Promise<void> {
+		update((state) => ({ ...state, loading: true, error: null }));
+		try {
+			await tauri.deleteAutomation(name);
+			// Remove from local state
+			update((state) => ({
+				...state,
+				automations: state.automations.filter((a) => a.name !== name),
+				selectedAutomation:
+					state.selectedAutomation?.name === name ? null : state.selectedAutomation,
+				loading: false,
+			}));
+		} catch (e) {
+			update((state) => ({
+				...state,
+				loading: false,
+				error: e instanceof Error ? e.message : String(e),
+			}));
+			throw e;
+		}
+	}
+
 	return {
 		subscribe,
 		getAutomations,
@@ -216,6 +285,9 @@ function createAutomationsStore() {
 		stopDaemon,
 		setDaemonRunning,
 		clearSelected,
+		create,
+		update: updateAutomation,
+		delete: deleteAutomation,
 	};
 }
 
