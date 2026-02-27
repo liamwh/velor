@@ -22,10 +22,11 @@ use tray::build_tray;
 
 // Import all commands for use in invoke_handler
 use commands::{
-    cancel_execution, check_binary_available, create_automation, delete_automation, delete_session,
-    discover_git_root, get_automation, get_automation_runs, get_config, get_execution_history,
-    get_execution_status, get_home_config, get_repo_config, get_session, get_session_stats,
-    hide_project, list_automations, list_projects, list_sessions, rename_project, rename_session,
+    build_plan_prompt, cancel_execution, check_binary_available, create_automation,
+    delete_automation, delete_session, discover_git_root, discover_specs, generate_plan,
+    get_automation, get_automation_runs, get_config, get_execution_history, get_execution_status,
+    get_home_config, get_repo_config, get_session, get_session_stats, hide_project,
+    list_automations, list_projects, list_sessions, rename_project, rename_session,
     reorder_projects, run_automation_now, save_config, show_project, start_daemon, start_execution,
     stop_daemon, test_notification, toggle_automation, toggle_session_pin, update_automation,
 };
@@ -122,6 +123,10 @@ pub fn run() {
             // System commands
             discover_git_root,
             check_binary_available,
+            // Plan commands
+            discover_specs,
+            build_plan_prompt,
+            generate_plan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

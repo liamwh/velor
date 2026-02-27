@@ -35,6 +35,9 @@ sqlx = { workspace = true }
 # Binary discovery
 which = "7"
 
+# HTTP client for plan generation
+reqwest = { workspace = true }
+
 [dev-dependencies]
 # Workspace dev dependencies
 tempfile = { workspace = true }

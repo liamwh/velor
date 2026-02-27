@@ -19,6 +19,8 @@ import type {
 	CreateAutomationRequest,
 	UpdateAutomationRequest,
 	Project,
+	SpecFileInfo,
+	GeneratePlanRequest,
 } from "$lib/types";
 
 /**
@@ -177,4 +179,20 @@ export async function renameProject(path: string, displayName: string): Promise<
 
 export async function reorderProjects(paths: string[]): Promise<void> {
 	await invoke("reorder_projects", { paths });
+}
+
+/**
+ * Plan Commands
+ */
+
+export async function discoverSpecs(specsDir?: string): Promise<SpecFileInfo[]> {
+	return await invoke<SpecFileInfo[]>("discover_specs", { specsDir });
+}
+
+export async function buildPlanPrompt(specs: SpecFileInfo[]): Promise<string> {
+	return await invoke<string>("build_plan_prompt", { specs });
+}
+
+export async function generatePlan(request: GeneratePlanRequest): Promise<string> {
+	return await invoke<string>("generate_plan", { request });
 }

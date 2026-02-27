@@ -140,6 +140,36 @@ pub struct UpdateAutomationRequest {
     pub notify_on_failure: Option<bool>,
 }
 
+// ============================================================================
+// Plan Types
+// ============================================================================
+
+/// Information about a discovered spec file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpecFileInfo {
+    /// The file name (without extension).
+    pub name: String,
+    /// The full file path.
+    pub path: String,
+    /// The file content.
+    pub content: String,
+}
+
+/// Request to generate a plan.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GeneratePlanRequest {
+    /// Path to the specs directory.
+    pub specs_dir: Option<String>,
+    /// OpenAI API key (if not using environment variable).
+    pub api_key: Option<String>,
+    /// OpenAI model to use.
+    pub model: Option<String>,
+    /// Optional custom OpenAI base URL.
+    pub base_url: Option<String>,
+    /// Whether to use dry run (no API calls).
+    pub dry_run: Option<bool>,
+}
+
 /// Helper to extract timestamp from an event.
 fn event_timestamp(event: &ExecutionEvent) -> chrono::DateTime<chrono::Utc> {
     match event {
@@ -1229,6 +1259,234 @@ pub async fn delete_automation(state: State<'_, Arc<AppState>>, name: String) ->
     Ok(())
 }
 
+// ============================================================================
+// Plan Commands
+// ============================================================================
+
+/// Discovers and returns all spec files from the specs directory.
+///
+/// # Arguments
+///
+/// * `specs_dir` - Optional path to specs directory. If not provided, uses
+///   `{git_root}/specs/`.
+///
+/// Returns a list of spec files with their names, paths, and contents.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn discover_specs(
+    state: State<'_, Arc<AppState>>,
+    specs_dir: Option<String>,
+) -> CommandResult<Vec<SpecFileInfo>> {
+    let git_root = state.git_root().await.ok_or("No git root set")?;
+
+    let specs_path = match specs_dir {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => git_root.join("specs"),
+    };
+
+    if !specs_path.exists() {
+        return Err(format!(
+            "Specs directory not found: {}",
+            specs_path.display()
+        ));
+    }
+
+    let mut specs = Vec::new();
+
+    let mut dir_reader = tokio::fs::read_dir(&specs_path)
+        .await
+        .map_err(|e| format!("Failed to read specs directory: {}", e))?;
+
+    while let Some(entry) = dir_reader
+        .next_entry()
+        .await
+        .map_err(|e| format!("Failed to read directory entry: {}", e))?
+    {
+        let path = entry.path();
+
+        // Only process .md files
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Invalid spec file name: {}", path.display()))?
+            .to_string();
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("Failed to read spec file {}: {}", path.display(), e))?;
+
+        specs.push(SpecFileInfo {
+            name,
+            path: path.to_string_lossy().to_string(),
+            content,
+        });
+    }
+
+    // Sort by name for deterministic ordering
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    info!(count = specs.len(), "Specs discovered");
+    Ok(specs)
+}
+
+/// Builds a plan prompt from the given spec files.
+///
+/// This is useful for dry-run mode to see what prompt would be sent
+/// without actually calling the API.
+///
+/// # Arguments
+///
+/// * `specs` - List of spec files to include in the prompt.
+#[tauri::command]
+#[instrument(level = "debug")]
+pub async fn build_plan_prompt(specs: Vec<SpecFileInfo>) -> CommandResult<String> {
+    let mut prompt = String::from(
+        "# Plan Generation Request\n\n\
+        You are an expert software architect. Please review the following specification(s) \
+        and generate a detailed implementation plan.\n\n\
+        The plan should:\n\
+        1. Break down the work into clear, actionable tasks\n\
+        2. Identify dependencies between tasks\n\
+        3. Suggest an optimal execution order\n\
+        4. Note any potential risks or technical challenges\n\
+        5. Reference the specific spec files being addressed\n\n",
+    );
+
+    if specs.is_empty() {
+        prompt
+            .push_str("WARNING: No spec files were found. Please verify the specs directory.\n\n");
+    } else {
+        prompt.push_str("## Specifications\n\n");
+        for spec in &specs {
+            prompt.push_str(&format!("### {} ({})\n\n", spec.name, spec.path));
+            prompt.push_str(&spec.content);
+            prompt.push_str("\n\n");
+        }
+    }
+
+    prompt.push_str(
+        "## Output Format\n\n\
+        Please output the implementation plan in markdown format with:\n\
+        - Clear task headings with task numbers\n\
+        - Dependencies between tasks clearly marked\n\
+        - Estimated complexity for each task (Low/Medium/High)\n\
+        - Risk assessment where applicable\n\n\
+        Begin your response with the plan directly.",
+    );
+
+    Ok(prompt)
+}
+
+/// Generates an implementation plan using OpenAI.
+///
+/// # Arguments
+///
+/// * `request` - The plan generation request.
+///
+/// Returns the generated plan content.
+#[tauri::command]
+#[instrument(skip(state, request), level = "debug")]
+pub async fn generate_plan(
+    state: State<'_, Arc<AppState>>,
+    request: GeneratePlanRequest,
+) -> CommandResult<String> {
+    // Get API key from request or environment
+    let api_key = match request.api_key {
+        Some(ref key) if !key.is_empty() => key.clone(),
+        _ => std::env::var("OPENAI_API_KEY")
+            .map_err(|_| "OpenAI API key not found. Set OPENAI_API_KEY environment variable or provide api_key in request.".to_string())?,
+    };
+
+    // Validate API key
+    if api_key.is_empty() {
+        return Err(
+            "OpenAI API key is empty. Set OPENAI_API_KEY environment variable.".to_string(),
+        );
+    }
+
+    // Discover specs
+    let specs = discover_specs(state, request.specs_dir.clone()).await?;
+
+    if specs.is_empty() {
+        return Err(
+            "No spec files found in specs directory. Please create .md spec files first."
+                .to_string(),
+        );
+    }
+
+    // Build prompt
+    let prompt = build_plan_prompt(specs).await?;
+
+    tracing::debug!(prompt_len = prompt.len(), "Prepared plan generation prompt");
+
+    // Handle dry run
+    if request.dry_run.unwrap_or(false) {
+        return Ok(format!(
+            "# Plan Generation Prompt (Dry Run)\n\n{}\n\n✅ Dry run complete. No API call was made.",
+            prompt
+        ));
+    }
+
+    // Build HTTP client
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    // Determine model and base URL
+    let model = request.model.unwrap_or_else(|| "gpt-4o".to_string());
+    let base_url = request
+        .base_url
+        .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
+
+    // Build API request
+    let response = client
+        .post(&base_url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to OpenAI API: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unable to read error body".to_string());
+        return Err(format!(
+            "OpenAI API request failed with status {}: {}",
+            status, error_body
+        ));
+    }
+
+    let response_json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenAI API response as JSON: {}", e))?;
+
+    let content = response_json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("OpenAI API response missing content field")?
+        .to_string();
+
+    info!("Plan generated successfully");
+    Ok(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,5 +1699,161 @@ mod tests {
         assert_eq!(stats.failed, 0, "Default failed should be 0");
         assert_eq!(stats.cancelled, 0, "Default cancelled should be 0");
         assert_eq!(stats.active, 0, "Default active should be 0");
+    }
+
+    // ========================================================================
+    // Plan Command Tests
+    // ========================================================================
+
+    #[test]
+    fn test_spec_file_info_serialization() {
+        let spec = SpecFileInfo {
+            name: "auth".to_string(),
+            path: "/specs/auth.md".to_string(),
+            content: "# Auth Spec\n\nImplement authentication.".to_string(),
+        };
+
+        let json = serde_json::to_string(&spec);
+        assert!(json.is_ok(), "SpecFileInfo should serialize to JSON");
+
+        let deserialized: SpecFileInfo = serde_json::from_str(&json.unwrap())
+            .expect("SpecFileInfo should deserialize from JSON");
+        assert_eq!(deserialized.name, "auth");
+        assert_eq!(deserialized.path, "/specs/auth.md");
+        assert!(deserialized.content.contains("authentication"));
+    }
+
+    #[test]
+    fn test_spec_file_info_deserialization() {
+        let json = r##"{
+            "name": "database",
+            "path": "/specs/database.md",
+            "content": "# Database Spec"
+        }"##;
+
+        let spec: SpecFileInfo =
+            serde_json::from_str(json).expect("SpecFileInfo should deserialize from JSON");
+
+        assert_eq!(spec.name, "database");
+        assert_eq!(spec.path, "/specs/database.md");
+        assert_eq!(spec.content, "# Database Spec");
+    }
+
+    #[test]
+    fn test_generate_plan_request_deserialization() {
+        let json = r#"{
+            "specs_dir": "/custom/specs",
+            "model": "gpt-4",
+            "dry_run": true
+        }"#;
+
+        let request: GeneratePlanRequest =
+            serde_json::from_str(json).expect("GeneratePlanRequest should deserialize from JSON");
+
+        assert_eq!(request.specs_dir, Some("/custom/specs".to_string()));
+        assert_eq!(request.model, Some("gpt-4".to_string()));
+        assert_eq!(request.dry_run, Some(true));
+        assert_eq!(request.api_key, None);
+        assert_eq!(request.base_url, None);
+    }
+
+    #[test]
+    fn test_generate_plan_request_defaults() {
+        let json = r#"{}"#;
+
+        let request: GeneratePlanRequest = serde_json::from_str(json)
+            .expect("GeneratePlanRequest should deserialize with defaults");
+
+        assert_eq!(request.specs_dir, None);
+        assert_eq!(request.model, None);
+        assert_eq!(request.dry_run, None);
+        assert_eq!(request.api_key, None);
+        assert_eq!(request.base_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_build_plan_prompt_empty_specs() {
+        let specs = vec![];
+        let prompt = build_plan_prompt(specs).await.expect("should build prompt");
+
+        assert!(
+            prompt.contains("WARNING: No spec files were found"),
+            "Prompt should warn about empty specs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_plan_prompt_with_specs() {
+        let specs = vec![
+            SpecFileInfo {
+                name: "auth".to_string(),
+                path: "/specs/auth.md".to_string(),
+                content: "# Auth\n\nImplement OAuth2.".to_string(),
+            },
+            SpecFileInfo {
+                name: "database".to_string(),
+                path: "/specs/database.md".to_string(),
+                content: "# Database\n\nUse PostgreSQL.".to_string(),
+            },
+        ];
+
+        let prompt = build_plan_prompt(specs).await.expect("should build prompt");
+
+        assert!(
+            prompt.contains("## Specifications"),
+            "Prompt should contain Specifications section"
+        );
+        assert!(
+            prompt.contains("auth.md"),
+            "Prompt should mention auth spec file"
+        );
+        assert!(
+            prompt.contains("database.md"),
+            "Prompt should mention database spec file"
+        );
+        assert!(
+            prompt.contains("Implement OAuth2"),
+            "Prompt should contain auth content"
+        );
+        assert!(
+            prompt.contains("Use PostgreSQL"),
+            "Prompt should contain database content"
+        );
+        assert!(
+            prompt.contains("## Output Format"),
+            "Prompt should contain Output Format section"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_plan_prompt_includes_instructions() {
+        let specs = vec![SpecFileInfo {
+            name: "test".to_string(),
+            path: "/specs/test.md".to_string(),
+            content: "# Test".to_string(),
+        }];
+
+        let prompt = build_plan_prompt(specs).await.expect("should build prompt");
+
+        assert!(
+            prompt.contains("Plan Generation Request"),
+            "Prompt should contain title"
+        );
+        assert!(
+            prompt.contains("expert software architect"),
+            "Prompt should set the role"
+        );
+        assert!(
+            prompt.contains("actionable tasks"),
+            "Prompt should ask for actionable tasks"
+        );
+        assert!(
+            prompt.contains("Dependencies between tasks"),
+            "Prompt should ask for dependencies"
+        );
+        assert!(
+            prompt.contains("Risk assessment"),
+            "Prompt should ask for risk assessment"
+        );
     }
 }
