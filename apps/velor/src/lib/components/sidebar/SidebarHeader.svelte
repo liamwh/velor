@@ -2,7 +2,7 @@
 	import * as Sidebar from "$lib/components/ui/sidebar/index.js";
 	import { Button } from "$lib/components/ui/button/index.js";
 	import { goto } from "$app/navigation";
-	import { Plus, Calendar } from "lucide-svelte";
+	import { Plus, Calendar, FileText } from "lucide-svelte";
 	import NewSessionDialog from "$lib/components/sessions/NewSessionDialog.svelte";
 
 	let showNewSessionDialog = $state(false);
@@ -27,6 +27,13 @@
 	async function handleAutomations(): Promise<void> {
 		await goto("/automations");
 	}
+
+	/**
+	 * Handle navigation to plans
+	 */
+	async function handlePlans(): Promise<void> {
+		await goto("/plans");
+	}
 </script>
 
 <Sidebar.Header class="border-b border-border p-4">
@@ -46,6 +53,14 @@
 		>
 			<Calendar size={16} />
 			<span>Automations</span>
+		</Button>
+		<Button
+			variant="outline"
+			class="w-full justify-start gap-2"
+			onclick={handlePlans}
+		>
+			<FileText size={16} />
+			<span>Plans</span>
 		</Button>
 	</div>
 </Sidebar.Header>
