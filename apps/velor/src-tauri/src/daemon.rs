@@ -39,7 +39,7 @@ const DEFAULT_MAX_OUTPUT_BYTES: usize = 100_000;
 pub struct BackgroundDaemon {
     /// Git root directory for automation definitions.
     git_root: Arc<RwLock<Option<PathBuf>>>,
-    /// Automation store for run history.
+    /// Automation store for the runner (points to unified velor.db).
     automation_store: Arc<RwLock<Option<velor_automations::AutomationStore>>>,
     /// Merged configuration (for automation directory, etc.).
     config: Arc<RwLock<Option<velor_core::FileConfig>>>,

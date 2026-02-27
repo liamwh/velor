@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod session_store;
 pub mod state;
 pub mod tray;
+pub mod unified_store;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -60,17 +61,12 @@ pub fn run() {
                     tracing::warn!("Failed to load initial configs: {}", e);
                 }
 
-                // Set git root and initialize automation store if available
+                // Set git root and initialize unified store if available
                 if let Some(root) = git_root {
                     app_state.set_git_root(root.clone()).await;
-                    let db_path = root.join(".velor").join("automations.db");
-                    if let Err(e) = app_state.init_automation_store(db_path).await {
-                        tracing::warn!("Failed to initialize automation store: {}", e);
-                    }
-                    // Initialize session store in the same database
-                    let session_db_path = root.join(".velor").join("sessions.db");
-                    if let Err(e) = app_state.init_session_store(session_db_path).await {
-                        tracing::warn!("Failed to initialize session store: {}", e);
+                    let velor_dir = root.join(".velor");
+                    if let Err(e) = app_state.init_store(velor_dir).await {
+                        tracing::warn!("Failed to initialize store: {}", e);
                     }
                 }
             });

@@ -19,8 +19,8 @@ use velor_core::{
     build_notifiers,
 };
 
-use crate::session_store::SessionStats;
 use crate::state::AppState;
+use crate::unified_store::SessionStats;
 
 /// Result type for commands that can fail.
 pub type CommandResult<T> = Result<T, String>;
@@ -483,9 +483,9 @@ pub async fn get_automation(
     let exists = file_path.exists();
 
     // Get recent runs from store
-    let store = state.automation_store().await;
+    let store = state.store().await;
     let (recent_runs, last_run_status) = if let Some(store) = store {
-        match store.get_runs(Some(&name), 100).await {
+        match store.get_automation_runs(Some(&name), 100).await {
             Ok(runs) => {
                 let recent = runs
                     .iter()
@@ -610,15 +610,12 @@ pub async fn get_automation_runs(
     state: State<'_, Arc<AppState>>,
     name: String,
     limit: Option<u32>,
-) -> CommandResult<Vec<velor_automations::AutomationRun>> {
-    let store = state
-        .automation_store()
-        .await
-        .ok_or("Automation store not initialized")?;
+) -> CommandResult<Vec<crate::unified_store::AutomationRun>> {
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     let limit = limit.unwrap_or(50);
     let runs = store
-        .get_runs(Some(&name), limit)
+        .get_automation_runs(Some(&name), limit)
         .await
         .map_err(|e| format!("Failed to get automation runs: {}", e))?;
 
@@ -788,7 +785,7 @@ pub async fn update_automation(
 /// Returns an error if:
 /// - The daemon is already running
 /// - Git root is not configured
-/// - Automation store is not initialized
+/// - Store is not initialized
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn start_daemon(state: State<'_, Arc<AppState>>) -> CommandResult<()> {
@@ -803,10 +800,12 @@ pub async fn start_daemon(state: State<'_, Arc<AppState>>) -> CommandResult<()> 
         .await
         .ok_or("Git root not configured. Cannot start daemon.")?;
 
-    let automation_store = state
-        .automation_store()
+    // Create AutomationStore from the unified database for the daemon runner
+    let velor_dir = git_root.join(".velor");
+    let db_path = velor_dir.join("velor.db");
+    let automation_store = velor_automations::AutomationStore::open(&db_path)
         .await
-        .ok_or("Automation store not initialized. Cannot start daemon.")?;
+        .map_err(|e| format!("Failed to open automation store: {}", e))?;
 
     let config = state.merged_config().await;
 
@@ -969,10 +968,7 @@ pub async fn list_sessions(
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> CommandResult<Vec<ExecutionRecord>> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     let limit = limit.unwrap_or(50);
     let offset = offset.unwrap_or(0);
@@ -999,10 +995,7 @@ pub async fn get_session(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<Option<ExecutionRecord>> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     let session = store
         .get_session(&id)
@@ -1023,10 +1016,7 @@ pub async fn get_session(
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn delete_session(state: State<'_, Arc<AppState>>, id: String) -> CommandResult<()> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     store
         .delete_session(&id)
@@ -1043,10 +1033,7 @@ pub async fn delete_session(state: State<'_, Arc<AppState>>, id: String) -> Comm
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn get_session_stats(state: State<'_, Arc<AppState>>) -> CommandResult<SessionStats> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     let stats = store
         .get_session_stats()
@@ -1069,10 +1056,7 @@ pub async fn rename_session(
     id: String,
     name: Option<String>,
 ) -> CommandResult<()> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     store
         .rename_session(&id, name)
@@ -1096,10 +1080,7 @@ pub async fn toggle_session_pin(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<bool> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     let pinned = store
         .toggle_session_pin(&id)
@@ -1119,11 +1100,8 @@ pub async fn toggle_session_pin(
 #[instrument(skip(state), level = "debug")]
 pub async fn list_projects(
     state: State<'_, Arc<AppState>>,
-) -> CommandResult<Vec<crate::session_store::Project>> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+) -> CommandResult<Vec<crate::unified_store::Project>> {
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     let projects = store
         .list_projects()
@@ -1141,10 +1119,7 @@ pub async fn list_projects(
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn hide_project(state: State<'_, Arc<AppState>>, path: String) -> CommandResult<()> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     store
         .hide_project(&path)
@@ -1163,10 +1138,7 @@ pub async fn hide_project(state: State<'_, Arc<AppState>>, path: String) -> Comm
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn show_project(state: State<'_, Arc<AppState>>, path: String) -> CommandResult<()> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     store
         .show_project(&path)
@@ -1190,10 +1162,7 @@ pub async fn rename_project(
     path: String,
     display_name: String,
 ) -> CommandResult<()> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     store
         .rename_project(&path, display_name.clone())
@@ -1215,10 +1184,7 @@ pub async fn reorder_projects(
     state: State<'_, Arc<AppState>>,
     paths: Vec<String>,
 ) -> CommandResult<()> {
-    let store = state
-        .session_store()
-        .await
-        .ok_or("Session store not initialized")?;
+    let store = state.store().await.ok_or("Store not initialized")?;
 
     store
         .reorder_projects(paths)
