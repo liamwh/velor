@@ -27,8 +27,9 @@
 	}: Props = $props();
 
 	/** Track whether this group is collapsed - starts with the inverse of the collapsed prop */
-	const initialOpen = !collapsed;
-	let isOpen = $state(initialOpen);
+	// Note: collapsed prop only affects initial state, not reactive updates
+	// svelte-ignore state_referenced_locally
+	let isOpen = $state(!collapsed);
 
 	/**
 	 * Get the project display name from path

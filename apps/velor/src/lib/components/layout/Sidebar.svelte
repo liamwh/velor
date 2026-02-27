@@ -21,17 +21,17 @@
 	let loading = $state(true);
 
 	/**
-	 * Group sessions by their project path
+	 * Update the grouped sessions map in place
 	 */
-	function groupSessionsByProject(): SvelteMap<string, ExecutionRecord[]> {
-		const grouped = new SvelteMap<string, ExecutionRecord[]>();
+	function updateGroupedSessions(): void {
+		// Clear existing entries
+		groupedSessions.clear();
+
+		// Add fresh data
 		const sessionsByProject = sessionsStore.groupByProject();
-
 		for (const [projectPath, sessionList] of sessionsByProject) {
-			grouped.set(projectPath, sessionList);
+			groupedSessions.set(projectPath, sessionList);
 		}
-
-		return grouped;
 	}
 
 	/**
@@ -42,7 +42,7 @@
 			try {
 				loading = true;
 				await Promise.all([sessionsStore.load(), projectsStore.load()]);
-				groupedSessions = groupSessionsByProject();
+				updateGroupedSessions();
 			} catch (e) {
 				console.error("Failed to load sidebar data:", e);
 			} finally {
@@ -65,7 +65,7 @@
 
 		// Subscribe to sessions changes
 		const unsubscribe = sessionsStore.subscribe((state) => {
-			groupedSessions = groupSessionsByProject();
+			updateGroupedSessions();
 			if (state.selectedSession) {
 				selectedSessionId = state.selectedSession.id;
 			}

@@ -1,116 +1,112 @@
 <script lang="ts">
-	import { config, gitRoot } from '$lib/stores';
-	import { Activity, Zap, FolderOpen } from 'lucide-svelte';
+	import { onMount } from 'svelte';
+	import { selectedSession, sessionsStore, sessions } from '$lib/stores';
+	import { MessageSquare, Sparkles, ArrowRight } from 'lucide-svelte';
+	import SessionDetail from '$lib/components/sessions/SessionDetail.svelte';
+	import { goto } from '$app/navigation';
+
+	/** Load sessions on mount */
+	onMount(() => {
+		sessionsStore.load(50);
+	});
+
+	/** Navigate to automations page */
+	function goToAutomations() {
+		goto('/automations');
+	}
+
+	/** Navigate to settings page */
+	function goToSettings() {
+		goto('/settings');
+	}
+
+	/** Handle close of session detail */
+	function handleCloseSessionDetail() {
+		sessionsStore.clearSelected();
+	}
+
+	/** Handle retry from session detail */
+	function handleRetryFromSession(_promptName: string) {
+		// Navigate to executions page with the prompt pre-selected
+		goto('/executions');
+	}
 </script>
 
-<div class="welcome">
-	<div class="hero">
-		<h1>Welcome to Velor</h1>
-		<p class="subtitle">
-			Autonomous AI agents powered by Claude, now with a beautiful GUI.
-		</p>
-	</div>
+<div class="h-full flex flex-col">
+	{#if $selectedSession}
+		<!-- Show selected session details -->
+		<SessionDetail
+			session={$selectedSession}
+			onClose={handleCloseSessionDetail}
+			onRetry={handleRetryFromSession}
+		/>
+	{:else}
+		<!-- Welcome/Empty state when no session is selected -->
+		<div class="flex-1 flex items-center justify-center p-8">
+			<div class="max-w-2xl w-full text-center space-y-8">
+				<!-- Icon -->
+				<div class="flex justify-center">
+					<div class="relative">
+						<div class="absolute inset-0 bg-primary/20 rounded-full blur-3xl"></div>
+						<div class="relative p-6 rounded-2xl bg-primary/10 border border-primary/20">
+							<MessageSquare size={48} class="text-primary" />
+						</div>
+					</div>
+				</div>
 
-	<div class="cards">
-		<div class="card">
-			<div class="card-icon">
-				<Activity size={24} />
-			</div>
-			<h3>Run Agents</h3>
-			<p>Execute automated AI agents with your configured prompts and variables.</p>
-		</div>
+				<!-- Heading -->
+				<div class="space-y-3">
+					<h1 class="text-3xl font-bold text-foreground">Welcome to Velor</h1>
+					<p class="text-lg text-muted-foreground">
+						Select a session from the sidebar to view details, or create a new automation to get started.
+					</p>
+				</div>
 
-		<div class="card">
-			<div class="card-icon">
-				<Zap size={24} />
-			</div>
-			<h3>Schedule Automations</h3>
-			<p>Set up cron-based automations that run your agents on a schedule.</p>
-		</div>
+				<!-- Stats (if available) -->
+				{#if $sessions && $sessions.length > 0}
+					<div class="grid grid-cols-3 gap-4 py-6">
+						<div class="p-4 rounded-lg bg-card border border-border">
+							<div class="text-2xl font-bold text-foreground">{$sessions.length}</div>
+							<div class="text-sm text-muted-foreground">Total Sessions</div>
+						</div>
+						<div class="p-4 rounded-lg bg-card border border-border">
+							<div class="text-2xl font-bold text-[var(--color-success)]">
+								{$sessions.filter(s => s.state === 'completed').length}
+							</div>
+							<div class="text-sm text-muted-foreground">Completed</div>
+						</div>
+						<div class="p-4 rounded-lg bg-card border border-border">
+							<div class="text-2xl font-bold text-[var(--color-accent-primary)]">
+								{$sessions.filter(s => s.state === 'running' || s.state === 'rendering').length}
+							</div>
+							<div class="text-sm text-muted-foreground">Active</div>
+						</div>
+					</div>
+				{/if}
 
-		<div class="card">
-			<div class="card-icon">
-				<FolderOpen size={24} />
-			</div>
-			<h3>Manage Configuration</h3>
-			<p>Edit global and project-level settings through the interface.</p>
-		</div>
-	</div>
+				<!-- Action Buttons -->
+				<div class="flex items-center justify-center gap-4">
+					<button
+						onclick={goToAutomations}
+						class="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-primary text-primary-foreground font-medium hover:bg-primary/90 transition-all"
+					>
+						<Sparkles size={18} />
+						<span>Create Automation</span>
+					</button>
+					<button
+						onclick={goToSettings}
+						class="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-card border border-border text-foreground font-medium hover:bg-muted transition-all"
+					>
+						<span>Settings</span>
+						<ArrowRight size={18} />
+					</button>
+				</div>
 
-	{#if $config}
-		<div class="config-status">
-			<h2>Configuration Status</h2>
-			<div class="status-item">
-				<span class="label">Git Root:</span>
-				<span class="value">{$gitRoot || 'Not detected'}</span>
-			</div>
-			<div class="status-item">
-				<span class="label">Prompts:</span>
-				<span class="value">{$config.prompts ? Object.keys($config.prompts).length : 0} configured</span>
-			</div>
-			<div class="status-item">
-				<span class="label">Claude Binary:</span>
-				<span class="value">{$config.binary || 'claude-glm'}</span>
+				<!-- Quick hint -->
+				<div class="pt-6 text-sm text-muted-foreground">
+					<p>Use the sidebar to browse sessions by project, pin important conversations, or manage your automation workflows.</p>
+				</div>
 			</div>
 		</div>
 	{/if}
 </div>
-
-<style>
-	.welcome {
-		@apply max-w-4xl mx-auto;
-	}
-
-	.hero {
-		@apply text-center mb-12;
-	}
-
-	.hero h1 {
-		@apply text-4xl font-bold text-[var(--color-text-primary)] mb-3;
-	}
-
-	.subtitle {
-		@apply text-lg text-[var(--color-text-secondary)];
-	}
-
-	.cards {
-		@apply grid grid-cols-1 md:grid-cols-3 gap-6 mb-12;
-	}
-
-	.card {
-		@apply p-6 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border)] hover:border-[var(--color-accent-primary)] transition-all duration-200;
-	}
-
-	.card-icon {
-		@apply w-12 h-12 rounded-lg bg-[var(--color-accent-light)] flex items-center justify-center text-[var(--color-accent-primary)] mb-4;
-	}
-
-	.card h3 {
-		@apply text-lg font-semibold text-[var(--color-text-primary)] mb-2;
-	}
-
-	.card p {
-		@apply text-sm text-[var(--color-text-secondary)];
-	}
-
-	.config-status {
-		@apply p-6 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border)];
-	}
-
-	.config-status h2 {
-		@apply text-lg font-semibold text-[var(--color-text-primary)] mb-4;
-	}
-
-	.status-item {
-		@apply flex justify-between py-2 border-b border-[var(--color-border)] last:border-0;
-	}
-
-	.status-item .label {
-		@apply text-sm text-[var(--color-text-secondary)];
-	}
-
-	.status-item .value {
-		@apply text-sm text-[var(--color-text-primary)] font-medium;
-	}
-</style>
-
