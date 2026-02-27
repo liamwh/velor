@@ -289,150 +289,364 @@
 
 <style>
 	.prompt-editor {
-		@apply flex flex-col gap-6;
+		display: flex;
+		flex-direction: column;
+		gap: 1.5rem;
 	}
 
 	/* List View */
 	.list-header {
-		@apply flex items-start justify-between;
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
 	}
 
 	.list-header h2 {
-		@apply text-xl font-semibold text-[var(--color-text-primary)];
+		font-size: 1.25rem;
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.list-header p {
-		@apply text-sm text-[var(--color-text-secondary)] mt-1;
+		font-size: 0.875rem;
+		color: var(--color-text-secondary);
+		margin-top: 0.25rem;
 	}
 
 	.create-btn {
-		@apply flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--color-accent-primary)] text-white text-sm font-medium hover:bg-[var(--color-accent-hover)] transition-all duration-200;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-accent-primary);
+		color: white;
+		font-size: 0.875rem;
+		font-weight: 500;
+		transition: all 0.2s ease-in-out;
+	}
+
+	.create-btn:hover {
+		background-color: var(--color-accent-hover);
 	}
 
 	.empty-state {
-		@apply flex flex-col items-center justify-center py-16 text-[var(--color-text-secondary)] gap-4;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		padding-top: 4rem;
+		padding-bottom: 4rem;
+		color: var(--color-text-secondary);
+		gap: 1rem;
 	}
 
 	.empty-state h3 {
-		@apply text-lg font-semibold text-[var(--color-text-primary)];
+		font-size: 1.125rem;
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.prompts-grid {
-		@apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4;
+		display: grid;
+		grid-template-columns: repeat(1, minmax(0, 1fr));
+		gap: 1rem;
+	}
+
+	@media (min-width: 768px) {
+		.prompts-grid {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+
+	@media (min-width: 1024px) {
+		.prompts-grid {
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+		}
 	}
 
 	.prompt-card {
-		@apply flex flex-col p-4 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg hover:border-[var(--color-accent-primary)] transition-all duration-200;
+		display: flex;
+		flex-direction: column;
+		padding: 1rem;
+		background-color: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: 0.5rem;
+		transition: all 0.2s ease-in-out;
+	}
+
+	.prompt-card:hover {
+		border-color: var(--color-accent-primary);
 	}
 
 	.card-header {
-		@apply flex items-center gap-3 mb-3;
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 0.75rem;
 	}
 
 	.prompt-icon {
-		@apply w-10 h-10 rounded-lg bg-[var(--color-accent-light)] flex items-center justify-center text-[var(--color-accent-primary)];
+		width: 2.5rem;
+		height: 2.5rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-accent-light);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--color-accent-primary);
 	}
 
 	.card-header h3 {
-		@apply font-semibold text-[var(--color-text-primary)];
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.card-preview {
-		@apply flex-1 text-sm text-[var(--color-text-secondary)] line-clamp-3 mb-4;
+		flex: 1;
+		font-size: 0.875rem;
+		color: var(--color-text-secondary);
+		display: -webkit-box;
+		-webkit-line-clamp: 3;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+		margin-bottom: 1rem;
 	}
 
 	.card-actions {
-		@apply flex items-center gap-2;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 
 	.action-btn {
-		@apply px-3 py-1.5 rounded text-sm font-medium transition-all duration-200;
+		padding-left: 0.75rem;
+		padding-right: 0.75rem;
+		padding-top: 0.375rem;
+		padding-bottom: 0.375rem;
+		border-radius: 0.25rem;
+		font-size: 0.875rem;
+		font-weight: 500;
+		transition: all 0.2s ease-in-out;
 	}
 
 	.action-btn.edit {
-		@apply text-[var(--color-accent-primary)] hover:bg-[var(--color-accent-light)] flex-1;
+		color: var(--color-accent-primary);
+		flex: 1;
+	}
+
+	.action-btn.edit:hover {
+		background-color: var(--color-accent-light);
 	}
 
 	.action-btn.delete {
-		@apply text-red-400 hover:bg-red-950/30 px-2;
+		color: rgb(248 113 113);
+		padding-left: 0.5rem;
+		padding-right: 0.5rem;
+	}
+
+	.action-btn.delete:hover {
+		background-color: rgb(127 29 29 / 0.3);
 	}
 
 	/* Form View */
 	.form-header {
-		@apply mb-6;
+		margin-bottom: 1.5rem;
 	}
 
 	.back-btn {
-		@apply text-sm text-[var(--color-text-secondary)] hover:text-[var(--color-accent-primary)] mb-2 transition-colors;
+		font-size: 0.875rem;
+		color: var(--color-text-secondary);
+		margin-bottom: 0.5rem;
+		transition: color 0.15s ease-in-out;
+	}
+
+	.back-btn:hover {
+		color: var(--color-accent-primary);
 	}
 
 	.form-header h2 {
-		@apply text-xl font-semibold text-[var(--color-text-primary)];
+		font-size: 1.25rem;
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.error-banner {
-		@apply flex items-center gap-2 px-4 py-3 rounded-lg bg-red-950/50 border border-red-900/50 text-red-300 mb-4;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.75rem;
+		padding-bottom: 0.75rem;
+		border-radius: 0.5rem;
+		background-color: rgb(127 29 29 / 0.5);
+		border: 1px solid rgb(185 28 28 / 0.5);
+		color: rgb(253 186 116);
+		margin-bottom: 1rem;
 	}
 
 	.prompt-form {
-		@apply max-w-2xl;
+		max-width: 42rem;
 	}
 
 	.form-group {
-		@apply mb-5;
+		margin-bottom: 1.25rem;
 	}
 
 	.form-group label {
-		@apply block text-sm font-medium text-[var(--color-text-primary)] mb-2;
+		display: block;
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-primary);
+		margin-bottom: 0.5rem;
 	}
 
 	.required {
-		@apply text-red-400 ml-1;
+		color: rgb(248 113 113);
+		margin-left: 0.25rem;
 	}
 
 	.form-group input[type="text"],
 	.form-group textarea {
-		@apply w-full px-4 py-2.5 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg text-[var(--color-text-primary)] placeholder-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent-primary)]/50 focus:border-[var(--color-accent-primary)] transition-all;
+		width: 100%;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.625rem;
+		padding-bottom: 0.625rem;
+		background-color: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: 0.5rem;
+		color: var(--color-text-primary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.form-group input[type="text"]::placeholder,
+	.form-group textarea::placeholder {
+		color: var(--color-text-muted);
+	}
+
+	.form-group input[type="text"]:focus,
+	.form-group textarea:focus {
+		outline: none;
+		box-shadow: 0 0 0 2px rgb(var(--color-accent-primary) / 0.5);
+		border-color: var(--color-accent-primary);
 	}
 
 	.form-group input:disabled,
 	.form-group textarea:disabled {
-		@apply opacity-60 cursor-not-allowed;
+		opacity: 0.6;
+		cursor: not-allowed;
 	}
 
 	.form-group textarea {
-		@apply font-mono text-sm resize-y min-h-[200px];
+		font-family: ui-monospace, monospace;
+		font-size: 0.875rem;
+		resize: vertical;
+		min-height: 200px;
 	}
 
 	.hint {
-		@apply block text-xs text-[var(--color-text-muted)] mt-1.5;
+		display: block;
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
+		margin-top: 0.375rem;
 	}
 
 	.checkbox-label {
-		@apply flex items-center gap-3 cursor-pointer;
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		cursor: pointer;
 	}
 
 	.checkbox-label input[type="checkbox"] {
-		@apply w-4 h-4 rounded border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[var(--color-accent-primary)] focus:ring-2 focus:ring-[var(--color-accent-primary)]/50;
+		width: 1rem;
+		height: 1rem;
+		border-radius: 0.25rem;
+		border: 1px solid var(--color-border);
+		background-color: var(--color-bg-secondary);
+	}
+
+	.checkbox-label input[type="checkbox"]:focus {
+		box-shadow: 0 0 0 2px rgb(var(--color-accent-primary) / 0.5);
 	}
 
 	.checkbox-label span {
-		@apply text-sm font-medium text-[var(--color-text-primary)];
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-primary);
 	}
 
 	.form-actions {
-		@apply flex items-center justify-end gap-3 pt-4 border-t border-[var(--color-border)];
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 0.75rem;
+		padding-top: 1rem;
+		border-top: 1px solid var(--color-border);
 	}
 
 	.cancel-btn {
-		@apply px-4 py-2 rounded-lg text-sm font-medium text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		border-radius: 0.5rem;
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-secondary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.cancel-btn:hover {
+		color: var(--color-text-primary);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.submit-btn {
-		@apply flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--color-accent-primary)] text-white text-sm font-medium hover:bg-[var(--color-accent-hover)] disabled:opacity-50 disabled:cursor-not-allowed transition-all;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-accent-primary);
+		color: white;
+		font-size: 0.875rem;
+		font-weight: 500;
+		transition: all 0.15s ease-in-out;
+	}
+
+	.submit-btn:hover {
+		background-color: var(--color-accent-hover);
+	}
+
+	.submit-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.spinner {
-		@apply w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin;
+		width: 1rem;
+		height: 1rem;
+		border-radius: 9999px;
+		border: 2px solid rgb(255 255 255 / 0.3);
+		border-top-color: white;
+		animation: spin 1s linear infinite;
+	}
+
+	@keyframes spin {
+		from {
+			transform: rotate(0deg);
+		}
+		to {
+			transform: rotate(360deg);
+		}
 	}
 </style>

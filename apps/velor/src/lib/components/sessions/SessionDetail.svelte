@@ -289,178 +289,359 @@
 
 <style>
 	.detail-overlay {
-		@apply fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4;
+		position: fixed;
+		inset: 0;
+		z-index: 50;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background-color: rgb(0 0 0 / 0.6);
+		backdrop-filter: blur(4px);
+		padding: 1rem;
 	}
 
 	.detail-dialog {
-		@apply w-full max-w-4xl max-h-[90vh] flex flex-col bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-xl;
+		width: 100%;
+		max-width: 56rem;
+		max-height: 90vh;
+		display: flex;
+		flex-direction: column;
+		background-color: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: 0.5rem;
+		box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
 	}
 
 	.detail-header {
-		@apply flex items-center justify-between px-6 py-4 border-b border-[var(--color-border)];
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding-left: 1.5rem;
+		padding-right: 1.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+		border-bottom: 1px solid var(--color-border);
 	}
 
 	.header-left {
-		@apply flex items-center gap-3;
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
 	}
 
 	.header-left h2 {
-		@apply text-lg font-semibold text-[var(--color-text-primary)];
+		font-size: 1.125rem;
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.state-badge {
-		@apply px-2 py-0.5 rounded text-xs font-medium capitalize;
+		padding-left: 0.5rem;
+		padding-right: 0.5rem;
+		padding-top: 0.125rem;
+		padding-bottom: 0.125rem;
+		border-radius: 0.25rem;
+		font-size: 0.75rem;
+		font-weight: 500;
+		text-transform: capitalize;
 	}
 
 	.header-actions {
-		@apply flex items-center gap-1;
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
 	}
 
 	.btn-icon {
-		@apply p-2 rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all disabled:opacity-50;
+		padding: 0.5rem;
+		border-radius: 0.25rem;
+		color: var(--color-text-secondary);
+		transition: all 0.15s ease-in-out;
 	}
 
-	.btn-icon.delete {
-		@apply hover:text-red-400 hover:bg-red-500/10;
+	.btn-icon:hover {
+		color: var(--color-text-primary);
+		background-color: var(--color-bg-tertiary);
+	}
+
+	.btn-icon:disabled {
+		opacity: 0.5;
+	}
+
+	.btn-icon.delete:hover {
+		color: rgb(248 113 113);
+		background-color: rgb(239 68 68 / 0.1);
 	}
 
 	.close-btn {
-		@apply p-1 rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all;
+		padding: 0.25rem;
+		border-radius: 0.25rem;
+		color: var(--color-text-secondary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.close-btn:hover {
+		color: var(--color-text-primary);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.detail-body {
-		@apply flex-1 overflow-y-auto px-6 py-4 space-y-6;
+		flex: 1;
+		overflow-y: auto;
+		padding-left: 1.5rem;
+		padding-right: 1.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 1.5rem;
 	}
 
 	.metadata-section {
-		@apply space-y-4;
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
 	}
 
 	.metadata-grid {
-		@apply grid grid-cols-2 gap-4;
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 1rem;
 	}
 
 	.metadata-item {
-		@apply flex flex-col gap-1;
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
 	}
 
 	.metadata-label {
-		@apply text-xs text-[var(--color-text-muted)];
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
 	}
 
 	.metadata-value {
-		@apply text-sm text-[var(--color-text-primary)];
+		font-size: 0.875rem;
+		color: var(--color-text-primary);
 	}
 
 	.metrics-section {
-		@apply space-y-3;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
 	}
 
 	.metrics-section h3 {
-		@apply text-sm font-medium text-[var(--color-text-secondary)];
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-secondary);
 	}
 
 	.metrics-grid {
-		@apply grid grid-cols-4 gap-3;
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		gap: 0.75rem;
 	}
 
 	.metric-card {
-		@apply flex items-center gap-3 p-3 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)];
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		padding: 0.75rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
 	}
 
 	.metric-icon {
-		@apply text-[var(--color-text-muted)];
+		color: var(--color-text-muted);
 	}
 
 	.metric-content {
-		@apply flex flex-col;
+		display: flex;
+		flex-direction: column;
 	}
 
 	.metric-value {
-		@apply text-lg font-semibold text-[var(--color-text-primary)];
+		font-size: 1.125rem;
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.metric-label {
-		@apply text-xs text-[var(--color-text-muted)];
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
 	}
 
 	.error-section {
-		@apply p-4 rounded-lg bg-red-950/50 border border-red-900/50;
+		padding: 1rem;
+		border-radius: 0.5rem;
+		background-color: rgb(127 29 29 / 0.5);
+		border: 1px solid rgb(185 28 28 / 0.5);
 	}
 
 	.error-header {
-		@apply flex items-center gap-2 text-red-400 font-medium mb-2;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		color: rgb(248 113 113);
+		font-weight: 500;
+		margin-bottom: 0.5rem;
 	}
 
 	.error-message {
-		@apply text-sm text-red-300 whitespace-pre-wrap font-mono overflow-x-auto;
+		font-size: 0.875rem;
+		color: rgb(253 186 116);
+		white-space: pre-wrap;
+		font-family: ui-monospace, monospace;
+		overflow-x: auto;
 	}
 
 	.output-section {
-		@apply space-y-3;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
 	}
 
 	.output-section h3 {
-		@apply text-sm font-medium text-[var(--color-text-secondary)];
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-secondary);
 	}
 
 	.output-content {
-		@apply p-4 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-sm text-[var(--color-text-primary)] font-mono whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto;
+		padding: 1rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		font-size: 0.875rem;
+		color: var(--color-text-primary);
+		font-family: ui-monospace, monospace;
+		white-space: pre-wrap;
+		overflow-x: auto;
+		max-height: 300px;
+		overflow-y: auto;
 	}
 
 	.empty-output {
-		@apply flex items-center justify-center py-8 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-[var(--color-text-muted)];
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding-top: 2rem;
+		padding-bottom: 2rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		color: var(--color-text-muted);
 	}
 
 	.events-section {
-		@apply space-y-3;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
 	}
 
 	.events-header {
-		@apply flex items-center justify-between;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
 	}
 
 	.events-header h3 {
-		@apply text-sm font-medium text-[var(--color-text-secondary)];
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-secondary);
 	}
 
 	.events-count {
-		@apply text-xs text-[var(--color-text-muted)];
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
 	}
 
 	.events-list {
-		@apply p-4 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] space-y-2 max-h-[200px] overflow-y-auto;
+		padding: 1rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		max-height: 200px;
+		overflow-y: auto;
 	}
 
 	.event-item {
-		@apply flex items-center gap-3 text-sm;
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		font-size: 0.875rem;
 	}
 
 	.event-icon {
-		@apply w-4 text-center;
+		width: 1rem;
+		text-align: center;
 	}
 
 	.event-type {
-		@apply flex-1 text-[var(--color-text-secondary)] capitalize;
+		flex: 1;
+		color: var(--color-text-secondary);
+		text-transform: capitalize;
 	}
 
 	.event-time {
-		@apply text-xs text-[var(--color-text-muted)] font-mono;
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
+		font-family: ui-monospace, monospace;
 	}
 
 	.event-state {
-		@apply px-1.5 py-0.5 rounded text-xs bg-[var(--color-bg-secondary)] text-[var(--color-text-muted)];
+		padding-left: 0.375rem;
+		padding-right: 0.375rem;
+		padding-top: 0.125rem;
+		padding-bottom: 0.125rem;
+		border-radius: 0.25rem;
+		font-size: 0.75rem;
+		background-color: var(--color-bg-secondary);
+		color: var(--color-text-muted);
 	}
 
 	.event-iteration {
-		@apply px-1.5 py-0.5 rounded text-xs bg-[var(--color-accent-primary)]/20 text-[var(--color-accent-primary)];
+		padding-left: 0.375rem;
+		padding-right: 0.375rem;
+		padding-top: 0.125rem;
+		padding-bottom: 0.125rem;
+		border-radius: 0.25rem;
+		font-size: 0.75rem;
+		background-color: rgb(var(--color-accent-primary) / 0.2);
+		color: var(--color-accent-primary);
 	}
 
 	.empty-events {
-		@apply flex items-center justify-center py-8 rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-[var(--color-text-muted)];
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding-top: 2rem;
+		padding-bottom: 2rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		color: var(--color-text-muted);
 	}
 
 	.show-more-btn {
-		@apply flex items-center justify-center gap-1 w-full py-2 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] transition-all;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.25rem;
+		width: 100%;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.show-more-btn:hover {
+		color: var(--color-text-secondary);
 	}
 </style>

@@ -7,73 +7,11 @@ Velor Agent CLI is a Rust-based command-line tool for running autonomous AI agen
 ## Common Commands
 
 ### Development
-- `just check` - Run all checks (fmt, clippy, tests)
-- `cargo check -q` - Quick compile check (always use quiet flag)
-- `just test` or `cargo nextest run` - Run tests (always use nextest, never `cargo test`)
-- `just fmt` - Format code
-- `just lint` - Run clippy
-- `just build` - Build the binary
-- `just build-release` - Build release binary
-- `just install` - Install to ~/bin
-
-### CLI Usage
-- `velor once` - Single-shot Claude invocation
-- `velor auto` - Iterative execution until completion
-- `velor init` - Initialize repository with `.velor/velor.toml` config
-- `velor test-notification` - Send test notification to verify configuration
-- `--dry-run` - Show rendered prompt without executing
+- `just check` - Run all checks (fmt, clippy, svelte-check)
 
 ### Configuration
 - Global config: `~/.velor/velor.toml`
 - Project config: `{git_root}/.velor/velor.toml`
-- `just edit-config` - Open project config in `$EDITOR`
-- `just show-prompts` - List available prompt templates
-- `just test-notification` - Test notification configuration
-
-### Notifications
-
-Velor can send notifications when runs complete, reach max iterations, or fail. Supports Telegram and macOS Notification Center.
-
-#### Configuration
-
-Add a `[notifications]` section to your `velor.toml`:
-
-```toml
-[notifications]
-enabled = true
-notify_on_success = true
-notify_on_max_iterations = true
-notify_on_failure = true
-output_preview_chars = 500
-
-# Telegram notifications
-[notifications.telegram]
-enabled = true
-bot_token_env = "TELEGRAM_BOT_TOKEN"  # Environment variable with bot token
-chat_id = "-1001234567890"             # Target chat/group ID
-api_base_url = "https://api.telegram.org"  # Optional: for proxies
-parse_mode = "MarkdownV2"              # Optional: "MarkdownV2" or "Html"
-
-# macOS notifications (works on macOS only)
-[notifications.macos]
-enabled = true
-sound = "default"  # Optional: "default", "Basso", "Sosumi", etc.
-```
-
-#### Testing
-
-Run `velor test-notification` to verify your configuration:
-- Builds notifiers from merged home + repo config
-- Sends a test notification via all enabled channels
-- Shows which notifiers are being used
-
-#### Telegram Setup
-
-1. Create a bot via [@BotFather](https://t.me/botfather) and get the token
-2. Get your chat ID (message [@userinfobot](https://t.me/userinfobot))
-3. Set environment variable: `export TELEGRAM_BOT_TOKEN="your-token"`
-4. Add `[notifications.telegram]` to your config with `chat_id`
-5. Run `velor test-notification` to verify
 
 ## Architecture
 
@@ -132,3 +70,6 @@ The CLI spawns the configured binary (default: `claude-glm`) with:
 - Validate all required values at startup (fail fast)
 - Use `secrecy::SecretString` for credentials
 - Use `veil` for redacting sensitive fields in Debug output
+
+### UI and Design
+- Bun instead of npm

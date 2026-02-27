@@ -593,6 +593,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
     let git_root = core::git::discover_git_root(&cwd).wrap_err("failed to discover git root")?;
 
+    // Load .env file from git root (if exists)
+    core::git::load_dotenv_from_git_root(&git_root)
+        .wrap_err("failed to load .env from git root")?;
+
     // Load home config (optional, may not exist)
     let home_cfg = FileConfig::load_if_exists(&FileConfig::home_config_path()?)
         .wrap_err("failed to load home config")?

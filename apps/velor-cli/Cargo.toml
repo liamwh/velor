@@ -11,6 +11,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
+dotenvy = { workspace = true }
 ctrlc = { workspace = true }
 crossterm = { workspace = true }
 humantime = { workspace = true }
@@ -33,6 +34,7 @@ chrono-tz = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+serial_test = "3.4.0"
 tempfile = { workspace = true }
 tokio = { workspace = true }
 wiremock = { workspace = true }

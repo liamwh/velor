@@ -90,12 +90,12 @@
 	}
 </script>
 
-<div class="chat-input">
-	<div class="input-wrapper">
+<div class="border-t border-border bg-card">
+	<div class="flex items-center gap-2 p-3">
 		<!-- Prompt Selector -->
 		<select
 			bind:value={selectedPrompt}
-			class="prompt-select"
+			class="flex-1 px-3 py-2 rounded-lg bg-background border border-border text-foreground text-sm focus:outline-none focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
 			disabled={loading}
 			aria-label="Select prompt template"
 		>
@@ -106,7 +106,7 @@
 
 		<!-- Variable Editor Toggle -->
 		<button
-			class="var-toggle"
+			class="p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-all disabled:opacity-50 disabled:cursor-not-allowed"
 			onclick={() => (showVarEditor = !showVarEditor)}
 			disabled={loading}
 			title="Edit variables"
@@ -118,14 +118,14 @@
 
 		<!-- Submit Button -->
 		<button
-			class="submit-btn"
+			class="p-2 rounded-lg bg-primary text-white hover:bg-[var(--color-accent-hover)] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
 			onclick={handleSubmit}
 			disabled={loading || !selectedPrompt}
 			title="Start execution (Enter)"
 			aria-label="Start execution"
 		>
 			{#if loading}
-				<Loader2 size={18} class="spinning" />
+				<Loader2 size={18} class="animate-spin" />
 			{:else}
 				<Send size={18} />
 			{/if}
@@ -134,11 +134,11 @@
 
 	<!-- Variable Editor Panel -->
 	{#if showVarEditor}
-		<div class="var-editor">
-			<div class="var-header">
-				<span class="var-title">Variables</span>
+		<div class="border-t border-border p-3 space-y-3">
+			<div class="flex items-center justify-between">
+				<span class="text-sm font-medium text-foreground">Variables</span>
 				<button
-					class="reset-btn"
+					class="text-xs text-primary hover:text-[var(--color-accent-hover)] disabled:opacity-50 disabled:cursor-not-allowed"
 					onclick={resetVars}
 					disabled={loading || Object.keys(customVars).length === 0}
 				>
@@ -148,12 +148,14 @@
 
 			<!-- Template Variables (read-only) -->
 			{#if templateVars().length > 0}
-				<div class="var-section">
-					<span class="var-section-title">Template Defaults</span>
+				<div class="space-y-2">
+					<span class="text-xs font-medium text-muted-foreground uppercase tracking-wide"
+						>Template Defaults</span
+					>
 					{#each templateVars() as { key, default: defaultValue } (key)}
-						<div class="var-item var-item-readonly">
-							<span class="var-key">{key}</span>
-							<span class="var-value">{String(defaultValue)}</span>
+						<div class="flex items-center gap-2 opacity-75">
+							<span class="text-sm text-muted-foreground min-w-24">{key}</span>
+							<span class="text-sm text-muted-foreground font-mono">{String(defaultValue)}</span>
 						</div>
 					{/each}
 				</div>
@@ -161,20 +163,22 @@
 
 			<!-- Custom Variables -->
 			{#if Object.keys(customVars).length > 0}
-				<div class="var-section">
-					<span class="var-section-title">Custom Overrides</span>
+				<div class="space-y-2">
+					<span class="text-xs font-medium text-muted-foreground uppercase tracking-wide"
+						>Custom Overrides</span
+					>
 					{#each Object.entries(customVars) as [key] (key)}
-						<div class="var-item">
-							<span class="var-key">{key}</span>
+						<div class="flex items-center gap-2">
+							<span class="text-sm text-muted-foreground min-w-24">{key}</span>
 							<input
 								type="text"
 								bind:value={customVars[key]}
-								class="var-input"
+								class="flex-1 px-2 py-1.5 rounded bg-background border border-border text-foreground text-sm focus:outline-none focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
 								disabled={loading}
 								placeholder="Value"
 							/>
 							<button
-								class="var-remove"
+								class="w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-red-400 hover:bg-red-950/50 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
 								onclick={() => removeVariable(key)}
 								disabled={loading}
 								aria-label="Remove variable"
@@ -187,11 +191,11 @@
 			{/if}
 
 			<!-- Add New Variable -->
-			<div class="var-add">
+			<div class="flex items-center gap-2">
 				<input
 					type="text"
 					bind:value={newVarKey}
-					class="var-input var-key-input"
+					class="w-32 flex-none min-w-0 px-2 py-1.5 rounded bg-background border border-border text-foreground text-sm focus:outline-none focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
 					placeholder="Variable name"
 					disabled={loading}
 					onkeydown={(e) => e.key === 'Enter' && addVariable()}
@@ -199,120 +203,19 @@
 				<input
 					type="text"
 					bind:value={newVarValue}
-					class="var-input var-value-input"
+					class="flex-1 px-2 py-1.5 rounded bg-background border border-border text-foreground text-sm focus:outline-none focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
 					placeholder="Value"
 					disabled={loading}
 					onkeydown={(e) => e.key === 'Enter' && addVariable()}
 				/>
-				<button class="var-add-btn" onclick={addVariable} disabled={loading || !newVarKey.trim()}>
+				<button
+					class="p-1.5 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+					onclick={addVariable}
+					disabled={loading || !newVarKey.trim()}
+				>
 					<Settings size={16} />
 				</button>
 			</div>
 		</div>
 	{/if}
 </div>
-
-<style>
-	.chat-input {
-		@apply border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)];
-	}
-
-	.input-wrapper {
-		@apply flex items-center gap-2 p-3;
-	}
-
-	.prompt-select {
-		@apply flex-1 px-3 py-2 rounded-lg bg-[var(--color-bg-primary)] border border-[var(--color-border)] text-[var(--color-text-primary)] text-sm focus:outline-none focus:border-[var(--color-accent-primary)] disabled:opacity-50 disabled:cursor-not-allowed;
-	}
-
-	.var-toggle,
-	.submit-btn {
-		@apply p-2 rounded-lg text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all disabled:opacity-50 disabled:cursor-not-allowed;
-	}
-
-	.submit-btn {
-		@apply bg-[var(--color-accent-primary)] text-white hover:bg-[var(--color-accent-hover)];
-	}
-
-	.var-editor {
-		@apply border-t border-[var(--color-border)] p-3 space-y-3;
-	}
-
-	.var-header {
-		@apply flex items-center justify-between;
-	}
-
-	.var-title {
-		@apply text-sm font-medium text-[var(--color-text-primary)];
-	}
-
-	.reset-btn {
-		@apply text-xs text-[var(--color-accent-primary)] hover:text-[var(--color-accent-hover)] disabled:opacity-50 disabled:cursor-not-allowed;
-	}
-
-	.var-section {
-		@apply space-y-2;
-	}
-
-	.var-section-title {
-		@apply text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wide;
-	}
-
-	.var-item {
-		@apply flex items-center gap-2;
-	}
-
-	.var-item-readonly {
-		@apply opacity-75;
-	}
-
-	.var-key {
-		@apply text-sm text-[var(--color-text-secondary)] min-w-24;
-	}
-
-	.var-value {
-		@apply text-sm text-[var(--color-text-muted)] font-mono;
-	}
-
-	.var-input {
-		@apply flex-1 px-2 py-1.5 rounded bg-[var(--color-bg-primary)] border border-[var(--color-border)] text-[var(--color-text-primary)] text-sm focus:outline-none focus:border-[var(--color-accent-primary)] disabled:opacity-50 disabled:cursor-not-allowed;
-	}
-
-	.var-key-input,
-	.var-value-input {
-		@apply flex-none min-w-0;
-	}
-
-	.var-key-input {
-		@apply w-32;
-	}
-
-	.var-value-input {
-		@apply flex-1;
-	}
-
-	.var-remove {
-		@apply w-6 h-6 flex items-center justify-center rounded text-[var(--color-text-muted)] hover:text-red-400 hover:bg-red-950/50 transition-all disabled:opacity-50 disabled:cursor-not-allowed;
-	}
-
-	.var-add {
-		@apply flex items-center gap-2;
-	}
-
-	.var-add-btn {
-		@apply p-1.5 rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all disabled:opacity-50 disabled:cursor-not-allowed;
-	}
-
-	.spinning {
-		animation: spin 1s linear infinite;
-	}
-
-	@keyframes spin {
-		from {
-			transform: rotate(0deg);
-		}
-		to {
-			transform: rotate(360deg);
-		}
-	}
-</style>

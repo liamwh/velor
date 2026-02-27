@@ -44,18 +44,18 @@
 
 		switch (execution.state) {
 			case ExecutionState.Pending:
-				return 'state-pending';
+				return 'bg-[var(--color-state-pending-bg)] text-[var(--color-state-pending-text)]';
 			case ExecutionState.Rendering:
 			case ExecutionState.Running:
-				return 'state-running';
+				return 'bg-[var(--color-state-running-bg)] text-[var(--color-state-running-text)]';
 			case ExecutionState.Retrying:
-				return 'state-retrying';
+				return 'bg-[var(--color-state-retrying-bg)] text-[var(--color-state-retrying-text)]';
 			case ExecutionState.Completed:
-				return 'state-completed';
+				return 'bg-[var(--color-state-completed-bg)] text-[var(--color-state-completed-text)]';
 			case ExecutionState.Failed:
-				return 'state-failed';
+				return 'bg-[var(--color-state-failed-bg)] text-[var(--color-state-failed-text)]';
 			case ExecutionState.Cancelled:
-				return 'state-cancelled';
+				return 'bg-[var(--color-state-cancelled-bg)] text-[var(--color-state-cancelled-text)]';
 			default:
 				return '';
 		}
@@ -113,23 +113,38 @@
 </script>
 
 {#if execution}
-	<div class="execution-status {compact ? 'compact' : ''}">
-		<div class="status-main">
-			<div class="status-indicator {stateClass}">
+	<div
+		class="flex {compact
+			? 'flex-row items-center gap-2 px-3 py-2'
+			: 'flex-col gap-3 p-4'} rounded-xl bg-card border border-border"
+	>
+		<div class="flex items-center {compact ? 'gap-2' : 'gap-3'}">
+			<div
+				class="flex items-center justify-center {compact
+					? 'w-5 h-5'
+					: 'w-8 h-8'} rounded-full {stateClass}"
+			>
 				{#if StateIcon}
-					<StateIcon size={compact ? 14 : 16} class="state-icon {execution.state === ExecutionState.Running || execution.state === ExecutionState.Rendering ? 'animate-spin' : ''}" />
+					<StateIcon
+						size={compact ? 14 : 16}
+						class="flex-shrink-0 {execution.state === ExecutionState.Running || execution.state === ExecutionState.Rendering
+							? 'animate-spin'
+							: ''}"
+					/>
 				{/if}
 			</div>
-			<div class="status-info">
+			<div class="{compact ? 'flex-row items-center gap-2' : 'flex-col gap-0.5'}">
 				{#if compact}
-					<span class="status-label">{stateLabel}</span>
-					<span class="execution-id">{execution.id.slice(0, 8)}</span>
+					<span class="text-sm font-medium text-foreground">{stateLabel}</span>
+					<span class="text-muted-foreground font-mono">{execution.id.slice(0, 8)}</span>
 				{:else}
-					<span class="status-label">{stateLabel}</span>
-					<span class="execution-details">
-						Execution <code class="id">{execution.id.slice(0, 8)}</code>
+					<span class="text-sm font-medium text-foreground">{stateLabel}</span>
+					<span class="flex items-center gap-2 text-xs text-muted-foreground">
+						Execution <code
+							class="px-1.5 py-0.5 rounded bg-muted text-primary font-mono text-xs">{execution.id.slice(0, 8)}</code
+						>
 						{#if execution.prompt_name}
-							<span class="prompt-name">using {execution.prompt_name}</span>
+							<span class="text-muted-foreground">using {execution.prompt_name}</span>
 						{/if}
 					</span>
 				{/if}
@@ -137,145 +152,43 @@
 		</div>
 
 		{#if showMetrics && !compact}
-			<div class="status-metrics">
-				<div class="metric">
-					<span class="metric-label">Iteration</span>
-					<span class="metric-value">{execution.iteration}</span>
+			<div class="flex flex-wrap items-center gap-4 px-3 py-2 rounded-lg bg-muted">
+				<div class="flex items-center gap-2">
+					<span class="text-xs text-muted-foreground uppercase tracking-wide">Iteration</span>
+					<span class="text-sm font-medium text-foreground">{execution.iteration}</span>
 				</div>
-				<div class="metric">
-					<span class="metric-label">Duration</span>
-					<span class="metric-value">{duration}</span>
+				<div class="flex items-center gap-2">
+					<span class="text-xs text-muted-foreground uppercase tracking-wide">Duration</span>
+					<span class="text-sm font-medium text-foreground">{duration}</span>
 				</div>
 				{#if execution.metrics.retries > 0}
-					<div class="metric">
-						<span class="metric-label">Retries</span>
-						<span class="metric-value">{execution.metrics.retries}</span>
+					<div class="flex items-center gap-2">
+						<span class="text-xs text-muted-foreground uppercase tracking-wide">Retries</span>
+						<span class="text-sm font-medium text-foreground">{execution.metrics.retries}</span>
 					</div>
 				{/if}
 				{#if execution.metrics.output_chars > 0}
-					<div class="metric">
-						<span class="metric-label">Output</span>
-						<span class="metric-value">{execution.metrics.output_chars} chars</span>
+					<div class="flex items-center gap-2">
+						<span class="text-xs text-muted-foreground uppercase tracking-wide">Output</span>
+						<span class="text-sm font-medium text-foreground"
+							>{execution.metrics.output_chars} chars</span
+						>
 					</div>
 				{/if}
 			</div>
 		{/if}
 
 		{#if execution.error && execution.state === ExecutionState.Failed}
-			<div class="error-message">
+			<div
+				class="flex items-start gap-2 px-3 py-2 rounded-lg bg-[var(--color-state-failed-bg)] border border-[var(--color-state-failed-border)] text-[var(--color-state-failed-text)] text-sm"
+			>
 				<AlertCircle size={14} />
 				<span>{execution.error}</span>
 			</div>
 		{/if}
 	</div>
 {:else}
-	<div class="execution-status empty {compact ? 'compact' : ''}">
-		<span class="no-execution">No active execution</span>
+	<div class="flex items-center justify-center min-h-[60px] {compact ? 'px-3 py-2' : 'p-4'} rounded-xl bg-card border border-border">
+		<span class="text-sm text-muted-foreground">No active execution</span>
 	</div>
 {/if}
-
-<style>
-	.execution-status {
-		@apply flex flex-col gap-3 p-4 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border)];
-	}
-
-	.execution-status.compact {
-		@apply flex-row items-center gap-2 px-3 py-2;
-	}
-
-	.execution-status.empty {
-		@apply items-center justify-center min-h-[60px];
-	}
-
-	.no-execution {
-		@apply text-sm text-[var(--color-text-tertiary)];
-	}
-
-	.status-main {
-		@apply flex items-center gap-3;
-	}
-
-	.status-indicator {
-		@apply flex items-center justify-center w-8 h-8 rounded-full;
-	}
-
-	.execution-status.compact .status-indicator {
-		@apply w-5 h-5;
-	}
-
-	.status-indicator.state-pending {
-		@apply bg-yellow-900/30 text-yellow-500;
-	}
-
-	.status-indicator.state-running {
-		@apply bg-[var(--color-accent-light)] text-[var(--color-accent-primary)];
-	}
-
-	.status-indicator.state-retrying {
-		@apply bg-orange-900/30 text-orange-400;
-	}
-
-	.status-indicator.state-completed {
-		@apply bg-green-900/30 text-green-400;
-	}
-
-	.status-indicator.state-failed {
-		@apply bg-red-900/30 text-red-400;
-	}
-
-	.status-indicator.state-cancelled {
-		@apply bg-gray-700/50 text-gray-400;
-	}
-
-	.state-icon {
-		@apply flex-shrink-0;
-	}
-
-	.status-info {
-		@apply flex flex-col gap-0.5;
-	}
-
-	.execution-status.compact .status-info {
-		@apply flex-row items-center gap-2;
-	}
-
-	.status-label {
-		@apply text-sm font-medium text-[var(--color-text-primary)];
-	}
-
-	.execution-details {
-		@apply flex items-center gap-2 text-xs text-[var(--color-text-secondary)];
-	}
-
-	.execution-id {
-		@apply text-[var(--color-text-tertiary)] font-mono;
-	}
-
-	.id {
-		@apply px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-accent-primary)] font-mono text-xs;
-	}
-
-	.prompt-name {
-		@apply text-[var(--color-text-tertiary)];
-	}
-
-	.status-metrics {
-		@apply flex flex-wrap items-center gap-4 px-3 py-2 rounded-lg bg-[var(--color-bg-tertiary)];
-	}
-
-	.metric {
-		@apply flex items-center gap-2;
-	}
-
-	.metric-label {
-		@apply text-xs text-[var(--color-text-tertiary)] uppercase tracking-wide;
-	}
-
-	.metric-value {
-		@apply text-sm font-medium text-[var(--color-text-primary)];
-	}
-
-	.error-message {
-		@apply flex items-start gap-2 px-3 py-2 rounded-lg bg-red-950/30 border border-red-900/50 text-red-300 text-sm;
-	}
-</style>

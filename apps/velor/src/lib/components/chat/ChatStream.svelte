@@ -15,7 +15,7 @@
 
 	let { executionId, autoScroll = true, showMetrics = true }: Props = $props();
 
-	let messagesContainer: HTMLElement;
+	let messagesContainer = $state<HTMLElement | undefined>(undefined);
 	let isScrolledToBottom = $state(true);
 	let isStreaming = $state(false);
 
@@ -30,16 +30,24 @@
 
 	// Get the state badge class
 	function getStateClass(state: string): string {
-		const stateMap: Record<string, string> = {
-			pending: 'status-pending',
-			rendering: 'status-rendering',
-			running: 'status-running',
-			retrying: 'status-retrying',
-			completed: 'status-completed',
-			failed: 'status-failed',
-			cancelled: 'status-cancelled'
-		};
-		return stateMap[state] || 'status-pending';
+		switch (state) {
+			case 'pending':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-gray-700 text-gray-300';
+			case 'rendering':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-blue-900/50 text-blue-300';
+			case 'running':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-primary text-white animate-pulse';
+			case 'retrying':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-orange-900/50 text-orange-300';
+			case 'completed':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-green-900/50 text-green-300';
+			case 'failed':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-red-900/50 text-red-300';
+			case 'cancelled':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-gray-700 text-gray-300';
+			default:
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-gray-700 text-gray-300';
+		}
 	}
 
 	// Check if we're at the bottom of the scroll
@@ -55,7 +63,9 @@
 		if (!messagesContainer) return;
 		if (force || isScrolledToBottom || autoScroll) {
 			await tick();
-			messagesContainer.scrollTop = messagesContainer.scrollHeight;
+			if (messagesContainer) {
+				messagesContainer.scrollTop = messagesContainer.scrollHeight;
+			}
 		}
 	}
 
@@ -183,23 +193,21 @@
 	});
 </script>
 
-<div class="chat-stream">
+<div class="flex flex-col h-full bg-background overflow-hidden">
 	{#if $currentExecution}
 		<!-- Status Bar -->
 		{#if showMetrics}
-			<div class="status-bar">
-				<div class="status-info">
-					<span class="status-badge {getStateClass($currentExecution.state)}"
-						>{$currentExecution.state}</span
-					>
-					<span class="metrics">
+			<div class="flex items-center justify-between px-4 py-2 border-b border-border bg-card">
+				<div class="flex items-center gap-2">
+					<span class={getStateClass($currentExecution.state)}>{$currentExecution.state}</span>
+					<span class="text-sm text-muted-foreground">
 						Iteration {$currentExecution.iteration}
 						{#if $currentExecution.metrics.retries > 0}
-							<span class="retry-count">({$currentExecution.metrics.retries} retries)</span>
+							<span class="text-orange-400">({$currentExecution.metrics.retries} retries)</span>
 						{/if}
 					</span>
 				</div>
-				<div class="metrics">
+				<div class="text-sm text-muted-foreground">
 					<span>{$currentExecution.metrics.output_chars} chars</span>
 					<span>{($currentExecution.metrics.duration_ms / 1000).toFixed(1)}s</span>
 				</div>
@@ -209,14 +217,14 @@
 		<!-- Messages Container -->
 		<div
 			bind:this={messagesContainer}
-			class="messages-container"
+			class="flex-1 overflow-y-auto px-4 py-4 space-y-1"
 			onscroll={handleScroll}
 			role="log"
 			aria-live="polite"
 			aria-atomic="false"
 		>
 			{#if processedEvents().length === 0}
-				<div class="empty-state">
+				<div class="flex flex-col items-center justify-center h-full text-muted-foreground gap-4">
 					<Scroll size={32} />
 					<p>Waiting for output...</p>
 				</div>
@@ -230,7 +238,7 @@
 		<!-- Scroll to Bottom Button -->
 		{#if !isScrolledToBottom}
 			<button
-				class="scroll-to-bottom"
+				class="absolute bottom-4 right-4 p-2 rounded-full bg-card border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-all shadow-lg"
 				onclick={scrollToBottomClick}
 				title="Scroll to bottom"
 				aria-label="Scroll to bottom"
@@ -239,104 +247,17 @@
 			</button>
 		{/if}
 	{:else}
-		<div class="no-execution">
+		<div class="flex flex-col items-center justify-center h-full text-muted-foreground gap-4">
 			<Scroll size={48} />
-			<h3>No Execution Active</h3>
-			<p>Start an execution to see live output here.</p>
+			<h3 class="text-lg font-semibold text-muted-foreground mt-2">No Execution Active</h3>
+			<p class="text-sm">Start an execution to see live output here.</p>
 		</div>
 	{/if}
 
 	{#if $executionError}
-		<div class="error-banner">
-			<span class="error-icon">⚠</span>
-			<span class="error-text">{$executionError}</span>
+		<div class="flex items-center gap-2 px-4 py-3 bg-red-950/50 border-t border-red-900/50 text-red-300">
+			<span class="text-lg">⚠</span>
+			<span class="text-sm flex-1">{$executionError}</span>
 		</div>
 	{/if}
 </div>
-
-<style>
-	.chat-stream {
-		@apply flex flex-col h-full bg-[var(--color-bg-primary)] overflow-hidden;
-	}
-
-	.status-bar {
-		@apply flex items-center justify-between px-4 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)];
-	}
-
-	.status-info {
-		@apply flex items-center gap-2;
-	}
-
-	.status-badge {
-		@apply px-2 py-0.5 rounded text-xs font-medium uppercase;
-	}
-
-	.status-badge.status-pending {
-		@apply bg-gray-700 text-gray-300;
-	}
-
-	.status-badge.status-rendering {
-		@apply bg-blue-900/50 text-blue-300;
-	}
-
-	.status-badge.status-running {
-		@apply bg-[var(--color-accent-primary)] text-white animate-pulse;
-	}
-
-	.status-badge.status-retrying {
-		@apply bg-orange-900/50 text-orange-300;
-	}
-
-	.status-badge.status-completed {
-		@apply bg-green-900/50 text-green-300;
-	}
-
-	.status-badge.status-failed {
-		@apply bg-red-900/50 text-red-300;
-	}
-
-	.status-badge.status-cancelled {
-		@apply bg-gray-700 text-gray-300;
-	}
-
-	.metrics {
-		@apply text-sm text-[var(--color-text-secondary)];
-	}
-
-	.retry-count {
-		@apply text-orange-400;
-	}
-
-	.messages-container {
-		@apply flex-1 overflow-y-auto px-4 py-4 space-y-1;
-	}
-
-	.empty-state,
-	.no-execution {
-		@apply flex flex-col items-center justify-center h-full text-[var(--color-text-muted)] gap-4;
-	}
-
-	.no-execution h3 {
-		@apply text-lg font-semibold text-[var(--color-text-secondary)] mt-2;
-	}
-
-	.no-execution p {
-		@apply text-sm;
-	}
-
-	.scroll-to-bottom {
-		@apply absolute bottom-4 right-4 p-2 rounded-full bg-[var(--color-bg-secondary)] border border-[var(--color-border)] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all shadow-lg;
-	}
-
-	.error-banner {
-		@apply flex items-center gap-2 px-4 py-3 bg-red-950/50 border-t border-red-900/50 text-red-300;
-	}
-
-	.error-icon {
-		@apply text-lg;
-	}
-
-	.error-text {
-		@apply text-sm flex-1;
-	}
-</style>
