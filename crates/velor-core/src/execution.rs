@@ -287,6 +287,12 @@ pub struct ExecutionRecord {
     pub ended_at: Option<DateTime<Utc>>,
     /// Events log.
     pub events: Vec<ExecutionEvent>,
+    /// User-editable session name (optional, defaults to prompt_name).
+    pub name: Option<String>,
+    /// Whether this session is pinned in the sidebar.
+    pub pinned: bool,
+    /// Git root path at time of session creation.
+    pub project_path: Option<String>,
 }
 
 impl ExecutionRecord {
@@ -309,6 +315,9 @@ impl ExecutionRecord {
             started_at,
             ended_at: None,
             events: vec![initial_event],
+            name: None,
+            pinned: false,
+            project_path: None,
         }
     }
 

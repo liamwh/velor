@@ -1008,6 +1008,179 @@ pub async fn get_session_stats(state: State<'_, Arc<AppState>>) -> CommandResult
     Ok(stats)
 }
 
+/// Renames a session.
+///
+/// # Arguments
+///
+/// * `id` - The session ID to rename.
+/// * `name` - The new name for the session (null to clear and use default).
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn rename_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    name: Option<String>,
+) -> CommandResult<()> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    store
+        .rename_session(&id, name)
+        .await
+        .map_err(|e| format!("Failed to rename session: {}", e))?;
+
+    info!(id, "Session renamed");
+    Ok(())
+}
+
+/// Toggles the pinned status of a session.
+///
+/// # Arguments
+///
+/// * `id` - The session ID to toggle pin status for.
+///
+/// Returns the new pinned state (true if pinned, false if unpinned).
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn toggle_session_pin(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> CommandResult<bool> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    let pinned = store
+        .toggle_session_pin(&id)
+        .await
+        .map_err(|e| format!("Failed to toggle session pin: {}", e))?;
+
+    info!(id, pinned, "Session pin toggled");
+    Ok(pinned)
+}
+
+// ============================================================================
+// Project Commands
+// ============================================================================
+
+/// Lists all projects with their session counts and metadata.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn list_projects(
+    state: State<'_, Arc<AppState>>,
+) -> CommandResult<Vec<crate::session_store::Project>> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    let projects = store
+        .list_projects()
+        .await
+        .map_err(|e| format!("Failed to list projects: {}", e))?;
+
+    Ok(projects)
+}
+
+/// Hides a project from the sidebar.
+///
+/// # Arguments
+///
+/// * `path` - The project path to hide.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn hide_project(state: State<'_, Arc<AppState>>, path: String) -> CommandResult<()> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    store
+        .hide_project(&path)
+        .await
+        .map_err(|e| format!("Failed to hide project: {}", e))?;
+
+    info!(path, "Project hidden");
+    Ok(())
+}
+
+/// Shows a hidden project in the sidebar.
+///
+/// # Arguments
+///
+/// * `path` - The project path to show.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn show_project(state: State<'_, Arc<AppState>>, path: String) -> CommandResult<()> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    store
+        .show_project(&path)
+        .await
+        .map_err(|e| format!("Failed to show project: {}", e))?;
+
+    info!(path, "Project shown");
+    Ok(())
+}
+
+/// Renames a project.
+///
+/// # Arguments
+///
+/// * `path` - The project path to rename.
+/// * `display_name` - The new display name.
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn rename_project(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    display_name: String,
+) -> CommandResult<()> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    store
+        .rename_project(&path, display_name.clone())
+        .await
+        .map_err(|e| format!("Failed to rename project: {}", e))?;
+
+    info!(path, display_name, "Project renamed");
+    Ok(())
+}
+
+/// Reorders projects by updating their sort order.
+///
+/// # Arguments
+///
+/// * `paths` - Ordered list of project paths (first appears at top).
+#[tauri::command]
+#[instrument(skip(state), level = "debug")]
+pub async fn reorder_projects(
+    state: State<'_, Arc<AppState>>,
+    paths: Vec<String>,
+) -> CommandResult<()> {
+    let store = state
+        .session_store()
+        .await
+        .ok_or("Session store not initialized")?;
+
+    store
+        .reorder_projects(paths)
+        .await
+        .map_err(|e| format!("Failed to reorder projects: {}", e))?;
+
+    info!("Projects reordered");
+    Ok(())
+}
+
 // ============================================================================
 // Automation Management Commands
 // ============================================================================
