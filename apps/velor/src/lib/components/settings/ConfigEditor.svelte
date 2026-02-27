@@ -149,7 +149,7 @@
 				aria-selected={activeTab === tab.id}
 				role="tab"
 			>
-				<svelte:component this={tab.icon} size={16} />
+				<tab.icon size={16} />
 				<span>{tab.label}</span>
 			</button>
 		{/each}
@@ -224,74 +224,179 @@
 
 <style>
 	.config-editor {
-		@apply flex flex-col gap-4;
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
 	}
 
 	.config-tabs {
-		@apply flex gap-2 border-b border-[var(--color-border)] -mx-2;
+		display: flex;
+		gap: 0.5rem;
+		border-bottom: 1px solid var(--color-border);
+		margin-left: -0.5rem;
+		margin-right: -0.5rem;
 	}
 
 	.config-tab {
-		@apply flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-[var(--color-text-secondary)] border-b-2 border-transparent hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] rounded-t-lg transition-all duration-200;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.625rem;
+		padding-bottom: 0.625rem;
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-secondary);
+		border-bottom: 2px solid transparent;
+		border-top-left-radius: 0.5rem;
+		border-top-right-radius: 0.5rem;
+		transition: all 0.2s ease-in-out;
+	}
+
+	.config-tab:hover {
+		color: var(--color-text-primary);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.config-tab.active {
-		@apply text-[var(--color-accent-primary)] border-b-[var(--color-accent-primary)] bg-[var(--color-bg-tertiary)];
+		color: var(--color-accent-primary);
+		border-bottom-color: var(--color-accent-primary);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.tab-description {
-		@apply text-sm text-[var(--color-text-secondary)] py-2;
+		font-size: 0.875rem;
+		color: var(--color-text-secondary);
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
 	}
 
 	.status-banner {
-		@apply flex items-center gap-2 px-4 py-3 rounded-lg;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.75rem;
+		padding-bottom: 0.75rem;
+		border-radius: 0.5rem;
 	}
 
 	.status-banner.success {
-		@apply bg-green-950/50 border border-green-900/50 text-green-300;
+		background-color: rgb(20 83 45 / 0.5);
+		border: 1px solid rgb(21 128 61 / 0.5);
+		color: rgb(134 239 172);
 	}
 
 	.status-banner.error {
-		@apply bg-red-950/50 border border-red-900/50 text-red-300;
+		background-color: rgb(127 29 29 / 0.5);
+		border: 1px solid rgb(185 28 28 / 0.5);
+		color: rgb(253 186 116);
 	}
 
 	.editor-container {
-		@apply flex flex-col bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg overflow-hidden;
+		display: flex;
+		flex-direction: column;
+		background-color: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: 0.5rem;
+		overflow: hidden;
 	}
 
 	.config-textarea {
-		@apply w-full h-96 px-4 py-3 bg-[var(--color-bg-secondary)] text-[var(--color-text-primary)] font-mono text-sm resize-y focus:outline-none focus:ring-2 focus:ring-[var(--color-accent-primary)]/50;
+		width: 100%;
+		height: 24rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.75rem;
+		padding-bottom: 0.75rem;
+		background-color: var(--color-bg-secondary);
+		color: var(--color-text-primary);
+		font-family: ui-monospace, monospace;
+		font-size: 0.875rem;
+		resize: vertical;
+	}
+
+	.config-textarea:focus {
+		outline: none;
+		box-shadow: 0 0 0 2px rgb(var(--color-accent-primary) / 0.5);
 	}
 
 	.config-textarea.readonly {
-		@apply text-[var(--color-text-secondary)] cursor-default;
+		color: var(--color-text-secondary);
+		cursor: default;
 	}
 
 	.action-bar {
-		@apply flex items-center justify-between px-4 py-3 border-t border-[var(--color-border)] bg-[var(--color-bg-tertiary)];
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.75rem;
+		padding-bottom: 0.75rem;
+		border-top: 1px solid var(--color-border);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.editor-info {
-		@apply flex items-center gap-3 text-sm text-[var(--color-text-secondary)];
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		font-size: 0.875rem;
+		color: var(--color-text-secondary);
 	}
 
 	.char-count {
-		@apply text-[var(--color-text-muted)];
+		color: var(--color-text-muted);
 	}
 
 	.empty-hint {
-		@apply italic text-[var(--color-text-muted)];
+		font-style: italic;
+		color: var(--color-text-muted);
 	}
 
 	.save-btn {
-		@apply flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--color-accent-primary)] text-white text-sm font-medium hover:bg-[var(--color-accent-hover)] disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-accent-primary);
+		color: white;
+		font-size: 0.875rem;
+		font-weight: 500;
+		transition: all 0.2s ease-in-out;
+	}
+
+	.save-btn:hover {
+		background-color: var(--color-accent-hover);
 	}
 
 	.save-btn:disabled {
-		@apply opacity-50 cursor-not-allowed;
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.spinner {
-		@apply w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin;
+		width: 1rem;
+		height: 1rem;
+		border-radius: 9999px;
+		border: 2px solid rgb(255 255 255 / 0.3);
+		border-top-color: white;
+		animation: spin 1s linear infinite;
+	}
+
+	@keyframes spin {
+		from {
+			transform: rotate(0deg);
+		}
+		to {
+			transform: rotate(360deg);
+		}
 	}
 </style>

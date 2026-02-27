@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "velor",
+  "productName": "Velor",
   "version": "0.1.0",
   "identifier": "com.veloxide.velor",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "velor",
+        "title": "Velor",
         "width": 800,
         "height": 600
       }

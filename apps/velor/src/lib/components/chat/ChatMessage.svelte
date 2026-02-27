@@ -38,17 +38,42 @@
 			await navigator.clipboard.writeText(event.output);
 		}
 	}
+
+	// Get status badge class based on state
+	function getStatusBadgeClass(state: string): string {
+		switch (state) {
+			case 'pending':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-gray-700 text-gray-300';
+			case 'rendering':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-blue-900/50 text-blue-300';
+			case 'running':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-primary text-white';
+			case 'retrying':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-orange-900/50 text-orange-300';
+			case 'completed':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-green-900/50 text-green-300';
+			case 'failed':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-red-900/50 text-red-300';
+			case 'cancelled':
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-gray-700 text-gray-300';
+			default:
+				return 'px-2 py-0.5 rounded text-xs font-medium uppercase bg-gray-700 text-gray-300';
+		}
+	}
 </script>
 
 {#if messageType === 'output'}
-	<div class="message message-output">
-		<div class="message-content">
-			<div class="output-text">{event.output}</div>
-			<div class="message-meta">
-				<span class="timestamp">{formattedTime()}</span>
+	<div class="flex gap-3 py-2 px-4 rounded-lg bg-card">
+		<div class="flex-1 min-w-0">
+			<div class="text-foreground whitespace-pre-wrap break-words font-mono text-sm leading-relaxed"
+			>
+				{event.output}
+			</div>
+			<div class="flex items-center justify-between mt-2 gap-4">
+				<span class="text-xs text-muted-foreground">{formattedTime()}</span>
 				{#if event.output}
 					<button
-						class="copy-btn"
+						class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-muted-foreground transition-colors"
 						onclick={copyOutput}
 						title="Copy to clipboard"
 						aria-label="Copy to clipboard"
@@ -60,179 +85,67 @@
 		</div>
 	</div>
 {:else if messageType === 'error'}
-	<div class="message message-error">
-		<div class="message-icon error-icon">
+	<div class="flex gap-3 py-2 px-4 rounded-lg bg-red-950/50 border border-red-900/50">
+		<div class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center mt-0.5 bg-red-900/50 text-red-400">
 			<AlertCircle size={16} />
 		</div>
-		<div class="message-content">
-			<div class="error-text">{event.error || 'An error occurred'}</div>
-			<div class="message-meta">
-				<span class="timestamp">{formattedTime()}</span>
+		<div class="flex-1 min-w-0">
+			<div class="text-red-300 whitespace-pre-wrap break-words font-mono text-sm"
+			>
+				{event.error || 'An error occurred'}
+			</div>
+			<div class="flex items-center justify-between mt-2 gap-4">
+				<span class="text-xs text-muted-foreground">{formattedTime()}</span>
 			</div>
 		</div>
 	</div>
 {:else if messageType === 'status'}
-	<div class="message message-status">
-		<div class="message-icon status-icon" class:spinning={isStreaming}>
+	<div class="flex gap-3 py-2 px-4 rounded-lg bg-muted opacity-75">
+		<div
+			class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center mt-0.5 bg-[var(--color-accent-light)] text-primary {isStreaming
+				? 'animate-spin'
+				: ''}"
+		>
 			{#if isStreaming}
 				<Loader2 size={16} />
 			{:else}
 				<Check size={16} />
 			{/if}
 		</div>
-		<div class="message-content">
+		<div class="flex-1 min-w-0">
 			{#if event.state}
-				<div class="status-text">
-					Status: <span class="status-badge status-{event.state}">{event.state}</span>
+				<div class="text-sm text-muted-foreground">
+					Status: <span class={getStatusBadgeClass(event.state)}>{event.state}</span>
 				</div>
 			{/if}
 			{#if event.iteration !== undefined}
-				<div class="iteration-text">Iteration {event.iteration}</div>
+				<div class="text-sm text-muted-foreground">Iteration {event.iteration}</div>
 			{/if}
 			{#if event.metrics}
-				<div class="metrics-text">
-					<span class="metric">Retry: {event.metrics.retries}</span>
-					<span class="metric">{event.metrics.output_chars} chars</span>
-					<span class="metric">{(event.metrics.duration_ms / 1000).toFixed(1)}s</span>
+				<div class="text-sm text-muted-foreground flex gap-3 mt-1">
+					<span class="text-xs text-muted-foreground">Retry: {event.metrics.retries}</span>
+					<span class="text-xs text-muted-foreground">{event.metrics.output_chars} chars</span>
+					<span class="text-xs text-muted-foreground">{(event.metrics.duration_ms / 1000).toFixed(1)}s</span>
 				</div>
 			{/if}
-			<div class="message-meta">
-				<span class="timestamp">{formattedTime()}</span>
+			<div class="flex items-center justify-between mt-2 gap-4">
+				<span class="text-xs text-muted-foreground">{formattedTime()}</span>
 			</div>
 		</div>
 	</div>
 {:else}
-	<div class="message message-info">
-		<div class="message-content">
-			<div class="info-text">
+	<div class="text-center text-sm text-muted-foreground py-2 px-4">
+		<div class="flex-1 min-w-0">
+			<div class="text-sm text-muted-foreground">
 				{#if event.event_type === ExecutionEventType.IterationCompleted}
 					Iteration {event.iteration} completed
 				{:else}
 					{event.event_type}
 				{/if}
 			</div>
-			<div class="message-meta">
-				<span class="timestamp">{formattedTime()}</span>
+			<div class="flex items-center justify-between mt-2 gap-4">
+				<span class="text-xs text-muted-foreground">{formattedTime()}</span>
 			</div>
 		</div>
 	</div>
 {/if}
-
-<style>
-	.message {
-		@apply flex gap-3 py-2 px-4 rounded-lg;
-	}
-
-	.message-output {
-		@apply bg-[var(--color-bg-secondary)];
-	}
-
-	.message-error {
-		@apply bg-red-950/50 border border-red-900/50;
-	}
-
-	.message-status {
-		@apply bg-[var(--color-bg-tertiary)] opacity-75;
-	}
-
-	.message-info {
-		@apply text-center text-sm text-[var(--color-text-muted)];
-	}
-
-	.message-icon {
-		@apply flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center mt-0.5;
-	}
-
-	.error-icon {
-		@apply bg-red-900/50 text-red-400;
-	}
-
-	.status-icon {
-		@apply bg-[var(--color-accent-light)] text-[var(--color-accent-primary)];
-	}
-
-	.message-content {
-		@apply flex-1 min-w-0;
-	}
-
-	.output-text {
-		@apply text-[var(--color-text-primary)] whitespace-pre-wrap break-words font-mono text-sm leading-relaxed;
-	}
-
-	.error-text {
-		@apply text-red-300 whitespace-pre-wrap break-words font-mono text-sm;
-	}
-
-	.status-text,
-	.iteration-text,
-	.metrics-text,
-	.info-text {
-		@apply text-sm text-[var(--color-text-secondary)];
-	}
-
-	.status-badge {
-		@apply px-2 py-0.5 rounded text-xs font-medium uppercase;
-	}
-
-	.status-badge.status-pending {
-		@apply bg-gray-700 text-gray-300;
-	}
-
-	.status-badge.status-rendering {
-		@apply bg-blue-900/50 text-blue-300;
-	}
-
-	.status-badge.status-running {
-		@apply bg-[var(--color-accent-primary)] text-white;
-	}
-
-	.status-badge.status-retrying {
-		@apply bg-orange-900/50 text-orange-300;
-	}
-
-	.status-badge.status-completed {
-		@apply bg-green-900/50 text-green-300;
-	}
-
-	.status-badge.status-failed {
-		@apply bg-red-900/50 text-red-300;
-	}
-
-	.status-badge.status-cancelled {
-		@apply bg-gray-700 text-gray-300;
-	}
-
-	.metrics-text {
-		@apply flex gap-3 mt-1;
-	}
-
-	.metric {
-		@apply text-xs text-[var(--color-text-muted)];
-	}
-
-	.message-meta {
-		@apply flex items-center justify-between mt-2 gap-4;
-	}
-
-	.timestamp {
-		@apply text-xs text-[var(--color-text-muted)];
-	}
-
-	.copy-btn {
-		@apply p-1 rounded hover:bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] transition-colors;
-	}
-
-	/* Spinning animation for loading state */
-	.spinning {
-		animation: spin 1s linear infinite;
-	}
-
-	@keyframes spin {
-		from {
-			transform: rotate(0deg);
-		}
-		to {
-			transform: rotate(360deg);
-		}
-	}
-</style>

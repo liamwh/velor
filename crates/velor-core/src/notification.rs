@@ -201,15 +201,25 @@ impl TelegramNotifier {
 
         let response = self
             .http_client
-            .post(url)
+            .post(url.clone())
             .json(&body)
             .send()
-            .wrap_err("failed to send Telegram notification request")?;
+            .wrap_err_with(|| {
+                format!(
+                    "failed to send Telegram notification request to chat {} (API URL: {})",
+                    self.chat_id, url
+                )
+            })?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            return Err(eyre!("Telegram API returned error {}: {}", status, body));
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unable to read response body>".to_string());
+            return Err(eyre!(
+                "Telegram API returned error {status} for chat {}: {body}",
+                self.chat_id
+            ));
         }
 
         Ok(())
@@ -272,7 +282,13 @@ impl MacOSNotifier {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(eyre!("osascript failed: {}", stderr));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(eyre!(
+                "macOS notification via osascript failed (exit code: {}): stderr={}, stdout={}",
+                output.status.code().unwrap_or(-1),
+                stderr,
+                stdout
+            ));
         }
 
         Ok(())

@@ -4,6 +4,7 @@
 //! from a given working directory.
 
 use std::path::Path;
+use tracing::trace;
 
 /// Discovers the git repository root from the current working directory.
 ///
@@ -22,6 +23,33 @@ pub fn discover_git_root(cwd: &Path) -> color_eyre::eyre::Result<std::path::Path
         return Ok(root);
     }
     Ok(cwd.to_path_buf())
+}
+
+/// Loads environment variables from a `.env` file in the git repository root.
+///
+/// This function looks for a `.env` file in the specified git root directory
+/// and loads its contents into the process environment. If the file doesn't
+/// exist, it silently succeeds (no error).
+///
+/// # Errors
+///
+/// Returns an error if the `.env` file exists but cannot be read or parsed.
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
+pub fn load_dotenv_from_git_root(git_root: &Path) -> color_eyre::eyre::Result<()> {
+    let dotenv_path = git_root.join(".env");
+
+    if !dotenv_path.exists() {
+        trace!("No .env file found at {}, skipping", dotenv_path.display());
+        return Ok(());
+    }
+
+    trace!("Loading .env from {}", dotenv_path.display());
+    dotenvy::from_path(&dotenv_path).map_err(|e| {
+        color_eyre::eyre::eyre!("failed to load .env from {}: {}", dotenv_path.display(), e)
+    })?;
+    trace!("Loaded .env from {}", dotenv_path.display());
+
+    Ok(())
 }
 
 /// Tests if a path contains a `.git` directory (used for testing).

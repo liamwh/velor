@@ -175,8 +175,10 @@
 	}
 </script>
 
-<div class="editor-overlay" onclick={onCancel}>
-	<div class="editor-dialog" onclick={(e) => e.stopPropagation()}>
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="editor-overlay" onclick={onCancel} onkeydown={(e) => e.key === 'Escape' && onCancel?.()}>
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="editor-dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
 		<!-- Header -->
 		<div class="editor-header">
 			<h2>{isEdit ? 'Edit Automation' : 'Create Automation'}</h2>
@@ -220,7 +222,7 @@
 					class="form-textarea"
 					placeholder="What does this automation do?"
 					rows="2"
-				/>
+				></textarea>
 			</div>
 
 			<!-- Prompt -->
@@ -294,7 +296,7 @@
 			<!-- Variables -->
 			<div class="form-group">
 				<div class="vars-header">
-					<label>Template Variables</label>
+					<span class="vars-label">Template Variables</span>
 					<button class="btn-small" onclick={addVar}>
 						<Plus size={14} />
 						<span>Add</span>
@@ -345,7 +347,7 @@
 			<button class="btn-secondary" onclick={onCancel} disabled={isSaving}>Cancel</button>
 			<button class="btn-primary" onclick={handleSave} disabled={isSaving}>
 				{#if isSaving}
-					<Clock size={16} class="spinning" />
+					<span class="spinning"><Clock size={16} /></span>
 				{:else}
 					<Save size={16} />
 				{/if}
@@ -357,163 +359,336 @@
 
 <style>
 	.editor-overlay {
-		@apply fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4;
+		position: fixed;
+		inset: 0;
+		z-index: 50;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background-color: rgb(0 0 0 / 0.6);
+		backdrop-filter: blur(4px);
+		padding: 1rem;
 	}
 
 	.editor-dialog {
-		@apply w-full max-w-2xl max-h-[90vh] flex flex-col bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-xl;
+		width: 100%;
+		max-width: 42rem;
+		max-height: 90vh;
+		display: flex;
+		flex-direction: column;
+		background-color: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: 0.5rem;
+		box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
 	}
 
 	.editor-header {
-		@apply flex items-center justify-between px-6 py-4 border-b border-[var(--color-border)];
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding-left: 1.5rem;
+		padding-right: 1.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+		border-bottom: 1px solid var(--color-border);
 	}
 
 	.editor-header h2 {
-		@apply text-lg font-semibold text-[var(--color-text-primary)];
+		font-size: 1.125rem;
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.close-btn {
-		@apply p-1 rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all;
+		padding: 0.25rem;
+		border-radius: 0.25rem;
+		color: var(--color-text-secondary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.close-btn:hover {
+		color: var(--color-text-primary);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.editor-body {
-		@apply flex-1 overflow-y-auto px-6 py-4 space-y-4;
+		flex: 1;
+		overflow-y: auto;
+		padding-left: 1.5rem;
+		padding-right: 1.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
 	}
 
 	.error-banner {
-		@apply flex items-center gap-2 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-300 text-sm;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0.75rem;
+		background-color: rgb(127 29 29 / 0.5);
+		border: 1px solid rgb(185 28 28 / 0.5);
+		border-radius: 0.5rem;
+		color: rgb(253 186 116);
+		font-size: 0.875rem;
 	}
 
 	.error-icon {
-		@apply text-lg;
+		font-size: 1.125rem;
 	}
 
 	.error-text {
-		@apply flex-1;
+		flex: 1;
 	}
 
 	.form-group {
-		@apply space-y-1.5;
+		display: flex;
+		flex-direction: column;
+		gap: 0.375rem;
 	}
 
 	.form-group label {
-		@apply block text-sm font-medium text-[var(--color-text-secondary)];
+		display: block;
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-secondary);
 	}
 
 	.form-input,
 	.form-select,
 	.form-textarea {
-		@apply w-full px-3 py-2 bg-[var(--color-bg-primary)] border border-[var(--color-border)] rounded-lg text-[var(--color-text-primary)] placeholder-[var(--color-text-muted)] transition-all;
+		width: 100%;
+		padding-left: 0.75rem;
+		padding-right: 0.75rem;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		background-color: var(--color-bg-primary);
+		border: 1px solid var(--color-border);
+		border-radius: 0.5rem;
+		color: var(--color-text-primary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.form-input::placeholder,
+	.form-textarea::placeholder {
+		color: var(--color-text-muted);
 	}
 
 	.form-input:focus,
 	.form-select:focus,
 	.form-textarea:focus {
-		@apply outline-none border-[var(--color-accent-primary)] ring-1 ring-[var(--color-accent-primary)];
+		outline: none;
+		border-color: var(--color-accent-primary);
+		box-shadow: 0 0 0 1px var(--color-accent-primary);
 	}
 
 	.form-input.invalid,
 	.form-select.invalid {
-		@apply border-red-500;
+		border-color: rgb(239 68 68);
 	}
 
 	.form-textarea {
-		@apply resize-none;
-	}
-
-	.form-text {
-		@apply text-xs text-[var(--color-text-muted)];
+		resize: none;
 	}
 
 	.error-text {
-		@apply text-xs text-red-400;
+		font-size: 0.75rem;
+		color: rgb(248 113 113);
 	}
 
 	.help-text {
-		@apply text-xs text-[var(--color-text-muted)];
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
 	}
 
 	.help-text code {
-		@apply px-1 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-accent-primary)] font-mono;
+		padding-left: 0.25rem;
+		padding-right: 0.25rem;
+		padding-top: 0.125rem;
+		padding-bottom: 0.125rem;
+		border-radius: 0.25rem;
+		background-color: var(--color-bg-tertiary);
+		color: var(--color-accent-primary);
+		font-family: ui-monospace, monospace;
 	}
 
 	.schedule-inputs {
-		@apply flex gap-2;
+		display: flex;
+		gap: 0.5rem;
 	}
 
 	.schedule-inputs .form-input {
-		@apply flex-1;
+		flex: 1;
 	}
 
 	.preset-select {
-		@apply w-48;
+		width: 12rem;
 	}
 
 	.vars-header {
-		@apply flex items-center justify-between;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.vars-label {
+		display: block;
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--color-text-secondary);
 	}
 
 	.vars-list {
-		@apply space-y-2;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
 	}
 
 	.var-row {
-		@apply flex items-center gap-2;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 
 	.var-key {
-		@apply flex-1 font-mono text-sm;
+		flex: 1;
+		font-family: ui-monospace, monospace;
+		font-size: 0.875rem;
 	}
 
 	.var-separator {
-		@apply text-[var(--color-text-muted)];
+		color: var(--color-text-muted);
 	}
 
 	.var-value {
-		@apply flex-[2] font-mono text-sm;
+		flex: 2;
+		font-family: ui-monospace, monospace;
+		font-size: 0.875rem;
 	}
 
 	.btn-small {
-		@apply flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-border)] transition-all;
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+		padding-left: 0.5rem;
+		padding-right: 0.5rem;
+		padding-top: 0.25rem;
+		padding-bottom: 0.25rem;
+		border-radius: 0.25rem;
+		font-size: 0.75rem;
+		font-weight: 500;
+		background-color: var(--color-bg-tertiary);
+		color: var(--color-text-secondary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.btn-small:hover {
+		color: var(--color-text-primary);
+		background-color: var(--color-border);
 	}
 
 	.btn-icon {
-		@apply p-1 rounded text-[var(--color-text-secondary)] hover:text-red-400 hover:bg-[var(--color-bg-tertiary)] transition-all;
+		padding: 0.25rem;
+		border-radius: 0.25rem;
+		color: var(--color-text-secondary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.btn-icon:hover {
+		color: rgb(248 113 113);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.empty-vars {
-		@apply flex flex-col items-center gap-2 py-4 text-center text-[var(--color-text-muted)];
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+		text-align: center;
+		color: var(--color-text-muted);
 	}
 
 	.empty-vars p {
-		@apply text-sm;
+		font-size: 0.875rem;
 	}
 
 	.toggle-label {
-		@apply flex items-center gap-2 cursor-pointer;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		cursor: pointer;
 	}
 
 	.toggle-checkbox {
-		@apply w-4 h-4 rounded border-[var(--color-border)] bg-[var(--color-bg-primary)] text-[var(--color-accent-primary)] focus:ring-2 focus:ring-[var(--color-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--color-bg-secondary)];
+		width: 1rem;
+		height: 1rem;
+		border-radius: 0.25rem;
+		border: 1px solid var(--color-border);
+		background-color: var(--color-bg-primary);
+		color: var(--color-accent-primary);
+	}
+
+	.toggle-checkbox:focus {
+		box-shadow: 0 0 0 2px var(--color-accent-primary), 0 0 0 4px var(--color-bg-secondary);
 	}
 
 	.editor-footer {
-		@apply flex items-center justify-end gap-2 px-6 py-4 border-t border-[var(--color-border)];
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 0.5rem;
+		padding-left: 1.5rem;
+		padding-right: 1.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+		border-top: 1px solid var(--color-border);
 	}
 
 	.btn-primary,
 	.btn-secondary {
-		@apply flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		border-radius: 0.5rem;
+		font-size: 0.875rem;
+		font-weight: 500;
+		transition: all 0.15s ease-in-out;
+	}
+
+	.btn-primary:disabled,
+	.btn-secondary:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.btn-primary {
-		@apply bg-[var(--color-accent-primary)] text-white hover:bg-[var(--color-accent-hover)];
+		background-color: var(--color-accent-primary);
+		color: white;
+	}
+
+	.btn-primary:hover {
+		background-color: var(--color-accent-hover);
 	}
 
 	.btn-secondary {
-		@apply bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-[var(--color-text-primary)] hover:bg-[var(--color-border)];
+		background-color: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		color: var(--color-text-primary);
 	}
 
+	.btn-secondary:hover {
+		background-color: var(--color-border);
+	}
+
+	/* svelte-ignore css_unused_selector */
 	.spinning {
 		animation: spin 1s linear infinite;
 	}

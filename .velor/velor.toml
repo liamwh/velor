@@ -131,3 +131,8 @@ output_preview_chars = 500
 [notifications.macos]
 enabled = true
 sound = "default"
+
+[notifications.telegram]
+enabled = true
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+chat_id = "-1003873464939"  # e.g., "-1001234567890"

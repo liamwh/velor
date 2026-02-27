@@ -98,10 +98,18 @@
 </script>
 
 {#if hasActions}
-	<div class="execution-controls {compact ? 'compact' : ''} {failed ? 'failed' : ''}">
+	<div
+		class="flex items-center {compact
+			? 'gap-1.5'
+			: 'gap-2'} {failed
+			? 'bg-[var(--color-state-failed-bg)] px-3 py-2 rounded-lg border border-[var(--color-state-failed-border)]'
+			: ''}"
+	>
 		{#if active && onCancel}
 			<button
-				class="control-btn cancel-btn"
+				class="flex items-center justify-center gap-1.5 {compact
+					? 'px-2 py-1.5'
+					: 'px-3 py-2'} rounded-lg text-sm font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed bg-[var(--color-btn-cancel-bg)] text-[var(--color-btn-cancel-text)] hover:bg-[var(--color-btn-cancel-hover)] active:bg-[var(--color-btn-cancel-active)] border border-[var(--color-btn-cancel-border)]"
 				onclick={handleCancel}
 				disabled={loading}
 				title="Cancel execution"
@@ -109,7 +117,7 @@
 			>
 				<X size={compact ? 14 : 16} />
 				{#if !compact}
-					<span>Cancel</span>
+					<span class="hidden sm:inline">Cancel</span>
 				{/if}
 			</button>
 		{/if}
@@ -117,7 +125,9 @@
 		{#if terminal}
 			{#if onRetry}
 				<button
-					class="control-btn retry-btn"
+					class="flex items-center justify-center gap-1.5 {compact
+						? 'px-2 py-1.5'
+						: 'px-3 py-2'} rounded-lg text-sm font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed bg-primary text-white hover:bg-[var(--color-accent-hover)] active:bg-[var(--color-accent-active)]"
 					onclick={handleRetry}
 					disabled={loading}
 					title="Retry execution"
@@ -125,14 +135,16 @@
 				>
 					<RefreshCw size={compact ? 14 : 16} />
 					{#if !compact}
-						<span>Retry</span>
+						<span class="hidden sm:inline">Retry</span>
 					{/if}
 				</button>
 			{/if}
 
 			{#if onClear}
 				<button
-					class="control-btn clear-btn"
+					class="flex items-center justify-center gap-1.5 {compact
+						? 'px-2 py-1.5'
+						: 'px-3 py-2'} rounded-lg text-sm font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed bg-muted text-muted-foreground hover:bg-border active:bg-input border border-border"
 					onclick={handleClear}
 					disabled={loading}
 					title="Clear execution"
@@ -140,7 +152,7 @@
 				>
 					<Trash2 size={compact ? 14 : 16} />
 					{#if !compact}
-						<span>Clear</span>
+						<span class="hidden sm:inline">Clear</span>
 					{/if}
 				</button>
 			{/if}
@@ -148,7 +160,9 @@
 
 		{#if showStart && onStart && !execution}
 			<button
-				class="control-btn start-btn"
+				class="flex items-center justify-center gap-1.5 {compact
+					? 'px-2 py-1.5'
+					: 'px-3 py-2'} rounded-lg text-sm font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed bg-[var(--color-btn-start-bg)] text-[var(--color-btn-start-text)] hover:bg-[var(--color-btn-start-hover)] active:bg-[var(--color-btn-start-active)] border border-[var(--color-btn-start-border)]"
 				onclick={handleStart}
 				disabled={loading}
 				title="Start new execution"
@@ -156,69 +170,17 @@
 			>
 				<Play size={compact ? 14 : 16} />
 				{#if !compact}
-					<span>Start</span>
+					<span class="hidden sm:inline">Start</span>
 				{/if}
 			</button>
 		{/if}
 
 		{#if loading}
-			<div class="loading-indicator">
-				<div class="spinner"></div>
+			<div class="flex items-center justify-center w-8 h-8">
+				<div
+					class="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin"
+				></div>
 			</div>
 		{/if}
 	</div>
 {/if}
-
-<style>
-	.execution-controls {
-		@apply flex items-center gap-2;
-	}
-
-	.execution-controls.compact {
-		@apply gap-1.5;
-	}
-
-	.execution-controls.failed {
-		@apply bg-[var(--color-state-failed-bg)] px-3 py-2 rounded-lg border border-[var(--color-state-failed-border)];
-	}
-
-	.control-btn {
-		@apply flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
-	}
-
-	.execution-controls.compact .control-btn {
-		@apply px-2 py-1.5;
-	}
-
-	.cancel-btn {
-		@apply bg-[var(--color-btn-cancel-bg)] text-[var(--color-btn-cancel-text)] hover:bg-[var(--color-btn-cancel-hover)] active:bg-[var(--color-btn-cancel-active)] border border-[var(--color-btn-cancel-border)];
-	}
-
-	.retry-btn {
-		@apply bg-[var(--color-accent-primary)] text-white hover:bg-[var(--color-accent-hover)] active:bg-[var(--color-accent-active)];
-	}
-
-	.clear-btn {
-		@apply bg-[var(--color-bg-tertiary)] text-[var(--color-text-secondary)] hover:bg-[var(--color-border)] active:bg-[var(--color-border-hover)] border border-[var(--color-border)];
-	}
-
-	.start-btn {
-		@apply bg-[var(--color-btn-start-bg)] text-[var(--color-btn-start-text)] hover:bg-[var(--color-btn-start-hover)] active:bg-[var(--color-btn-start-active)] border border-[var(--color-btn-start-border)];
-	}
-
-	.control-btn span {
-		@apply hidden sm:inline;
-	}
-
-	.execution-controls:not(.compact) .control-btn span {
-		@apply inline;
-	}
-
-	.loading-indicator {
-		@apply flex items-center justify-center w-8 h-8;
-	}
-
-	.spinner {
-		@apply w-4 h-4 border-2 border-[var(--color-accent-primary)] border-t-transparent rounded-full animate-spin;
-	}
-</style>

@@ -46,10 +46,13 @@ lint:
     cargo clippy -- -D warnings
 
 # Run all checks (fmt, clippy, tests)
-check: format-rust lint-rust
+check: format-rust lint-rust lint-typescript
 
 lint-rust:
     cargo clippy --all-targets --all-features --workspace --quiet --no-deps
+
+lint-typescript:
+    cd apps/velor && bunx svelte-kit sync && bunx svelte-check --tsconfig ./tsconfig.json --diagnostic-sources "js,svelte" && bunx eslint .
 
 # Install velor to ~/bin
 install:
@@ -95,6 +98,10 @@ show-prompts:
 # Test notification configuration
 test-notification:
     cargo build -q && ./target/debug/velor test-notification
+
+# Run the Tauri GUI app in dev mode
+tauri-dev:
+    cd apps/velor && bun run tauri dev
 
 # List all justfile recipes
 default:

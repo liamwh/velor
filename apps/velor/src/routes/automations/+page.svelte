@@ -42,12 +42,8 @@
 	}
 </script>
 
-<div class="automations-page">
-	<AutomationList
-		onCreate={handleCreate}
-		onEdit={handleEdit}
-		onViewRuns={handleViewRuns}
-	/>
+<div class="h-full">
+	<AutomationList onCreate={handleCreate} onEdit={handleEdit} onViewRuns={handleViewRuns} />
 
 	{#if showEditor}
 		<AutomationEditor
@@ -64,9 +60,3 @@
 		/>
 	{/if}
 </div>
-
-<style>
-	.automations-page {
-		@apply h-full;
-	}
-</style>

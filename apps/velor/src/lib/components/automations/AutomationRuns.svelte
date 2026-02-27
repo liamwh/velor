@@ -67,8 +67,10 @@
 	}
 </script>
 
-<div class="runs-overlay" onclick={onClose}>
-	<div class="runs-dialog" onclick={(e) => e.stopPropagation()}>
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="runs-overlay" onclick={onClose} onkeydown={(e) => e.key === 'Escape' && onClose?.()}>
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="runs-dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
 		<!-- Header -->
 		<div class="runs-header">
 			<div class="header-content">
@@ -112,6 +114,7 @@
 						<div class="run-card" class:failed={run.status === 'Failed'}>
 							<div class="run-header">
 								<div class="run-status">
+									<!-- svelte-ignore svelte_component_deprecated -->
 									<svelte:component this={getStatusIcon(run.status).icon} size={18} class={getStatusIcon(run.status).class} />
 									<span class="status-label">{getStatusIcon(run.status).label}</span>
 								</div>
@@ -166,148 +169,286 @@
 
 <style>
 	.runs-overlay {
-		@apply fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4;
+		position: fixed;
+		inset: 0;
+		z-index: 50;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background-color: rgb(0 0 0 / 0.6);
+		backdrop-filter: blur(4px);
+		padding: 1rem;
 	}
 
 	.runs-dialog {
-		@apply w-full max-w-2xl max-h-[80vh] flex flex-col bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-xl;
+		width: 100%;
+		max-width: 42rem;
+		max-height: 80vh;
+		display: flex;
+		flex-direction: column;
+		background-color: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: 0.5rem;
+		box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
 	}
 
 	.runs-header {
-		@apply flex items-center justify-between px-6 py-4 border-b border-[var(--color-border)];
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding-left: 1.5rem;
+		padding-right: 1.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
+		border-bottom: 1px solid var(--color-border);
+	}
+
+	.header-content {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
 	}
 
 	.header-content h2 {
-		@apply text-lg font-semibold text-[var(--color-text-primary)];
+		font-size: 1.125rem;
+		font-weight: 600;
+		color: var(--color-text-primary);
 	}
 
 	.automation-name {
-		@apply text-sm text-[var(--color-text-muted)];
+		font-size: 0.875rem;
+		color: var(--color-text-muted);
 	}
 
 	.header-actions {
-		@apply flex items-center gap-1;
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
 	}
 
 	.icon-btn {
-		@apply p-2 rounded text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all;
+		padding: 0.5rem;
+		border-radius: 0.25rem;
+		color: var(--color-text-secondary);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.icon-btn:hover {
+		color: var(--color-text-primary);
+		background-color: var(--color-bg-tertiary);
 	}
 
 	.runs-body {
-		@apply flex-1 overflow-y-auto px-6 py-4;
+		flex: 1;
+		overflow-y: auto;
+		padding-left: 1.5rem;
+		padding-right: 1.5rem;
+		padding-top: 1rem;
+		padding-bottom: 1rem;
 	}
 
 	.error-state,
 	.loading-state,
 	.empty-state {
-		@apply flex flex-col items-center justify-center gap-4 py-12 text-[var(--color-text-muted)];
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 1rem;
+		padding-top: 3rem;
+		padding-bottom: 3rem;
+		color: var(--color-text-muted);
 	}
 
 	.error-state {
-		@apply text-red-400;
+		color: rgb(248 113 113);
 	}
 
 	.spinner {
-		@apply w-8 h-8 border-2 border-[var(--color-border)] border-t-[var(--color-accent-primary)] rounded-full animate-spin;
+		width: 2rem;
+		height: 2rem;
+		border: 2px solid var(--color-border);
+		border-top-color: var(--color-accent-primary);
+		border-radius: 9999px;
+		animation: spin 1s linear infinite;
 	}
 
 	.empty-state h3 {
-		@apply text-lg font-semibold text-[var(--color-text-secondary)];
+		font-size: 1.125rem;
+		font-weight: 600;
+		color: var(--color-text-secondary);
 	}
 
 	.empty-state p {
-		@apply text-sm;
+		font-size: 0.875rem;
 	}
 
 	.runs-list {
-		@apply space-y-3;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
 	}
 
 	.run-card {
-		@apply p-4 rounded-lg bg-[var(--color-bg-primary)] border border-[var(--color-border)] hover:border-[var(--color-border-hover)] transition-all;
+		padding: 1rem;
+		border-radius: 0.5rem;
+		background-color: var(--color-bg-primary);
+		border: 1px solid var(--color-border);
+		transition: all 0.15s ease-in-out;
+	}
+
+	.run-card:hover {
+		border-color: var(--color-border-hover);
 	}
 
 	.run-card.failed {
-		@apply border-red-900/50 bg-red-950/20;
+		border-color: rgb(127 29 29 / 0.5);
+		background-color: rgb(127 29 29 / 0.2);
 	}
 
 	.run-header {
-		@apply flex items-center justify-between mb-3;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 0.75rem;
 	}
 
 	.run-status {
-		@apply flex items-center gap-2;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 
 	.status-label {
-		@apply text-sm font-medium;
+		font-size: 0.875rem;
+		font-weight: 500;
 	}
 
+	/* svelte-ignore css_unused_selector */
 	.status-completed {
-		@apply text-[var(--color-success)];
+		color: var(--color-success);
 	}
 
+	/* svelte-ignore css_unused_selector */
 	.status-failed,
 	.status-cancelled {
-		@apply text-red-400;
+		color: rgb(248 113 113);
 	}
 
+	/* svelte-ignore css_unused_selector */
 	.status-running {
-		@apply text-[var(--color-accent-primary)] animate-pulse;
+		color: var(--color-accent-primary);
+		animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 	}
 
+	/* svelte-ignore css_unused_selector */
 	.status-pending {
-		@apply text-[var(--color-text-muted)];
+		color: var(--color-text-muted);
 	}
 
+	/* svelte-ignore css_unused_selector */
 	.status-unknown {
-		@apply text-[var(--color-warning)];
+		color: var(--color-state-warning-text, oklch(0.75 0.15 45));
+	}
+
+	@keyframes pulse {
+		0%, 100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.5;
+		}
 	}
 
 	.run-time {
-		@apply text-xs text-[var(--color-text-muted)];
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
 	}
 
 	.run-details {
-		@apply grid grid-cols-2 gap-1.5 mb-3;
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.375rem;
+		margin-bottom: 0.75rem;
 	}
 
 	.detail-row {
-		@apply flex items-center justify-between text-sm;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		font-size: 0.875rem;
 	}
 
 	.detail-label {
-		@apply text-[var(--color-text-muted)];
+		color: var(--color-text-muted);
 	}
 
 	.detail-value {
-		@apply text-[var(--color-text-secondary)] font-mono text-xs;
+		color: var(--color-text-secondary);
+		font-family: ui-monospace, monospace;
+		font-size: 0.75rem;
 	}
 
 	.run-error {
-		@apply flex items-start gap-2 p-2 rounded bg-red-950/30 border border-red-900/30 text-red-300 text-sm;
+		display: flex;
+		align-items: flex-start;
+		gap: 0.5rem;
+		padding: 0.5rem;
+		border-radius: 0.25rem;
+		background-color: rgb(127 29 29 / 0.3);
+		border: 1px solid rgb(185 28 28 / 0.3);
+		color: rgb(253 186 116);
+		font-size: 0.875rem;
 	}
 
 	.error-message {
-		@apply flex-1 break-words;
+		flex: 1;
+		overflow-wrap: break-word;
 	}
 
 	.run-output {
-		@apply space-y-1;
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
 	}
 
 	.output-label {
-		@apply text-xs font-medium text-[var(--color-text-muted)];
+		font-size: 0.75rem;
+		font-weight: 500;
+		color: var(--color-text-muted);
 	}
 
 	.output-content {
-		@apply p-2 rounded bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-secondary)] font-mono whitespace-pre-wrap break-words overflow-x-auto;
+		padding: 0.5rem;
+		border-radius: 0.25rem;
+		background-color: var(--color-bg-tertiary);
+		font-size: 0.75rem;
+		color: var(--color-text-secondary);
+		font-family: ui-monospace, monospace;
+		white-space: pre-wrap;
+		overflow-wrap: break-word;
+		overflow-x: auto;
 	}
 
 	.btn-secondary {
-		@apply px-4 py-2 rounded-lg text-sm font-medium bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] text-[var(--color-text-primary)] hover:bg-[var(--color-border)] transition-all;
+		padding-left: 1rem;
+		padding-right: 1rem;
+		padding-top: 0.5rem;
+		padding-bottom: 0.5rem;
+		border-radius: 0.5rem;
+		font-size: 0.875rem;
+		font-weight: 500;
+		background-color: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		color: var(--color-text-primary);
+		transition: all 0.15s ease-in-out;
 	}
 
+	.btn-secondary:hover {
+		background-color: var(--color-border);
+	}
+
+	/* svelte-ignore css_unused_selector */
 	.spinning {
 		animation: spin 1s linear infinite;
 	}
