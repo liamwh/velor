@@ -26,14 +26,24 @@ use crate::state::AppState;
 pub type CommandResult<T> = Result<T, String>;
 
 /// Configuration response with merged, home, and repo configs.
+///
+/// Both the parsed config objects and pre-serialized TOML strings are provided.
+/// The TOML strings should be used for display purposes to ensure proper
+/// serialization of nested structures.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigResponse {
     /// The merged (effective) configuration.
     pub merged: FileConfig,
+    /// Pre-serialized TOML for the merged config.
+    pub merged_toml: String,
     /// The home configuration (from ~/.velor/velor.toml).
     pub home: Option<FileConfig>,
+    /// Pre-serialized TOML for the home config.
+    pub home_toml: Option<String>,
     /// The repo configuration (from {git_root}/.velor/velor.toml).
     pub repo: Option<FileConfig>,
+    /// Pre-serialized TOML for the repo config.
+    pub repo_toml: Option<String>,
 }
 
 /// Execution status response.
@@ -148,7 +158,8 @@ fn event_timestamp(event: &ExecutionEvent) -> chrono::DateTime<chrono::Utc> {
 /// Returns the merged configuration along with home and repo configs separately.
 ///
 /// This allows the frontend to display the effective config while also showing
-/// which values come from which source.
+/// which values come from which source. TOML strings are pre-serialized by the
+/// backend to ensure proper handling of nested structures.
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
 pub async fn get_config(state: State<'_, Arc<AppState>>) -> CommandResult<ConfigResponse> {
@@ -156,21 +167,58 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> CommandResult<Config
     let home = state.home_config().await;
     let repo = state.repo_config().await;
 
-    Ok(ConfigResponse { merged, home, repo })
+    // Serialize configs to TOML strings for display
+    let merged_toml = toml::to_string_pretty(&merged)
+        .map_err(|e| format!("Failed to serialize merged config to TOML: {e}"))?;
+    let home_toml = home
+        .as_ref()
+        .map(toml::to_string_pretty)
+        .transpose()
+        .map_err(|e| format!("Failed to serialize home config to TOML: {e}"))?;
+    let repo_toml = repo
+        .as_ref()
+        .map(toml::to_string_pretty)
+        .transpose()
+        .map_err(|e| format!("Failed to serialize repo config to TOML: {e}"))?;
+
+    Ok(ConfigResponse {
+        merged,
+        merged_toml,
+        home,
+        home_toml,
+        repo,
+        repo_toml,
+    })
 }
 
-/// Returns only the home configuration.
+/// Returns only the home configuration as a TOML string.
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
-pub async fn get_home_config(state: State<'_, Arc<AppState>>) -> CommandResult<Option<FileConfig>> {
-    Ok(state.home_config().await)
+pub async fn get_home_config(state: State<'_, Arc<AppState>>) -> CommandResult<Option<String>> {
+    let config = state.home_config().await;
+    match config {
+        Some(c) => {
+            let toml = toml::to_string_pretty(&c)
+                .map_err(|e| format!("Failed to serialize home config to TOML: {e}"))?;
+            Ok(Some(toml))
+        }
+        None => Ok(None),
+    }
 }
 
-/// Returns only the repo configuration.
+/// Returns only the repo configuration as a TOML string.
 #[tauri::command]
 #[instrument(skip(state), level = "debug")]
-pub async fn get_repo_config(state: State<'_, Arc<AppState>>) -> CommandResult<Option<FileConfig>> {
-    Ok(state.repo_config().await)
+pub async fn get_repo_config(state: State<'_, Arc<AppState>>) -> CommandResult<Option<String>> {
+    let config = state.repo_config().await;
+    match config {
+        Some(c) => {
+            let toml = toml::to_string_pretty(&c)
+                .map_err(|e| format!("Failed to serialize repo config to TOML: {e}"))?;
+            Ok(Some(toml))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Saves configuration to the specified path.
@@ -1221,14 +1269,95 @@ mod tests {
 
     #[test]
     fn test_config_response_serialization() {
+        let merged = FileConfig::default();
+        let merged_toml = toml::to_string_pretty(&merged).expect("default config should serialize");
         let response = ConfigResponse {
-            merged: FileConfig::default(),
+            merged,
+            merged_toml,
             home: None,
+            home_toml: None,
             repo: None,
+            repo_toml: None,
         };
 
         let json = serde_json::to_string(&response);
         assert!(json.is_ok(), "ConfigResponse should serialize to JSON");
+    }
+
+    /// Tests that TOML serialization handles nested structures correctly.
+    ///
+    /// This test verifies the fix for the "[object Object]" bug where the
+    /// frontend's custom tomlStringify function couldn't handle deeply nested
+    /// objects like the `prompts` section.
+    #[test]
+    fn test_toml_serialization_handles_nested_structures() {
+        use velor_core::PromptDef;
+
+        // Create a config with nested structures
+        let mut prompts = BTreeMap::new();
+        prompts.insert(
+            "test-prompt".to_string(),
+            PromptDef::Table {
+                template: "Hello {{name}}".to_string(),
+                complete_token: Some("<DONE>".to_string()),
+            },
+        );
+        prompts.insert(
+            "another-prompt".to_string(),
+            PromptDef::Inline("Goodbye {{name}}".to_string()),
+        );
+
+        let config = FileConfig {
+            vars: {
+                let mut vars = BTreeMap::new();
+                vars.insert("name".to_string(), "world".to_string());
+                vars
+            },
+            prompts,
+            ..FileConfig::default()
+        };
+
+        // Serialize to TOML
+        let toml_string = toml::to_string_pretty(&config);
+        assert!(toml_string.is_ok(), "Config should serialize to TOML");
+
+        let toml = toml_string.unwrap();
+
+        // Verify nested structures are properly serialized
+        assert!(
+            toml.contains("[prompts.test-prompt]"),
+            "TOML should contain nested prompt section"
+        );
+        assert!(
+            toml.contains("template = \"Hello {{name}}\""),
+            "TOML should contain prompt template"
+        );
+        assert!(
+            toml.contains("complete_token = \"<DONE>\""),
+            "TOML should contain complete_token"
+        );
+        assert!(
+            !toml.contains("[object Object]"),
+            "TOML should not contain '[object Object]'"
+        );
+
+        // Verify we can deserialize back
+        let deserialized: Result<FileConfig, _> = toml::from_str(&toml);
+        assert!(
+            deserialized.is_ok(),
+            "TOML should deserialize back to FileConfig"
+        );
+        let deserialized = deserialized.unwrap();
+        assert_eq!(
+            deserialized.prompts.len(),
+            2,
+            "Deserialized config should have 2 prompts"
+        );
+        assert_eq!(
+            deserialized.prompts["test-prompt"].template(),
+            "Hello {{name}}",
+            "Deserialized prompt template should match"
+        );
     }
 
     #[test]

@@ -132,13 +132,17 @@ export interface VelorConfig {
  */
 export interface ConfigResponse {
 	/** Merged effective configuration */
-	config: VelorConfig;
+	merged: VelorConfig;
+	/** Pre-serialized TOML for the merged config */
+	merged_toml: string;
 	/** Home directory config */
-	home_config?: VelorConfig;
+	home?: VelorConfig;
+	/** Pre-serialized TOML for the home config */
+	home_toml?: string;
 	/** Repository config */
-	repo_config?: VelorConfig;
-	/** Git root path */
-	git_root?: string;
+	repo?: VelorConfig;
+	/** Pre-serialized TOML for the repo config */
+	repo_toml?: string;
 }
 
 /**

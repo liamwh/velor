@@ -11,6 +11,7 @@ import * as tauri from "$lib/services/tauri";
  */
 interface ConfigState {
 	config: VelorConfig | null;
+	configToml: string | null;
 	homeConfig: string | null;
 	repoConfig: string | null;
 	gitRoot: string | null;
@@ -24,6 +25,7 @@ interface ConfigState {
 function createConfigStore() {
 	const { subscribe, update } = writable<ConfigState>({
 		config: null,
+		configToml: null,
 		homeConfig: null,
 		repoConfig: null,
 		gitRoot: null,
@@ -37,17 +39,14 @@ function createConfigStore() {
 	async function load(): Promise<void> {
 		update((state) => ({ ...state, loading: true, error: null }));
 		try {
-			const [configResponse, homeConfig, repoConfig] = await Promise.all([
-				tauri.getConfig(),
-				tauri.getHomeConfig().catch(() => ""),
-				tauri.getRepoConfig().catch(() => ""),
-			]);
+			const configResponse = await tauri.getConfig();
 			update((state) => ({
 				...state,
-				config: configResponse.config,
-				homeConfig: homeConfig || null,
-				repoConfig: repoConfig || null,
-				gitRoot: configResponse.git_root || null,
+				config: configResponse.merged,
+				configToml: configResponse.merged_toml,
+				homeConfig: configResponse.home_toml || null,
+				repoConfig: configResponse.repo_toml || null,
+				gitRoot: null,
 				loading: false,
 			}));
 		} catch (e) {
@@ -91,6 +90,7 @@ export const configStore = createConfigStore();
  * Derived stores for convenience
  */
 export const config = derived(configStore, ($store) => $store.config);
+export const configToml = derived(configStore, ($store) => $store.configToml);
 export const homeConfig = derived(configStore, ($store) => $store.homeConfig);
 export const repoConfig = derived(configStore, ($store) => $store.repoConfig);
 export const gitRoot = derived(configStore, ($store) => $store.gitRoot);

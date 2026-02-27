@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { configStore, homeConfig, repoConfig, config } from '$lib/stores';
+	import { configStore, homeConfig, repoConfig, configToml } from '$lib/stores';
 	import type { ConfigFileType } from '$lib/types';
 	import { FileText, Globe, Folder, Save, Check, AlertCircle } from 'lucide-svelte';
 
@@ -21,8 +21,8 @@
 
 	// Update editor content when tab changes
 	$effect(() => {
-		if (activeTab === 'effective' && $config) {
-			editorContent = tomlStringify($config);
+		if (activeTab === 'effective' && $configToml) {
+			editorContent = $configToml;
 		} else if (activeTab === 'home' && $homeConfig) {
 			editorContent = $homeConfig;
 		} else if (activeTab === 'project' && $repoConfig) {
@@ -69,67 +69,6 @@
 		const target = event.target as HTMLTextAreaElement;
 		editorContent = target.value;
 		setSaveStatus('none', '');
-	}
-
-	// Simple TOML stringify for display (basic implementation)
-	function tomlStringify(obj: unknown): string {
-		const lines: string[] = [];
-		const objVal = obj as Record<string, unknown>;
-
-		for (const [key, value] of Object.entries(objVal)) {
-			if (key.startsWith('_')) continue; // Skip internal keys
-
-			if (value === null || value === undefined) {
-				continue;
-			}
-
-			if (typeof value === 'string') {
-				lines.push(`${key} = ${JSON.stringify(value)}`);
-			} else if (typeof value === 'number') {
-				lines.push(`${key} = ${value}`);
-			} else if (typeof value === 'boolean') {
-				lines.push(`${key} = ${value}`);
-			} else if (Array.isArray(value)) {
-				lines.push(`${key} = [`);
-				for (const item of value) {
-					if (typeof item === 'string') {
-						lines.push(`  ${JSON.stringify(item)},`);
-					} else {
-						lines.push(`  ${JSON.stringify(item)},`);
-					}
-				}
-				lines.push(`]`);
-			} else if (typeof value === 'object') {
-				lines.push(``);
-				lines.push(`[${key}]`);
-				for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-					if (v === null || v === undefined) continue;
-					if (typeof v === 'string') {
-						lines.push(`${k} = ${JSON.stringify(v)}`);
-					} else if (typeof v === 'number') {
-						lines.push(`${k} = ${v}`);
-					} else if (typeof v === 'boolean') {
-						lines.push(`${k} = ${v}`);
-					} else if (typeof v === 'object') {
-						// Nested object
-						lines.push(``);
-						lines.push(`[${k}]`);
-						for (const [nk, nv] of Object.entries(v as Record<string, unknown>)) {
-							if (nv === null || nv === undefined) continue;
-							if (typeof nv === 'string') {
-								lines.push(`${nk} = ${JSON.stringify(nv)}`);
-							} else if (typeof nv === 'number') {
-								lines.push(`${nk} = ${nv}`);
-							} else if (typeof nv === 'boolean') {
-								lines.push(`${nk} = ${nv}`);
-							}
-						}
-					}
-				}
-			}
-		}
-
-		return lines.join('\n');
 	}
 
 	const currentTab = $derived(tabs.find((t) => t.id === activeTab));
