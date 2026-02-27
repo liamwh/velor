@@ -1,31 +1,98 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
-	import { page } from '$app/stores';
-	import { automationsStore, daemonRunning } from '$lib/stores';
-	import { EVENT_SERVICE } from '$lib/services/events';
-	import {
-		Home,
-		Calendar,
-		Plus,
-		Settings,
-		Power,
-		PowerOff,
-		History,
-		Play
-	} from 'lucide-svelte';
+	import { onMount } from "svelte";
+	import { SvelteMap } from "svelte/reactivity";
+	import { goto } from "$app/navigation";
+	import * as Sidebar from "$lib/components/ui/sidebar/index.js";
+	import { SidebarRail } from "$lib/components/ui/sidebar/index.js";
+	import SidebarHeader from "$lib/components/sidebar/SidebarHeader.svelte";
+	import ProjectGroup from "$lib/components/sidebar/ProjectGroup.svelte";
+	import { sessionsStore, projects, projectsStore, automationsStore, daemonRunning } from "$lib/stores";
+	import { EVENT_SERVICE } from "$lib/services/events";
+	import type { ExecutionRecord } from "$lib/types";
+	import { Settings, Power, PowerOff } from "lucide-svelte";
 
-	// Listen for daemon events from backend
-	onMount(async () => {
-		await EVENT_SERVICE.onDaemonStarted(({ running }) => {
-			automationsStore.setDaemonRunning(running);
+	/** Track grouped sessions by project path */
+	let groupedSessions = new SvelteMap<string, ExecutionRecord[]>();
+
+	/** Track the currently selected session */
+	let selectedSessionId = $state<string | null>(null);
+
+	/** Track loading state */
+	let loading = $state(true);
+
+	/**
+	 * Group sessions by their project path
+	 */
+	function groupSessionsByProject(): SvelteMap<string, ExecutionRecord[]> {
+		const grouped = new SvelteMap<string, ExecutionRecord[]>();
+		const sessionsByProject = sessionsStore.groupByProject();
+
+		for (const [projectPath, sessionList] of sessionsByProject) {
+			grouped.set(projectPath, sessionList);
+		}
+
+		return grouped;
+	}
+
+	/**
+	 * Load sessions and projects on mount
+	 */
+	onMount(() => {
+		const loadData = async () => {
+			try {
+				loading = true;
+				await Promise.all([sessionsStore.load(), projectsStore.load()]);
+				groupedSessions = groupSessionsByProject();
+			} catch (e) {
+				console.error("Failed to load sidebar data:", e);
+			} finally {
+				loading = false;
+			}
+		};
+
+		const setupEventListeners = async () => {
+			// Listen for daemon events from backend
+			await EVENT_SERVICE.onDaemonStarted(({ running }) => {
+				automationsStore.setDaemonRunning(running);
+			});
+			await EVENT_SERVICE.onDaemonStopped(({ running }) => {
+				automationsStore.setDaemonRunning(running);
+			});
+		};
+
+		loadData();
+		setupEventListeners();
+
+		// Subscribe to sessions changes
+		const unsubscribe = sessionsStore.subscribe((state) => {
+			groupedSessions = groupSessionsByProject();
+			if (state.selectedSession) {
+				selectedSessionId = state.selectedSession.id;
+			}
 		});
-		await EVENT_SERVICE.onDaemonStopped(({ running }) => {
-			automationsStore.setDaemonRunning(running);
-		});
+
+		return unsubscribe;
 	});
 
-	async function toggleDaemon() {
+	/**
+	 * Handle session selection
+	 */
+	function handleSessionSelect(session: ExecutionRecord): void {
+		selectedSessionId = session.id;
+		sessionsStore.select(session);
+	}
+
+	/**
+	 * Navigate to settings
+	 */
+	function goToSettings(): void {
+		goto("/settings");
+	}
+
+	/**
+	 * Toggle daemon status
+	 */
+	async function toggleDaemon(): Promise<void> {
 		if ($daemonRunning) {
 			await automationsStore.stopDaemon();
 		} else {
@@ -33,141 +100,72 @@
 		}
 	}
 
-	async function navigate(route: string) {
-		await goto(route);
-	}
-
-	const navItems = [
-		{ id: '/', label: 'Home', icon: Home },
-		{ id: '/executions', label: 'Executions', icon: History },
-		{ id: '/automations', label: 'Automations', icon: Calendar },
-		{ id: '/settings', label: 'Settings', icon: Settings },
-	];
-
-	const quickActions = [
-		{ id: 'new-prompt', label: 'New Prompt', icon: Plus },
-		{ id: 'run-now', label: 'Run Now', icon: Play },
-	];
+	/** Get sorted projects with their sessions */
+	let projectsWithSessions = $derived(
+		$projects
+			.filter((p) => !p.hidden && groupedSessions.has(p.path))
+			.sort((a, b) => a.sort_order - b.sort_order)
+	);
 </script>
 
-<aside class="sidebar">
-	<div class="sidebar-top">
-		<div class="logo">
-			<span class="logo-text">Velor</span>
-		</div>
+<Sidebar.Root collapsible="icon">
+	<Sidebar.Content class="bg-sidebar">
+		<SidebarHeader />
 
-		<nav class="nav">
-			{#each navItems as item (item.id)}
-				<button
-					class="nav-item"
-					class:active={$page.url.pathname === item.id}
-					onclick={() => navigate(item.id)}
-					aria-label={item.label}
-					title={item.label}
-				>
-					<svelte:component this={item.icon} size={20} />
-					<span class="nav-label">{item.label}</span>
-				</button>
-			{/each}
-		</nav>
-
-		<div class="quick-actions">
-			{#each quickActions as action (action.id)}
-				<button
-					class="quick-action-btn"
-					onclick={() => navigate(action.id)}
-					aria-label={action.label}
-					title={action.label}
-				>
-					<svelte:component this={action.icon} size={18} />
-					<span>{action.label}</span>
-				</button>
-			{/each}
-		</div>
-	</div>
-
-	<div class="sidebar-bottom">
-		<button
-			class="daemon-toggle"
-			class:running={$daemonRunning}
-			onclick={toggleDaemon}
-			aria-label={$daemonRunning ? 'Stop daemon' : 'Start daemon'}
-			title={$daemonRunning ? 'Stop daemon' : 'Start daemon'}
-		>
-			{#if $daemonRunning}
-				<PowerOff size={18} />
-				<span>Stop</span>
+		<Sidebar.Content class="flex-1 overflow-y-auto">
+			{#if loading}
+				<div class="p-4 text-sm text-muted-foreground">Loading...</div>
+			{:else if projectsWithSessions.length === 0}
+				<div class="p-4 text-sm text-muted-foreground">
+					No sessions yet. Create a new session to get started.
+				</div>
 			{:else}
-				<Power size={18} />
-				<span>Start</span>
+				{#each projectsWithSessions as project (project.path)}
+					<ProjectGroup
+						{project}
+						sessions={groupedSessions.get(project.path) || []}
+						{selectedSessionId}
+						onselect={handleSessionSelect}
+					/>
+				{/each}
 			{/if}
-			<span class="daemon-indicator" class:active={$daemonRunning}></span>
-		</button>
-	</div>
-</aside>
+		</Sidebar.Content>
 
-<style>
-	.sidebar {
-		@apply flex flex-col h-full w-64 bg-[var(--color-bg-secondary)] border-r border-[var(--color-border)];
-	}
-
-	.sidebar-top {
-		@apply flex flex-col flex-1 overflow-hidden;
-	}
-
-	.logo {
-		@apply flex items-center justify-center h-16 border-b border-[var(--color-border)];
-	}
-
-	.logo-text {
-		@apply text-xl font-bold text-[var(--color-text-primary)];
-	}
-
-	.nav {
-		@apply flex flex-col gap-1 p-3;
-	}
-
-	.nav-item {
-		@apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all duration-200;
-	}
-
-	.nav-item.active {
-		@apply bg-[var(--color-accent-primary)] text-[var(--color-text-primary)];
-	}
-
-	.nav-label {
-		@apply text-sm font-medium;
-	}
-
-	.quick-actions {
-		@apply flex flex-col gap-2 p-3 border-t border-[var(--color-border)] mt-auto;
-	}
-
-	.quick-action-btn {
-		@apply flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all duration-200;
-	}
-
-	.sidebar-bottom {
-		@apply flex flex-col gap-2 p-3 border-t border-[var(--color-border)];
-	}
-
-	.daemon-toggle {
-		@apply flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg text-sm text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-tertiary)] transition-all duration-200;
-	}
-
-	.daemon-toggle.running {
-		@apply text-[var(--color-success)];
-	}
-
-	.daemon-indicator {
-		@apply w-2 h-2 rounded-full bg-[var(--color-text-muted)];
-	}
-
-	.daemon-indicator.active {
-		@apply bg-[var(--color-success)] shadow-[0_0_8px_var(--color-success)];
-	}
-
-	.settings-btn {
-		@apply flex items-center justify-center p-2.5 rounded-lg text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-tertiary)] transition-all duration-200;
-	}
-</style>
+		<Sidebar.Footer>
+			<Sidebar.Menu>
+				<Sidebar.MenuItem>
+					<Sidebar.MenuButton
+						onclick={goToSettings}
+						class="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground"
+					>
+						{#snippet child({ props })}
+							<button {...props} class="flex items-center gap-2 w-full">
+								<Settings size={16} />
+								<span>Settings</span>
+							</button>
+						{/snippet}
+					</Sidebar.MenuButton>
+				</Sidebar.MenuItem>
+				<Sidebar.MenuItem>
+					<Sidebar.MenuButton
+						onclick={toggleDaemon}
+						class="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground"
+					>
+						{#snippet child({ props })}
+							<button {...props} class="flex items-center gap-2 w-full">
+								{#if $daemonRunning}
+									<PowerOff size={16} class="text-green-500" />
+									<span>Stop Daemon</span>
+								{:else}
+									<Power size={16} />
+									<span>Start Daemon</span>
+								{/if}
+							</button>
+						{/snippet}
+					</Sidebar.MenuButton>
+				</Sidebar.MenuItem>
+			</Sidebar.Menu>
+		</Sidebar.Footer>
+	</Sidebar.Content>
+	<SidebarRail />
+</Sidebar.Root>
