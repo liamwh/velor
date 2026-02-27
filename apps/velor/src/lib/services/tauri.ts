@@ -18,6 +18,7 @@ import type {
 	ToggleAutomationRequest,
 	CreateAutomationRequest,
 	UpdateAutomationRequest,
+	Project,
 } from "$lib/types";
 
 /**
@@ -82,6 +83,14 @@ export async function getSessionStats(): Promise<SessionStats> {
 	return await invoke<SessionStats>("get_session_stats");
 }
 
+export async function renameSession(id: string, name: string | null): Promise<void> {
+	await invoke("rename_session", { id, name });
+}
+
+export async function toggleSessionPin(id: string): Promise<boolean> {
+	return await invoke<boolean>("toggle_session_pin", { id });
+}
+
 /**
  * Automation Commands
  */
@@ -144,4 +153,28 @@ export async function discoverGitRoot(path?: string): Promise<string | null> {
 
 export async function checkBinaryAvailable(): Promise<boolean> {
 	return await invoke<boolean>("check_binary_available");
+}
+
+/**
+ * Project Commands
+ */
+
+export async function listProjects(): Promise<Project[]> {
+	return await invoke<Project[]>("list_projects");
+}
+
+export async function hideProject(path: string): Promise<void> {
+	await invoke("hide_project", { path });
+}
+
+export async function showProject(path: string): Promise<void> {
+	await invoke("show_project", { path });
+}
+
+export async function renameProject(path: string, displayName: string): Promise<void> {
+	await invoke("rename_project", { path, displayName });
+}
+
+export async function reorderProjects(paths: string[]): Promise<void> {
+	await invoke("reorder_projects", { paths });
 }

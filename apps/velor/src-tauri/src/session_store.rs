@@ -31,6 +31,16 @@ fn parse_execution_state(s: &str) -> Option<ExecutionState> {
     }
 }
 
+/// Discover the git root directory from a given path.
+///
+/// Returns `None` if the path is not within a git repository.
+async fn discover_git_root_from_path(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    velor_core::git::discover_git_root(path)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 /// Statistics about sessions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionStats {
@@ -44,6 +54,31 @@ pub struct SessionStats {
     pub cancelled: u64,
     /// Number of active (non-terminal) sessions.
     pub active: u64,
+}
+
+/// Project metadata for organizing sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    /// Unique path to the project (git root).
+    pub path: String,
+    /// User-editable display name.
+    pub display_name: String,
+    /// Whether this project is hidden from the sidebar.
+    pub hidden: bool,
+    /// Sort order for display (lower numbers appear first).
+    pub sort_order: i64,
+    /// Number of sessions associated with this project.
+    pub session_count: u64,
+}
+
+/// Raw project row from database.
+#[derive(FromRow)]
+struct ProjectRow {
+    path: String,
+    display_name: Option<String>,
+    hidden: i64,
+    sort_order: i64,
+    session_count: i64,
 }
 
 /// Async SQLite storage for execution sessions.
@@ -90,9 +125,10 @@ impl SessionStore {
         Ok(store)
     }
 
-    /// Initialize the database schema.
+    /// Initialize the database schema with migration support.
     async fn init_schema(&self) -> Result<()> {
-        let query = r#"
+        // Create sessions table if it doesn't exist
+        let sessions_table = r#"
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 prompt_name TEXT NOT NULL,
@@ -108,7 +144,15 @@ impl SessionStore {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+        "#;
 
+        sqlx::query(sessions_table)
+            .execute(&self.pool)
+            .await
+            .wrap_err("Failed to create sessions table")?;
+
+        // Create session_events table if it doesn't exist
+        let events_table = r#"
             CREATE TABLE IF NOT EXISTS session_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -117,18 +161,87 @@ impl SessionStore {
                 timestamp TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
+        "#;
 
+        sqlx::query(events_table)
+            .execute(&self.pool)
+            .await
+            .wrap_err("Failed to create session_events table")?;
+
+        // Create projects table
+        let projects_table = r#"
+            CREATE TABLE IF NOT EXISTS projects (
+                path TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                hidden INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );
+        "#;
+
+        sqlx::query(projects_table)
+            .execute(&self.pool)
+            .await
+            .wrap_err("Failed to create projects table")?;
+
+        // Run migrations to add new columns to existing databases
+        self.migrate_sessions_table().await?;
+        self.migrate_projects_table().await?;
+
+        // Create indexes if they don't exist
+        let indexes = r#"
             CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
             CREATE INDEX IF NOT EXISTS idx_sessions_automation_name ON sessions(automation_name);
             CREATE INDEX IF NOT EXISTS idx_session_events_session_id ON session_events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_project_path ON sessions(project_path);
+            CREATE INDEX IF NOT EXISTS idx_sessions_pinned ON sessions(pinned);
+            CREATE INDEX IF NOT EXISTS idx_projects_sort_order ON projects(sort_order);
         "#;
 
-        sqlx::query(query)
+        sqlx::query(indexes)
             .execute(&self.pool)
             .await
-            .wrap_err("Failed to initialize session store schema")?;
+            .wrap_err("Failed to create indexes")?;
 
+        Ok(())
+    }
+
+    /// Migrate sessions table to add new columns.
+    ///
+    /// This is a safe migration that adds columns only if they don't exist.
+    async fn migrate_sessions_table(&self) -> Result<()> {
+        // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we use a workaround
+        // by trying the migration and ignoring duplicate column errors
+        let migrations = vec![
+            "ALTER TABLE sessions ADD COLUMN name TEXT;",
+            "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE sessions ADD COLUMN project_path TEXT;",
+        ];
+
+        for migration in migrations {
+            // Try to run the migration - it will fail if the column already exists
+            let result = sqlx::query(migration).execute(&self.pool).await;
+            if let Err(e) = result {
+                // Check if the error is about duplicate column (column already exists)
+                let error_msg = e.to_string();
+                if error_msg.contains("duplicate column") {
+                    debug!("Column already exists, skipping migration");
+                } else {
+                    // Some other error - log but continue
+                    debug!("Migration skipped: {}", error_msg);
+                }
+            } else {
+                debug!("Applied migration: {}", migration.trim());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migrate projects table - ensure default projects exist.
+    async fn migrate_projects_table(&self) -> Result<()> {
+        // The projects table is already created in init_schema
+        // This is for any data migration if needed in the future
         Ok(())
     }
 
@@ -144,9 +257,16 @@ impl SessionStore {
         let metrics_json = serde_json::to_string(&record.metrics)
             .wrap_err("Failed to serialize ExecutionMetrics")?;
 
+        // Extract git root from cwd if project_path is not set
+        let project_path = if record.project_path.is_some() {
+            record.project_path.clone()
+        } else {
+            discover_git_root_from_path(&record.config.cwd).await
+        };
+
         sqlx::query(
-            "INSERT INTO sessions (id, prompt_name, state, started_at, ended_at, config_json, metrics_json, output, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO sessions (id, prompt_name, state, started_at, ended_at, config_json, metrics_json, output, error, name, pinned, project_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(record.id.as_str())
         .bind(&record.config.prompt_name)
@@ -157,6 +277,9 @@ impl SessionStore {
         .bind(&metrics_json)
         .bind(&record.output)
         .bind(&record.error)
+        .bind(&record.name)
+        .bind(record.pinned as i64)
+        .bind(&project_path)
         .execute(&self.pool)
         .await
         .wrap_err("Failed to insert session")?;
@@ -179,14 +302,17 @@ impl SessionStore {
 
         sqlx::query(
             "UPDATE sessions
-             SET state = ?1, ended_at = ?2, metrics_json = ?3, output = ?4, error = ?5, updated_at = datetime('now')
-             WHERE id = ?6",
+             SET state = ?1, ended_at = ?2, metrics_json = ?3, output = ?4, error = ?5, name = ?6, pinned = ?7, project_path = ?8, updated_at = datetime('now')
+             WHERE id = ?9",
         )
         .bind(record.state.label())
         .bind(ended_at)
         .bind(&metrics_json)
         .bind(&record.output)
         .bind(&record.error)
+        .bind(&record.name)
+        .bind(record.pinned as i64)
+        .bind(&record.project_path)
         .bind(record.id.as_str())
         .execute(&self.pool)
         .await
@@ -316,6 +442,200 @@ impl SessionStore {
         })
     }
 
+    /// Rename a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn rename_session(&self, id: &str, name: Option<String>) -> Result<()> {
+        sqlx::query("UPDATE sessions SET name = ?1, updated_at = datetime('now') WHERE id = ?2")
+            .bind(&name)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .wrap_err("Failed to rename session")?;
+
+        debug!(id, name = ?name, "Session renamed");
+        Ok(())
+    }
+
+    /// Toggle the pinned status of a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn toggle_session_pin(&self, id: &str) -> Result<bool> {
+        // First get the current state
+        let current: Option<(i64,)> = sqlx::query_as("SELECT pinned FROM sessions WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .wrap_err("Failed to get session pin state")?;
+
+        let Some((pinned,)) = current else {
+            return Ok(false);
+        };
+
+        let new_state = if pinned != 0 { 0 } else { 1 };
+
+        sqlx::query("UPDATE sessions SET pinned = ?1, updated_at = datetime('now') WHERE id = ?2")
+            .bind(new_state)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .wrap_err("Failed to toggle session pin")?;
+
+        debug!(id, new_pinned = new_state, "Session pin toggled");
+        Ok(new_state != 0)
+    }
+
+    /// List all projects with their metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn list_projects(&self) -> Result<Vec<Project>> {
+        let rows: Vec<ProjectRow> = sqlx::query_as(
+            r#"
+            SELECT
+                COALESCE(p.path, s.project_path) as path,
+                COALESCE(p.display_name, s.project_path) as display_name,
+                COALESCE(p.hidden, 0) as hidden,
+                COALESCE(p.sort_order, 0) as sort_order,
+                COUNT(s.id) as session_count
+            FROM projects p
+            FULL OUTER JOIN sessions s ON s.project_path = p.path
+            WHERE s.project_path IS NOT NULL OR p.path IS NOT NULL
+            GROUP BY COALESCE(p.path, s.project_path), p.display_name, p.hidden, p.sort_order
+            ORDER BY COALESCE(p.sort_order, 0) ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .wrap_err("Failed to list projects")?;
+
+        let projects = rows
+            .into_iter()
+            .map(|row| {
+                let display_name = row.display_name.unwrap_or_else(|| {
+                    // Extract directory name from path for display
+                    row.path
+                        .rsplit('/')
+                        .next()
+                        .or(row.path.rsplit('\\').next())
+                        .unwrap_or(&row.path)
+                        .to_string()
+                });
+                Project {
+                    path: row.path,
+                    display_name,
+                    hidden: row.hidden != 0,
+                    sort_order: row.sort_order,
+                    session_count: row.session_count as u64,
+                }
+            })
+            .collect();
+
+        Ok(projects)
+    }
+
+    /// Hide a project from the sidebar.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn hide_project(&self, path: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO projects (path, display_name, hidden, sort_order) VALUES (?1, ?2, 1, 0)
+             ON CONFLICT(path) DO UPDATE SET hidden = 1, updated_at = datetime('now')",
+        )
+        .bind(path)
+        .bind(path) // Use path as default display_name
+        .execute(&self.pool)
+        .await
+        .wrap_err("Failed to hide project")?;
+
+        debug!(path, "Project hidden");
+        Ok(())
+    }
+
+    /// Show a hidden project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn show_project(&self, path: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO projects (path, display_name, hidden, sort_order) VALUES (?1, ?2, 0, 0)
+             ON CONFLICT(path) DO UPDATE SET hidden = 0, updated_at = datetime('now')",
+        )
+        .bind(path)
+        .bind(path) // Use path as default display_name
+        .execute(&self.pool)
+        .await
+        .wrap_err("Failed to show project")?;
+
+        debug!(path, "Project shown");
+        Ok(())
+    }
+
+    /// Update the display name of a project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn rename_project(&self, path: &str, display_name: String) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO projects (path, display_name, hidden, sort_order) VALUES (?1, ?2, 0, 0)
+             ON CONFLICT(path) DO UPDATE SET display_name = ?2, updated_at = datetime('now')",
+        )
+        .bind(path)
+        .bind(&display_name)
+        .execute(&self.pool)
+        .await
+        .wrap_err("Failed to rename project")?;
+
+        debug!(path, display_name, "Project renamed");
+        Ok(())
+    }
+
+    /// Reorder projects by updating their sort_order values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn reorder_projects(&self, paths: Vec<String>) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .wrap_err("Failed to begin transaction")?;
+
+        for (index, path) in paths.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO projects (path, display_name, hidden, sort_order) VALUES (?1, ?2, 0, ?3)
+                 ON CONFLICT(path) DO UPDATE SET sort_order = ?3, updated_at = datetime('now')",
+            )
+            .bind(path)
+            .bind(path) // Use path as default display_name
+            .bind(index as i64)
+            .execute(&mut *tx)
+            .await
+            .wrap_err_with(|| format!("Failed to reorder project at index {}", index))?;
+        }
+
+        tx.commit().await.wrap_err("Failed to commit transaction")?;
+        debug!("Projects reordered");
+        Ok(())
+    }
+
     /// Append an event to the session events table.
     ///
     /// # Errors
@@ -428,6 +748,9 @@ impl SessionStore {
             started_at,
             ended_at,
             events,
+            name: row.name,
+            pinned: row.pinned != 0,
+            project_path: row.project_path,
         })
     }
 
@@ -496,6 +819,9 @@ struct SessionRow {
     metrics_json: String,
     output: Option<String>,
     error: Option<String>,
+    name: Option<String>,
+    pinned: i64,
+    project_path: Option<String>,
 }
 
 /// Raw event row from database.

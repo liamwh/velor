@@ -83,7 +83,7 @@ export interface ExecutionConfig {
 }
 
 /**
- * Execution record
+ * Execution record (session)
  */
 export interface ExecutionRecord {
 	/** Unique execution ID */
@@ -104,6 +104,12 @@ export interface ExecutionRecord {
 	metrics: ExecutionMetrics;
 	/** Error message if failed */
 	error?: string;
+	/** User-editable session name */
+	name?: string;
+	/** Whether this session is pinned in the sidebar */
+	pinned: boolean;
+	/** Git root path at time of session creation */
+	project_path: string;
 }
 
 /**
@@ -148,4 +154,20 @@ export interface SessionStats {
 	cancelled: number;
 	/** Number of active (non-terminal) sessions */
 	active: number;
+}
+
+/**
+ * Project metadata for organizing sessions
+ */
+export interface Project {
+	/** Unique path to the project (git root) */
+	path: string;
+	/** User-editable display name */
+	display_name: string;
+	/** Whether this project is hidden from the sidebar */
+	hidden: boolean;
+	/** Sort order for display (lower numbers appear first) */
+	sort_order: number;
+	/** Number of sessions associated with this project */
+	session_count: number;
 }

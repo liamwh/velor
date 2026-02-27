@@ -24,8 +24,9 @@ use commands::{
     cancel_execution, check_binary_available, create_automation, delete_automation, delete_session,
     discover_git_root, get_automation, get_automation_runs, get_config, get_execution_history,
     get_execution_status, get_home_config, get_repo_config, get_session, get_session_stats,
-    list_automations, list_sessions, run_automation_now, save_config, start_daemon,
-    start_execution, stop_daemon, test_notification, toggle_automation, update_automation,
+    hide_project, list_automations, list_projects, list_sessions, rename_project, rename_session,
+    reorder_projects, run_automation_now, save_config, show_project, start_daemon, start_execution,
+    stop_daemon, test_notification, toggle_automation, toggle_session_pin, update_automation,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -101,6 +102,14 @@ pub fn run() {
             get_session,
             delete_session,
             get_session_stats,
+            rename_session,
+            toggle_session_pin,
+            // Project commands
+            list_projects,
+            hide_project,
+            show_project,
+            rename_project,
+            reorder_projects,
             // Automation commands
             list_automations,
             get_automation,

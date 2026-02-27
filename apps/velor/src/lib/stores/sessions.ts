@@ -152,6 +152,90 @@ function createSessionsStore() {
 	}
 
 	/**
+	 * Rename a session
+	 */
+	async function rename(id: string, name: string | null): Promise<void> {
+		update((state) => ({ ...state, loading: true, error: null }));
+		try {
+			await tauri.renameSession(id, name);
+			// Update local state
+			update((state) => ({
+				...state,
+				sessions: state.sessions.map((s) =>
+					s.id === id ? { ...s, name: name ?? undefined } : s,
+				),
+				selectedSession:
+					state.selectedSession?.id === id
+						? { ...state.selectedSession, name: name ?? undefined }
+						: state.selectedSession,
+				loading: false,
+			}));
+		} catch (e) {
+			update((state) => ({
+				...state,
+				loading: false,
+				error: e instanceof Error ? e.message : String(e),
+			}));
+			throw e;
+		}
+	}
+
+	/**
+	 * Toggle the pinned status of a session
+	 */
+	async function togglePin(id: string): Promise<boolean> {
+		update((state) => ({ ...state, loading: true, error: null }));
+		try {
+			const pinned = await tauri.toggleSessionPin(id);
+			// Update local state
+			update((state) => ({
+				...state,
+				sessions: state.sessions.map((s) =>
+					s.id === id ? { ...s, pinned } : s,
+				),
+				selectedSession:
+					state.selectedSession?.id === id
+						? { ...state.selectedSession, pinned }
+						: state.selectedSession,
+				loading: false,
+			}));
+			return pinned;
+		} catch (e) {
+			update((state) => ({
+				...state,
+				loading: false,
+				error: e instanceof Error ? e.message : String(e),
+			}));
+			throw e;
+		}
+	}
+
+	/**
+	 * Group sessions by project path
+	 */
+	function groupByProject(): Map<string, ExecutionRecord[]> {
+		const state = getState();
+		const grouped = new Map<string, ExecutionRecord[]>();
+
+		// Sort pinned sessions first, then by date
+		const sorted = [...state.sessions].sort((a, b) => {
+			if (a.pinned && !b.pinned) return -1;
+			if (!a.pinned && b.pinned) return 1;
+			return new Date(b.started_at).getTime() - new Date(a.started_at).getTime();
+		});
+
+		for (const session of sorted) {
+			const projectPath = session.project_path || "Other";
+			if (!grouped.has(projectPath)) {
+				grouped.set(projectPath, []);
+			}
+			grouped.get(projectPath)!.push(session);
+		}
+
+		return grouped;
+	}
+
+	/**
 	 * Refresh the session list (reload first page)
 	 */
 	async function refresh(limit: number = DEFAULT_PAGE_SIZE): Promise<void> {
@@ -216,6 +300,9 @@ function createSessionsStore() {
 		loadMore,
 		get: getSession,
 		delete: deleteSession,
+		rename,
+		togglePin,
+		groupByProject,
 		refresh,
 		refreshStats,
 		select,
