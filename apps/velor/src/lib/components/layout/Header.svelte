@@ -1,6 +1,7 @@
 <script lang="ts">
-	import { gitRoot, config } from '$lib/stores';
-	import { FolderGit2, Activity } from 'lucide-svelte';
+	import * as Sidebar from "$lib/components/ui/sidebar/index.js";
+	import { gitRoot, config } from "$lib/stores";
+	import { FolderGit2, Activity } from "lucide-svelte";
 
 	let currentGitRoot = $state<string | null>(null);
 	let promptCount = $state(0);
@@ -24,7 +25,8 @@
 </script>
 
 <header class="header">
-	<div class="header-left">
+	<div class="header-left flex items-center gap-2">
+		<Sidebar.Trigger />
 		<h1 class="title">Velor Agent CLI</h1>
 		{#if currentGitRoot}
 			<div class="git-root" title="Project root">
@@ -43,41 +45,3 @@
 		</div>
 	</div>
 </header>
-
-<style>
-	.header {
-		@apply flex items-center justify-between h-16 px-6 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)];
-	}
-
-	.header-left {
-		@apply flex items-center gap-4;
-	}
-
-	.title {
-		@apply text-lg font-semibold text-[var(--color-text-primary)];
-	}
-
-	.git-root {
-		@apply flex items-center gap-1.5 px-2.5 py-1 rounded text-xs text-[var(--color-text-secondary)] bg-[var(--color-bg-tertiary)];
-	}
-
-	.git-path {
-		@apply max-w-[300px] truncate;
-	}
-
-	.header-right {
-		@apply flex items-center gap-4;
-	}
-
-	.stats {
-		@apply flex items-center gap-3;
-	}
-
-	.stat-item {
-		@apply flex items-center gap-1.5 text-sm text-[var(--color-text-secondary)];
-	}
-
-	.stat-label {
-		@apply text-xs;
-	}
-</style>
