@@ -3,12 +3,22 @@
 	import { Button } from "$lib/components/ui/button/index.js";
 	import { goto } from "$app/navigation";
 	import { Plus, Calendar } from "lucide-svelte";
+	import NewSessionDialog from "$lib/components/sessions/NewSessionDialog.svelte";
+
+	let showNewSessionDialog = $state(false);
 
 	/**
-	 * Handle navigation to a new session
+	 * Handle opening new session dialog
 	 */
-	async function handleNewSession(): Promise<void> {
-		await goto("/");
+	function handleNewSession(): void {
+		showNewSessionDialog = true;
+	}
+
+	/**
+	 * Handle closing new session dialog
+	 */
+	function handleCloseDialog(): void {
+		showNewSessionDialog = false;
 	}
 
 	/**
@@ -39,3 +49,7 @@
 		</Button>
 	</div>
 </Sidebar.Header>
+
+{#if showNewSessionDialog}
+	<NewSessionDialog onClose={handleCloseDialog} />
+{/if}
