@@ -54,12 +54,17 @@ lint-rust:
 lint-typescript:
     cd apps/velor && bunx svelte-kit sync && bunx svelte-check --tsconfig ./tsconfig.json --diagnostic-sources "js,svelte" && bunx eslint .
 
-# Install velor to ~/bin
+# Install velor to ~/bin (backs up existing binary with timestamp)
 install:
     @echo "📦 Building velor binary..."
     cargo build --release -q
     @echo "📥 Installing to ~/bin..."
     @mkdir -p ~/bin
+    @if [ -f ~/bin/velor ]; then \
+        backup=~/bin/velor.backup.$(date +%Y%m%d-%H%M%S); \
+        echo "💾 Backing up existing velor to $$backup"; \
+        cp ~/bin/velor "$$backup"; \
+    fi
     @cp target/release/velor ~/bin/
     @echo "✅ velor installed to ~/bin/velor"
 
