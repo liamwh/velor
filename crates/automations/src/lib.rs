@@ -10,6 +10,7 @@ pub mod config;
 pub mod file_config;
 pub mod runner;
 pub mod scheduler;
+pub mod state;
 pub mod store;
 pub mod vars;
 
@@ -22,5 +23,6 @@ pub use file_config::{
 };
 pub use runner::{AutomationResult, AutomationRunner, WorktreeCleanup};
 pub use scheduler::Scheduler;
+pub use state::{AutomationState, RunStatus};
 pub use store::{AutomationRun, AutomationRunStatus, AutomationStore};
 pub use vars::merge_automation_vars;
