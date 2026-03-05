@@ -1,88 +1,107 @@
-# Progress Handoff - File-Based Automations (Phase 2b)
+# Progress Handoff - File-Based Automations (Phase 3)
 
 ## Session Summary
 
-Completed **Phase 2b: Prompt Source Resolution** of the file-based automations plan. This phase adds the ability to resolve `PromptSource` variants to actual prompt content.
+Completed **Phase 3: Variable Merging** of the file-based automations plan. This phase adds the ability to merge variables from multiple sources with built-in variables for template rendering.
 
 ## Changes Made
 
+### New Files
+
+1. **`crates/automations/src/vars.rs`** (new)
+   - Added `merge_automation_vars()` function that merges variables from:
+     - Home config vars (lowest precedence)
+     - Repo config vars (override home)
+     - Automation vars (override repo and home)
+     - Built-in variables (override everything - prevents user breaking templates)
+   - Built-in variables:
+     - `git_root` - Path to the git repository root
+     - `cwd` - Current working directory
+     - `now` - Current UTC timestamp in RFC3339 format
+     - `repo` - Repository name extracted from git_root path
+     - `branch` - Current git branch name (best-effort, empty string if unavailable)
+   - Added `get_current_branch()` helper function:
+     - Uses `git rev-parse --abbrev-ref HEAD` to get current branch
+     - Uses `.arg()` with Path to handle non-UTF8 paths correctly
+     - Returns empty string on failure (best-effort semantics)
+
 ### Modified Files
 
-1. **`crates/automations/Cargo.toml`**
-   - Added `velor-core` dependency to access `PromptCache`
-
-2. **`crates/automations/src/file_config.rs`**
-   - Updated imports to include:
-     - `std::path::Path` for the path parameter
-     - `tokio::fs` for async file reading
-     - `velor_core::prompts::PromptCache`
-     - `color_eyre::eyre::WrapErr` for error context
-   - Added `resolve()` method to `PromptSource` impl block:
-     - For `Inline` - returns content directly
-     - For `PromptsDirFile` - tries repo prompts first, then global (override pattern)
-     - For `Name` - looks up in `PromptCache`
-   - Added `resolve_tests` test module with 10 comprehensive tests:
-     - `test_resolve_inline` - Inline prompts return content directly
-     - `test_resolve_prompts_dir_file_from_repo` - Repo prompts override global
-     - `test_resolve_prompts_dir_file_fallback_to_home` - Falls back to global when repo doesn't have file
-     - `test_resolve_prompts_dir_file_not_found` - Returns error when file not found
-     - `test_resolve_prompts_dir_file_no_repo` - Works correctly when no repo_dir provided
-     - `test_resolve_name_from_cache` - Named prompts are resolved from cache
-     - `test_resolve_name_not_found` - Returns error when named prompt not found
-     - `test_resolve_prompts_dir_file_with_md_suffix` - File references work correctly
-     - `test_resolve_all_three_variants` - All three variants work in same context
+1. **`crates/automations/src/lib.rs`**
+   - Added `pub mod vars;` module declaration
+   - Added `pub use vars::merge_automation_vars;` re-export for convenience
 
 ## Test Coverage
 
-All 77 tests pass, including:
-- 10 new `resolve()` method tests
-- 40 existing file_config tests (DST transitions, validation, parsing)
-- 21 cache tests (discovery, override behavior, error handling)
-- 6 other tests (config, runner, scheduler, store)
+Added 10 comprehensive tests for the vars module:
+- `test_merge_automation_vars_precedence` - Verifies variable precedence order
+- `test_merge_automation_vars_builtins` - Verifies built-in variables are present
+- `test_merge_automation_vars_repo_name` - Verifies repo name extraction from git_root
+- `test_merge_automation_vars_empty_maps` - Verifies built-ins work with empty input maps
+- `test_merge_automation_vars_builtin_override` - Verifies built-ins override user values
+- `test_merge_automation_vars_non_utf8_repo_name` - Verifies valid UTF-8 repo names work
+- `test_get_current_branch_valid_repo` - Verifies git branch resolution in actual repo
+- `test_get_current_branch_non_repo` - Verifies graceful handling of non-git directories
+- `test_merge_automation_vars_includes_branch` - Verifies branch variable is included
+- `test_merge_automation_vars_now_is_valid_rfc3339` - Verifies timestamp format
+
+All 87 tests pass (77 existing + 10 new).
 
 ## Implementation Details
 
-The `resolve()` method:
-- Uses `try-read` approach instead of `exists()` to avoid sync filesystem calls
-- Provides detailed error messages showing which paths were tried
-- Uses `wrap_err_with!` for contextual error information
-- Follows the override pattern: repo prompts take precedence over global prompts
+- Uses `BTreeMap` for sorted variable output (consistent ordering)
+- Built-in variables use highest precedence to prevent users from accidentally breaking template rendering
+- Branch resolution is best-effort (returns empty string on failure) to ensure templates always render
+- Collapsible if-let pattern used for repo name extraction (clippy-clean)
+- All functions are fully documented with rustdoc comments including examples
 
 ## What's Next (Recommended)
 
-**Phase 3: Variable Merging** - Create `crates/automations/src/vars.rs` with `merge_automation_vars()` function:
+**Phase 4: Update AutomationRunner** - Modify `crates/automations/src/runner.rs` to:
 
-```rust
-pub fn merge_automation_vars(
-    automation_vars: BTreeMap<String, String>,
-    repo_vars: BTreeMap<String, String>,
-    home_vars: BTreeMap<String, String>,
-    git_root: &Path,
-    cwd: &Path,
-) -> BTreeMap<String, String>
-```
+1. Add git root resolution helper (truly handles non-UTF8 paths):
+   ```rust
+   async fn resolve_git_root(&self, path: &Path) -> Result<PathBuf>
+   ```
 
-**Why this is next:** With Phase 2b complete, we can now:
-1. Load automations from files (Phase 1)
-2. Discover them via the cache (Phase 2)
-3. Resolve their prompt sources (Phase 2b)
+2. Add `worktree` and `project` handling with clear semantics:
+   - `project` is the working directory (can be inside a repo)
+   - Git root is derived from `project` via `git rev-parse --show-toplevel`
+   - If `worktree=true` and `project` is outside a git repo → config error
 
-The next logical step is to merge variables from multiple sources with built-ins (git_root, cwd, now, repo, branch) to provide the full context needed for prompt rendering.
+3. Sanitize worktree names with collision resistance:
+   ```rust
+   fn sanitize_worktree_name(name: &str) -> String
+   fn generate_worktree_path(git_root: &Path, automation_name: &str) -> PathBuf
+   ```
+
+4. Create worktrees base directory at runner init (not in hot path):
+   ```rust
+   async fn init_worktrees_base(&self) -> Result<()>
+   async fn prune_orphaned_worktrees(&self) -> Result<()>
+   ```
+
+**Why this is next:** With Phase 3 complete, we now have:
+1. File-based automation types (Phase 1)
+2. Discovery via AutomationCache (Phase 2)
+3. Prompt source resolution (Phase 2b)
+4. Variable merging with built-ins (Phase 3)
+
+The next step is to update the AutomationRunner to use these pieces together for proper automation execution with git root resolution, worktree support, and merged variables.
 
 **Alternative next steps:**
-- **Phase 4: Update AutomationRunner** - Add git root resolution and worktree handling
-- **Phase 4b: State Tracking** - Create `AutomationState` for run tracking with idempotency
+- **Phase 4b: State Tracking** - Create `AutomationState` for run tracking with idempotency (depends on Phase 4)
+- **Phase 5: CLI Flags** - Add list, validate, run, status, tick commands (depends on Phase 4)
 
 ## Remaining Phases (from plan)
-- Phase 3: Variable Merging - `merge_automation_vars()` with built-ins
 - Phase 4: Update AutomationRunner - git root resolution, worktree handling
 - Phase 4b: State Tracking - `AutomationState` with UNIQUE constraint
 - Phase 5: CLI Flags - list, validate, run, status, tick commands
-- Phase 6: Exports - Update lib.rs with new module exports
+- Phase 6: Exports - Update lib.rs with new module exports (partially done - vars exported)
 
 ## No Blockers
 
-All dependencies resolved. Ready to proceed with Phase 3 or alternative.
+All dependencies resolved. Ready to proceed with Phase 4 or alternative.
 
 ## Commit Reference
-(Waiting to commit after this handoff is written)
+(To be committed after this handoff)
