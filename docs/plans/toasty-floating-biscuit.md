@@ -44,7 +44,7 @@ Config precedence (documented, deterministic):
 
 Two patterns for defining automations:
   Pattern A: Global repo-aware automations
-    └─ ~/.config/velor/automations/my-task.toml
+    └─ XDG_CONFIG_HOME/velor/automations/my-task.toml
        └─ Contains: project_path = "/Users/liam/git/repoA"
 
   Pattern B: Repo-local automations
@@ -52,6 +52,13 @@ Two patterns for defining automations:
        └─ Discovered via registry
 
 Security: All Command calls use argument arrays (never shell interpolation)
+
+**Directory semantics**: Uses cross-platform `dirs` crate for consistency:
+- `dirs::config_dir()/velor/` for configuration (projects.toml, global automations, global config)
+  - macOS: `~/Library/Application Support/velor/`
+  - Linux: `~/.config/velor/`
+- `dirs::runtime_dir()/velor/` for lock files (ephemeral, cleared on reboot)
+  - Falls back to `dirs::state_dir()/velor/` if runtime dir unavailable
 ```
 
 ### User Experience
@@ -104,19 +111,24 @@ let config_path = git_root.join(".velor/velor.toml");
 
 ### 2. Robust Git Repository Detection
 
-Uses `git rev-parse --show-toplevel` and canonicalizes paths to handle:
+Uses `git rev-parse --show-toplevel` via `discover_git_root` and canonicalizes paths. **No additional `.git` existence check needed** - if `discover_git_root` succeeds, it's a valid git repo.
+
+Handles:
 - Submodules (`.git` is a file, not directory)
 - Worktrees (`.git` is a file pointing to gitdir)
 - Symlinked paths (prevents duplicate registrations)
+- Bare repos and unusual layouts
 
-### 3. Registry Schema: Versioned BTreeMap
+### 3. Registry Schema: Versioned BTreeMap with De-Duplication
 
 ```toml
-# ~/.config/velor/projects.toml
+# dirs::config_dir()/velor/projects.toml
+# macOS: ~/Library/Application Support/velor/projects.toml
+# Linux: ~/.config/velor/projects.toml
 version = 1
 
 [projects.velor]
-path = "/Users/liam/git/velor"
+path = "/Users/liam/git/velor"  # Canonical git root, not input path
 enabled = true
 added_at = "2026-03-05T20:00:00Z"
 
@@ -125,11 +137,18 @@ path = "/Users/liam/git/dotfiles"
 enabled = true
 ```
 
-Uses `BTreeMap<String, ProjectEntry>` for O(1) lookups and stable ordering.
+**Critical**: Registry stores the **canonical git root** (from `discover_git_root`), not the user-supplied path. This ensures:
+- De-duplication: same repo can't be registered twice (checked by comparing git_root paths)
+- Correctness for worktrees/submodules
+- Consistent config discovery
+
+Uses `BTreeMap<String, ProjectEntry>` for O(1) lookups and stable ordering. Version field is enforced on load.
 
 ### 4. Single-Instance Tick with Lock File
 
-Uses `fs2` crate for cross-process locking at `~/.local/state/velor/automations.lock`. Returns immediately if lock is held.
+Uses `fs2` crate for cross-process locking. Lock file location:
+- Prefer `XDG_RUNTIME_DIR/velor/automations.lock` (cleaner, doesn't survive reboots)
+- Fall back to `XDG_STATE_HOME/velor/automations.lock` if runtime dir unavailable
 
 ### 5. Idempotent launchctl Operations
 
@@ -163,6 +182,16 @@ If registry is empty, falls back to legacy single-repo behavior with helpful mes
 ### 8. Enable/Disable Commands
 
 Users can temporarily disable projects without removing them from the registry.
+
+### 9. Quiet Tick with Structured Logging
+
+Tick output is **quiet by default** to avoid log spam:
+- Only errors/warnings printed to stderr
+- Summary line only if errors occurred
+- Use `tracing::info!` for structured logging (configurable log level)
+- Verbose mode available for debugging (prints per-project details)
+
+This prevents the log file from becoming a wall of emojis every minute.
 
 ## Implementation Plan
 
@@ -202,10 +231,13 @@ pub struct ProjectEntry {
 
 fn default_true() -> bool { true }
 
+/// Supported registry version
+const SUPPORTED_VERSION: u32 = 1;
+
 impl ProjectRegistry {
     pub fn registry_path() -> Result<PathBuf> {
         Ok(dirs::config_dir()
-            .ok_or_else(|| color_eyre::eyre!("Cannot determine XDG config directory"))?
+            .ok_or_else(|| color_eyre::eyre!("Cannot determine config directory"))?
             .join("velor/projects.toml"))
     }
 
@@ -213,7 +245,18 @@ impl ProjectRegistry {
         let path = Self::registry_path()?;
         if !path.exists() { return Ok(Self::default()); }
         let content = tokio::fs::read_to_string(&path).await?;
-        toml::from_str(&content).wrap_err_with(|| "Failed to parse projects.toml")
+        let registry: ProjectRegistry = toml::from_str(&content)
+            .wrap_err_with(|| "Failed to parse projects.toml")?;
+
+        // Enforce version
+        if registry.version != SUPPORTED_VERSION {
+            return Err(color_eyre::eyre!(
+                "Unsupported registry version {}; expected {}",
+                registry.version, SUPPORTED_VERSION
+            ));
+        }
+
+        Ok(registry)
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -228,17 +271,38 @@ impl ProjectRegistry {
 
     /// Add project (SYNC - no async I/O)
     pub fn add(&mut self, path: PathBuf, id: Option<String>) -> Result<()> {
+        use dunce; // for cross-platform canonicalization
+
+        // Resolve to absolute path
         let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
-        let path = dunce::canonicalize(&path)?;  // Resolve symlinks
+
+        // Canonicalize to resolve symlinks
+        let path = dunce::canonicalize(&path)
+            .wrap_err_with(|| format!("Failed to canonicalize: {}", path.display()))?;
+
+        // Discover and store the CANONICAL GIT ROOT (handles worktrees/submodules)
+        // discover_git_root is the verification - if it succeeds, it's a valid git repo
         let git_root = velor_core::git::discover_git_root(&path)?;
 
+        // De-duplicate by git_root (prevents same repo registered via different paths)
+        if self.projects.values().any(|p| p.path == git_root) {
+            return Err(color_eyre::eyre!(
+                "This repository is already registered as: {}",
+                self.projects.iter().find(|(_, p)| p.path == git_root).unwrap().0
+            ));
+        }
+
+        // Derive ID from git_root directory name
         let id = id.unwrap_or_else(|| {
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string()
+            git_root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
         });
         let id = self.unique_id(id);
 
         self.projects.insert(id, ProjectEntry {
-            path,
+            path: git_root,  // Store canonical git root, not input path
             enabled: true,
             added_at: Some(chrono::Utc::now().to_rfc3339()),
         });
@@ -395,13 +459,14 @@ pub async fn run_tick(home_cfg: FileConfig, _git_root: PathBuf) -> Result<()> {
     use fs2::FileExt;
     use std::fs::OpenOptions;
 
-    // Acquire single-instance lock
-    let state_dir = dirs::state_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"))
-        .join("velor");
-    std::fs::create_dir_all(&state_dir)?;
+    // Acquire single-instance lock (prefer XDG_RUNTIME_DIR, fall back to XDG_STATE_HOME)
+    let lock_dir = dirs::runtime_dir()
+        .or_else(|| dirs::state_dir())
+        .unwrap_or_else(|| dirs::home_dir().map(|h| h.join(".local/state")).unwrap());
+    let lock_dir = lock_dir.join("velor");
+    std::fs::create_dir_all(&lock_dir)?;
 
-    let lock_path = state_dir.join("automations.lock");
+    let lock_path = lock_dir.join("automations.lock");
     let lock_file = OpenOptions::new().write(true).create(true).open(&lock_path)?;
 
     if lock_file.try_lock_exclusive().is_err() {
@@ -409,14 +474,16 @@ pub async fn run_tick(home_cfg: FileConfig, _git_root: PathBuf) -> Result<()> {
         return Ok(());
     }
 
+    // lock_file stays in scope until end of function, holding the lock
+
     // Load registry
     let registry = ProjectRegistry::load().await?;
 
     // Backwards compatibility: if empty, use current directory
     let projects: Vec<_> = if registry.enabled_iter().count() == 0 {
         let git_root = velor_core::git::discover_git_root(&std::env::current_dir()?)?;
-        println!("⚠️  No projects registered. Running in legacy mode.");
-        println!("   Run 'vel project add .' to enable multi-repo support.");
+        eprintln!("Warning: No projects registered. Running in legacy mode.");
+        eprintln!("Run 'vel project add .' to enable multi-repo support.");
         vec![("current".to_string(), ProjectEntry {
             path: git_root,
             enabled: true,
@@ -427,7 +494,47 @@ pub async fn run_tick(home_cfg: FileConfig, _git_root: PathBuf) -> Result<()> {
     };
 
     let now = chrono::Utc::now();
-    println!("🕐 Tick at {} ({} projects)", now.format("%Y-%m-%d %H:%M:%S UTC"), projects.len());
+    tracing::info!("Tick started at {} for {} projects", now.format("%Y-%m-%d %H:%M:%S UTC"), projects.len());
+
+    // Load global config and global automations ONCE (outside project loop)
+    let global_cfg_path = FileConfig::home_config_path()?;
+    let global_cfg = FileConfig::load_if_exists(&global_cfg_path)?.unwrap_or_default();
+
+    // Track errors across all projects
+    let mut had_errors = false;
+
+    // Process each project (PATH-EXPLICIT, no set_current_dir)
+    for (id, project) in projects {
+        tracing::debug!("Processing project: {}", id);
+
+        let git_root = velor_core::git::discover_git_root(&project.path)?;
+
+        // Load repo config
+        let repo_cfg_path = git_root.join(".velor/velor.toml");
+        let repo_cfg = FileConfig::load_if_exists(&repo_cfg_path)?.unwrap_or_default();
+        let merged_cfg = FileConfig::merge(global_cfg.clone(), repo_cfg);
+
+        // Load and run automations for this project
+        // ... (reuse existing automation logic with explicit git_root)
+        // Set had_errors = true if any automation fails
+    }
+
+    // Single summary line (unless errors occurred)
+    if had_errors {
+        eprintln!("⚠️  Tick completed with errors");
+    } else {
+        tracing::info!("Tick completed successfully");
+    }
+
+    Ok(())
+}
+```
+
+**Key points:**
+- `lock_file` stays in scope until function ends, maintaining the lock
+- Global config/automations loaded once, not per-project
+- Simple `bool` for error tracking (sufficient for single-threaded execution)
+- Quiet by default: only errors go to stderr, everything else uses `tracing!`
 
     // Load global config once
     let global_cfg_path = FileConfig::home_config_path()?;
@@ -523,7 +630,7 @@ pub async fn run_install(interval: Option<u64>) -> Result<()> {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>
@@ -583,22 +690,38 @@ pub async fn run_uninstall() -> Result<()> {
 pub async fn run_status() -> Result<()> {
     let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?.trim().to_string();
     let domain = format!("gui/{}", uid);
-
-    let output = std::process::Command::new("launchctl")
-        .args(["list", &format!("{}/com.liamwh.velor", domain)])
-        .output()?;
-
+    let label = "com.liamwh.velor";
+    let plist = plist_path()?;
     let log_path = log_directory_path()?.join("automations.log");
 
-    if output.status.success() {
+    // Try launchctl print first (more detailed), fall back to list
+    let print_output = std::process::Command::new("launchctl")
+        .args(["print", &format!("{}/{}", domain, label)])
+        .output();
+
+    let is_running = print_output.as_ref().map(|o| o.status.success()).unwrap_or(false);
+
+    if is_running {
         println!("✅ Service is running");
+        println!("   Label: {}", label);
+        println!("   Plist: {}", plist.display());
+        println!("   Logs: {}", log_path.display());
+
         if log_path.exists() {
+            let metadata = std::fs::metadata(&log_path)?;
+            if let Ok(modified) = metadata.modified() {
+                let duration = modified.elapsed()?.as_secs();
+                println!("   Last log: {}s ago", duration);
+            }
             println!("\nRecent logs:");
             let tail = std::process::Command::new("tail").arg("-10").arg(&log_path).output()?;
             print!("{}", String::from_utf8_lossy(&tail.stdout));
         }
     } else {
         println!("❌ Service is not running");
+        if plist.exists() {
+            println!("   Plist exists at: {}", plist.display());
+        }
         println!("   Run 'vel automations install' to install");
     }
     Ok(())

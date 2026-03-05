@@ -8,11 +8,14 @@ use crate::core::config::FileConfig;
 use clap::Args;
 use color_eyre::eyre::WrapErr;
 use color_eyre::eyre::eyre;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use velor_automations::{
     Automation, AutomationCache, AutomationEntry, AutomationRunner, AutomationStore, CatchUpPolicy,
-    merge_automation_vars,
+    ProjectEntry, ProjectRegistry, merge_automation_vars,
 };
 use velor_core::prompts::PromptCache;
 
@@ -461,41 +464,171 @@ pub async fn run_status(
 ///
 /// Executes a single tick of the scheduler - runs all scheduled automations once and exits.
 /// This is designed for use with external schedulers like launchd (macOS) or cron (Linux).
-#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
-pub async fn run_tick(home_cfg: FileConfig, git_root: PathBuf) -> color_eyre::eyre::Result<()> {
-    let config_path = FileConfig::default_config_path(&git_root);
+///
+/// Supports multi-repo automation discovery via ProjectRegistry. If the registry is empty,
+/// falls back to legacy single-repo mode using the current directory.
+#[tracing::instrument(level = "debug", ret, err)]
+pub async fn run_tick(home_cfg: FileConfig, _git_root: PathBuf) -> color_eyre::eyre::Result<()> {
+    use fs2::FileExt;
+
+    // Acquire single-instance lock (prefer XDG_RUNTIME_DIR, fall back to XDG_STATE_HOME)
+    let lock_dir = dirs::runtime_dir()
+        .or_else(dirs::state_dir)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".local/state"))
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+        });
+    let lock_dir = lock_dir.join("velor");
+    std::fs::create_dir_all(&lock_dir)
+        .wrap_err_with(|| format!("Failed to create lock directory: {}", lock_dir.display()))?;
+
+    let lock_path = lock_dir.join("automations.lock");
+    let lock_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)
+        .wrap_err_with(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+
+    if lock_file.try_lock_exclusive().is_err() {
+        tracing::info!("Tick already running, exiting");
+        return Ok(());
+    }
+
+    // Load registry
+    let registry = ProjectRegistry::load()
+        .await
+        .wrap_err("Failed to load project registry")?;
+
+    // Collect projects to process (use BTreeMap for stable ordering)
+    let projects: std::collections::BTreeMap<String, ProjectEntry> =
+        if registry.enabled_projects().is_empty() {
+            // Backwards compatibility: if empty, use current directory
+            let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
+            let git_root = velor_core::git::discover_git_root(&cwd).unwrap_or(cwd.clone());
+
+            eprintln!("Warning: No projects registered. Running in legacy mode.");
+            eprintln!("Run 'vel project add .' to enable multi-repo support.");
+
+            let mut projects = std::collections::BTreeMap::new();
+            projects.insert(
+                "current".to_string(),
+                velor_automations::ProjectEntry {
+                    id: "current".to_string(),
+                    path: git_root,
+                    enabled: true,
+                },
+            );
+            projects
+        } else {
+            // Convert registry Vec to BTreeMap by ID for stable ordering
+            registry
+                .list()
+                .iter()
+                .filter(|p| p.enabled)
+                .map(|p| (p.id.clone(), p.clone()))
+                .collect()
+        };
+
+    let now = chrono::Utc::now();
+    let project_count = projects.len();
+    tracing::info!(
+        "Tick started at {} for {} project(s)",
+        now.format("%Y-%m-%d %H:%M:%S UTC"),
+        project_count
+    );
+
+    // Track errors across all projects
+    let had_errors = Arc::new(AtomicBool::new(false));
+
+    // Load global config once
+    let global_cfg_path =
+        FileConfig::home_config_path().wrap_err("Failed to determine home config path")?;
+    let global_cfg = FileConfig::load_if_exists(&global_cfg_path)?.unwrap_or_default();
+
+    // Process each project (PATH-EXPLICIT, no set_current_dir)
+    for (id, project) in &projects {
+        tracing::debug!("Processing project: {}", id);
+
+        let project_result = process_project_tick(id, project, &global_cfg, &home_cfg, now).await;
+
+        if let Err(e) = project_result {
+            had_errors.store(true, Ordering::Relaxed);
+            eprintln!("❌ Error processing project '{}': {}", id, e);
+        }
+    }
+
+    // Single summary line (only if errors occurred)
+    if had_errors.load(Ordering::Relaxed) {
+        eprintln!("⚠️  Tick completed with errors");
+    } else {
+        tracing::info!("Tick completed successfully");
+    }
+
+    // Lock file is released when it goes out of scope
+    Ok(())
+}
+
+/// Processes automations for a single project during tick.
+///
+/// This function handles all the per-project logic including:
+/// - Loading project-specific config
+/// - Discovering automations from global and project sources
+/// - Running due automations
+///
+/// Uses path-explicit execution (no `set_current_dir`) to ensure safety in multi-repo scenarios.
+#[tracing::instrument(level = "debug", ret, err, skip_all, fields(id = %id))]
+async fn process_project_tick(
+    id: &str,
+    project: &velor_automations::ProjectEntry,
+    global_cfg: &FileConfig,
+    home_cfg: &FileConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> color_eyre::eyre::Result<()> {
+    let git_root = &project.path;
+
+    // Load repo config
+    let config_path = FileConfig::default_config_path(git_root);
     let repo_cfg = FileConfig::load_if_exists(&config_path)
-        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
+        .wrap_err_with(|| format!("Failed to load config at {}", config_path.display()))?
         .unwrap_or_default();
 
-    let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg);
+    // Merge configs: global -> repo
+    let merged_cfg = FileConfig::merge(global_cfg.clone(), repo_cfg);
     let auto_cfg = merged_cfg.automations;
 
     let home_dir = get_xdg_config_home();
     let repo_dir = Some(git_root.join(".velor"));
     let db_path = git_root.join(&auto_cfg.state_db_path);
 
-    // Load automations using cache
-    let cache = AutomationCache::new(home_dir, repo_dir);
-    let automations = cache.get().await?;
+    // Load automations using cache for this project
+    let cache = AutomationCache::new(home_dir.clone(), repo_dir);
+    let automations = cache
+        .get()
+        .await
+        .wrap_err_with(|| format!("Failed to load automations for project '{}'", id))?;
+
     let enabled_automations: Vec<_> = automations
         .into_values()
         .filter(|e| e.automation.enabled)
         .collect();
 
     if enabled_automations.is_empty() {
-        println!("⚠️  No enabled automations found. Exiting.");
+        tracing::debug!("No enabled automations for project '{}'", id);
         return Ok(());
     }
 
-    // Open state database
-    let store = AutomationStore::open(&db_path).await?;
+    // Open state database for this project
+    let store = AutomationStore::open(&db_path)
+        .await
+        .wrap_err_with(|| format!("Failed to open state database at {}", db_path.display()))?;
 
-    // Create runner
+    // Create runner for this project
     let runner = AutomationRunner::new(
         store.clone(),
         auto_cfg.max_concurrent,
-        &git_root,
+        git_root,
         merged_cfg.defaults.binary,
         auto_cfg.max_output_bytes,
     );
@@ -503,21 +636,23 @@ pub async fn run_tick(home_cfg: FileConfig, git_root: PathBuf) -> color_eyre::ey
     // Create cancellation handler
     let (_cancel_handler, cancel_token) = crate::cancellation::CancellationHandler::new();
 
-    let now = chrono::Utc::now();
-    println!("🕐 Tick at {}", now.format("%Y-%m-%d %H:%M:%S UTC"));
+    tracing::debug!(
+        "Processing {} automation(s) for project '{}'",
+        enabled_automations.len(),
+        id
+    );
 
-    // Process all automations once
+    // Process all automations for this project
     process_automations_tick(
         &enabled_automations,
         &runner,
         &cancel_token,
-        &home_cfg,
-        &git_root,
+        home_cfg,
+        git_root,
         now,
     )
-    .await?;
-
-    println!("✅ Tick complete.");
+    .await
+    .wrap_err_with(|| format!("Failed to process automations for project '{}'", id))?;
 
     Ok(())
 }
