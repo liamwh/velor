@@ -29,7 +29,10 @@
 		try {
 			specs = await discoverSpecs();
 			// Select all specs by default
-			selectedSpecs = new SvelteSet(specs.map((s) => s.name));
+			selectedSpecs.clear();
+			for (const spec of specs) {
+				selectedSpecs.add(spec.name);
+			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load specs';
 		} finally {
@@ -46,11 +49,14 @@
 	}
 
 	function selectAll(): void {
-		selectedSpecs = new SvelteSet(specs.map((s) => s.name));
+		selectedSpecs.clear();
+		for (const spec of specs) {
+			selectedSpecs.add(spec.name);
+		}
 	}
 
 	function deselectAll(): void {
-		selectedSpecs = new SvelteSet();
+		selectedSpecs.clear();
 	}
 
 	async function handleGeneratePlan(): Promise<void> {
