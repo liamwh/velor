@@ -42,6 +42,7 @@ regex = "1.10"
 # Automation-specific dependencies
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
 cron = "0.12"
+iana-time-zone = "0.1"
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
