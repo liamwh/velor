@@ -173,6 +173,26 @@ impl Default for RulesConfig {
     }
 }
 
+/// Configuration for the file-based prompts system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptsConfig {
+    /// Whether file-based prompts are enabled.
+    pub enabled: bool,
+
+    /// Directory for prompt definitions (relative to .velor/).
+    pub directory: String,
+}
+
+impl Default for PromptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: "prompts".to_string(),
+        }
+    }
+}
+
 /// Configuration for notifications.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -328,6 +348,10 @@ pub struct FileConfig {
     #[serde(default)]
     pub rules: RulesConfig,
 
+    /// Prompts system configuration.
+    #[serde(default)]
+    pub prompts_config: PromptsConfig,
+
     /// Automations configuration.
     #[serde(default)]
     pub automations: AutomationsConfig,
@@ -414,15 +438,27 @@ pub enum PromptDef {
         #[serde(default)]
         complete_token: Option<String>,
     },
+    /// File-based prompt with optional complete_token override.
+    File {
+        /// Path to the prompt file relative to the prompts directory.
+        path: String,
+        /// Optional override of the completion token for this prompt.
+        #[serde(default)]
+        complete_token: Option<String>,
+    },
 }
 
 impl PromptDef {
     /// Returns the template string.
+    ///
+    /// For `PromptDef::File` variants, this returns the path placeholder
+    /// that should be resolved through the prompt cache.
     #[must_use]
     pub fn template(&self) -> &str {
         match self {
             Self::Inline(s) => s,
             Self::Table { template, .. } => template,
+            Self::File { path, .. } => path,
         }
     }
 
@@ -433,7 +469,14 @@ impl PromptDef {
         match self {
             Self::Inline(_) => None,
             Self::Table { complete_token, .. } => complete_token.as_ref(),
+            Self::File { complete_token, .. } => complete_token.as_ref(),
         }
+    }
+
+    /// Returns whether this is a file-based prompt.
+    #[must_use]
+    pub const fn is_file(&self) -> bool {
+        matches!(self, Self::File { .. })
     }
 }
 
@@ -519,6 +562,7 @@ impl FileConfig {
             plan: overlay.plan,
             notifications: overlay.notifications,
             rules: overlay.rules,
+            prompts_config: overlay.prompts_config,
             automations: overlay.automations,
         }
     }
@@ -774,6 +818,7 @@ mod tests {
             },
             notifications: NotificationsConfig::default(),
             rules: RulesConfig::default(),
+            prompts_config: PromptsConfig::default(),
             automations: AutomationsConfig::default(),
         };
 
@@ -809,6 +854,7 @@ mod tests {
                 ..Default::default()
             },
             rules: RulesConfig::default(),
+            prompts_config: PromptsConfig::default(),
             automations: AutomationsConfig::default(),
         };
 

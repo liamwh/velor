@@ -17,6 +17,7 @@
 //! - [`notification`] - Notification system (Telegram, macOS)
 //! - [`retry`] - Crash resilience and retry logic
 //! - [`rules`] - Project rules system for intelligent AI agent guidance
+//! - [`prompts`] - File-based prompt system
 //! - [`template`] - Template rendering utilities using MiniJinja
 //! - [`acp`] - ACP (Agent Client Protocol) client implementation
 
@@ -29,6 +30,7 @@ pub mod config;
 pub mod execution;
 pub mod git;
 pub mod notification;
+pub mod prompts;
 pub mod retry;
 pub mod rules;
 pub mod template;
@@ -37,8 +39,8 @@ pub mod template;
 pub use agent::{AgentRunner, ClaudeRunResult};
 pub use config::{
     AcpConfig, AutomationsConfig, ConversationDbConfig, Defaults, FileConfig, MacOSConfig,
-    NotificationsConfig, PermissionMode, PlanConfig, PromptDef, Protocol, TelegramConfig,
-    TelegramParseMode,
+    NotificationsConfig, PermissionMode, PlanConfig, PromptDef, PromptsConfig, Protocol,
+    TelegramConfig, TelegramParseMode,
 };
 pub use execution::{
     ExecutionConfig, ExecutionEvent, ExecutionId, ExecutionMetrics, ExecutionRecord, ExecutionState,

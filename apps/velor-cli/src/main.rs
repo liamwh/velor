@@ -30,6 +30,7 @@ use core::{
     notification::{
         NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify,
     },
+    prompts::PromptCache,
     retry::{ConversationHistory, RetryConfig, RetryError},
     rules::{
         RulesCache, RulesState, build_follow_up_prompt_delta, get_rules_by_names, inject_rules,
@@ -808,7 +809,16 @@ async fn run_once(
     let cli_vars = merge_cli_vars(&common.set_vars, extracted_overrides);
     let vars = core::template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
 
-    let template_str = resolve_prompt_template(&common, &file_cfg, &prompt_name)?;
+    // Initialize prompt cache for file-based prompts
+    let home_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .wrap_err("failed to determine home directory")?;
+    let home_velor_dir = std::path::PathBuf::from(home_dir).join(".velor");
+    let repo_velor_dir = git_root.join(".velor");
+    let prompt_cache = PromptCache::new(home_velor_dir, Some(repo_velor_dir));
+
+    let template_str =
+        resolve_prompt_template(&common, &file_cfg, &prompt_name, &prompt_cache).await?;
 
     let rendered = core::template::render_template(&template_str, &vars)?;
 
@@ -940,7 +950,16 @@ async fn run_auto(
     let cli_vars = merge_cli_vars(&common.set_vars, extracted_overrides);
     let vars = core::template::merge_vars(&file_cfg.vars, &cli_vars, &runtime_vars);
 
-    let template_str = resolve_prompt_template(&common, &file_cfg, &prompt_name)?;
+    // Initialize prompt cache for file-based prompts
+    let home_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .wrap_err("failed to determine home directory")?;
+    let home_velor_dir = std::path::PathBuf::from(home_dir).join(".velor");
+    let repo_velor_dir = git_root.join(".velor");
+    let prompt_cache = PromptCache::new(home_velor_dir, Some(repo_velor_dir));
+
+    let template_str =
+        resolve_prompt_template(&common, &file_cfg, &prompt_name, &prompt_cache).await?;
 
     if common.dry_run {
         // Render once with iteration=1 for dry run
@@ -1113,27 +1132,62 @@ async fn run_auto(
     }
 }
 
-/// Resolves the prompt template string from CLI args or config.
+/// Resolves the prompt template string from CLI args, config, or file-based prompts.
 ///
 /// # Errors
 ///
-/// Returns an error if the named prompt is not found in the config.
+/// Returns an error if the named prompt is not found in the config or file-based prompts.
 #[tracing::instrument(level = "debug", ret, err, fields(prompt_name))]
-fn resolve_prompt_template(
+async fn resolve_prompt_template(
     args: &CommonArgs,
     cfg: &FileConfig,
     prompt_name: &str,
+    prompt_cache: &PromptCache,
 ) -> color_eyre::eyre::Result<String> {
+    // CLI --prompt-text takes precedence
     if let Some(s) = args.prompt_text.clone() {
         return Ok(s);
     }
 
+    // Check if prompts are enabled in config
+    if cfg.prompts_config.enabled {
+        // Try to load from file-based prompts first (highest priority for file prompts)
+        if let Ok(prompt) = prompt_cache.get_by_name(prompt_name).await {
+            tracing::debug!("Loaded prompt '{}' from file-based prompts", prompt_name);
+            return Ok(prompt.content);
+        }
+    }
+
+    // Fall back to config prompts
     let prompt_def = cfg.prompts.get(prompt_name).ok_or_else(|| {
         let available: Vec<String> = cfg.prompts.keys().cloned().collect();
         color_eyre::eyre::eyre!(
-            "prompt '{prompt_name}' not found in config. Available prompts: {available:?}"
+            "prompt '{prompt_name}' not found in config or file-based prompts. Available config prompts: {available:?}"
         )
     })?;
+
+    // For File variant, load from prompt cache
+    if prompt_def.is_file() {
+        let path = prompt_def.template();
+        // Extract just the filename from the path (for error messages)
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path);
+
+        // Try to load from cache
+        match prompt_cache.get_by_name(filename).await {
+            Ok(prompt) => {
+                tracing::debug!("Loaded file-based prompt '{}' from: {}", prompt_name, path);
+                return Ok(prompt.content);
+            }
+            Err(e) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "file-based prompt '{prompt_name}' not found at path '{path}': {e}"
+                ));
+            }
+        }
+    }
 
     Ok(prompt_def.template().to_string())
 }
