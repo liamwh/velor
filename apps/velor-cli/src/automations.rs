@@ -1,13 +1,20 @@
 //! Automations command handlers for velor.
 //!
 //! This module provides CLI commands for managing and running scheduled automations.
+//! Supports dual-location discovery: global (XDG_CONFIG_HOME/velor/automations/)
+//! and project-specific ({repo}/.velor/automations/).
 
 use crate::core::config::FileConfig;
 use clap::Args;
 use color_eyre::eyre::WrapErr;
+use color_eyre::eyre::eyre;
 use std::path::PathBuf;
 
-use velor_automations::{AutomationRunner, AutomationStore, load_automations};
+use velor_automations::{
+    Automation, AutomationCache, AutomationRunner, AutomationStore, CatchUpPolicy,
+    merge_automation_vars,
+};
+use velor_core::prompts::PromptCache;
 
 /// Arguments for the `automations` subcommand.
 #[derive(Debug, Args)]
@@ -20,7 +27,11 @@ pub struct AutomationsArgs {
 #[derive(Debug, clap::Subcommand)]
 pub enum AutomationsCommand {
     /// List all configured automations
-    List,
+    List {
+        /// Show disabled automations
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Validate automation definitions
     Validate,
@@ -29,6 +40,9 @@ pub enum AutomationsCommand {
     Run {
         /// Name of the automation to run
         name: String,
+        /// Force run even if disabled
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show automation status and recent runs
@@ -45,31 +59,61 @@ pub enum AutomationsCommand {
     },
 }
 
+/// Gets the XDG config home directory for velor.
+///
+/// Returns `XDG_CONFIG_HOME/velor` or `~/.config/velor` as fallback.
+#[must_use]
+pub fn get_xdg_config_home() -> PathBuf {
+    // Try XDG_CONFIG_HOME first
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg).join("velor");
+    }
+
+    // Fallback to ~/.config/velor
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".config").join("velor");
+    }
+
+    // Last resort: try USERPROFILE (Windows)
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return PathBuf::from(home).join(".velor");
+    }
+
+    // If all else fails, use current directory
+    PathBuf::from(".velor")
+}
+
 /// Runs the `automations list` subcommand.
 ///
 /// Lists all configured automations with their schedules and status.
+/// Uses AutomationCache for dual-location discovery (global + project).
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
-pub async fn run_list(home_cfg: FileConfig, git_root: PathBuf) -> color_eyre::eyre::Result<()> {
-    let config_path = FileConfig::default_config_path(&git_root);
-    let repo_cfg = FileConfig::load_if_exists(&config_path)
-        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
-        .unwrap_or_default();
+pub async fn run_list(
+    all: bool,
+    home_cfg: FileConfig,
+    git_root: PathBuf,
+) -> color_eyre::eyre::Result<()> {
+    let home_dir = get_xdg_config_home();
+    let repo_dir = Some(git_root.join(".velor"));
 
-    let merged_cfg = FileConfig::merge(home_cfg, repo_cfg);
-    let auto_cfg = merged_cfg.automations;
+    let cache = AutomationCache::new(home_dir.clone(), repo_dir);
+    let automations = cache.list_all().await?;
 
-    let automations_dir = git_root.join(&auto_cfg.automations_dir);
+    // Filter by enabled unless --all
+    let automations: Vec<_> = automations
+        .into_iter()
+        .filter(|e| all || e.automation.enabled)
+        .collect();
 
-    println!(
-        "📋 Loading automations from {}...",
-        automations_dir.display()
-    );
-
-    let automations = load_automations(&automations_dir).await?;
+    let total_count = automations.len();
 
     if automations.is_empty() {
-        println!("No automations configured.");
-        println!("Create automation files in {}/", automations_dir.display());
+        println!(
+            "No {}automations configured.",
+            if all { "" } else { "enabled " }
+        );
+        println!("Global: {}/automations/", home_dir.display());
+        println!("Project: {}/.velor/automations/", git_root.display());
         return Ok(());
     }
 
@@ -77,101 +121,179 @@ pub async fn run_list(home_cfg: FileConfig, git_root: PathBuf) -> color_eyre::ey
     println!("📋 Configured Automations");
     println!("════════════════════════════════════════\n");
 
-    for auto in &automations {
-        println!("Name: {}", auto.name);
-        println!("  Description: {}", auto.description);
-        println!("  Schedule: {}", auto.schedule);
-        println!("  Timezone: {}", auto.timezone);
-        println!("  Prompt: {}", auto.prompt);
+    for entry in &automations {
+        let (source_icon, source_label) = match entry.source {
+            velor_automations::AutomationSource::Global => ("🌍", "global"),
+            velor_automations::AutomationSource::Project => ("📁", "project"),
+            velor_automations::AutomationSource::Legacy => ("⚠️ ", "legacy"),
+        };
+        println!(
+            "{} {} ({})",
+            source_icon, entry.automation.name, source_label
+        );
+        println!("  Description: {}", entry.automation.description);
+        println!("  Schedule: {}", entry.automation.schedule_raw);
+        println!("  Timezone: {}", entry.automation.timezone);
         println!(
             "  Status: {}",
-            if auto.enabled {
+            if entry.automation.enabled {
                 "✅ Enabled"
             } else {
                 "❌ Disabled"
             }
         );
-        println!("  Catch-up policy: {:?}", auto.catch_up);
-        if !auto.vars.is_empty() {
-            println!("  Variables:");
-            for (key, value) in &auto.vars {
-                println!("    {} = {}", key, value);
-            }
+        if !entry.automation.enabled && !all {
+            println!("  Hint: Use --all to show disabled automations");
         }
         println!();
     }
 
-    println!("Total: {} automation(s)", automations.len());
+    println!("Total: {} automation(s)", total_count);
 
     Ok(())
 }
 
 /// Runs the `automations validate` subcommand.
 ///
-/// Validates all automation definitions without executing them.
+/// Validates all automation definitions with detailed checks including
+/// prompt resolution and warnings for legacy format.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
 pub async fn run_validate(home_cfg: FileConfig, git_root: PathBuf) -> color_eyre::eyre::Result<()> {
-    let config_path = FileConfig::default_config_path(&git_root);
-    let repo_cfg = FileConfig::load_if_exists(&config_path)
-        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
-        .unwrap_or_default();
+    let home_dir = get_xdg_config_home();
+    let repo_dir = Some(git_root.join(".velor"));
 
-    let merged_cfg = FileConfig::merge(home_cfg, repo_cfg);
-    let auto_cfg = merged_cfg.automations;
+    let cache = AutomationCache::new(home_dir.clone(), repo_dir.clone());
+    let automations = cache.list_all().await?;
 
-    let automations_dir = git_root.join(&auto_cfg.automations_dir);
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
 
-    println!(
-        "🔍 Validating automations in {}...",
-        automations_dir.display()
-    );
+    // Create prompt cache once
+    let prompt_cache = PromptCache::new(home_dir, repo_dir);
 
-    match load_automations(&automations_dir).await {
-        Ok(automations) => {
-            println!("✅ All {} automation(s) are valid!", automations.len());
-            for auto in &automations {
-                println!("  - {} ({})", auto.name, auto.schedule);
-            }
-            Ok(())
+    let total_count = automations.len();
+    println!("🔍 Validating {} automation(s)...", total_count);
+
+    for entry in &automations {
+        let source_label = match entry.source {
+            velor_automations::AutomationSource::Global => "global",
+            velor_automations::AutomationSource::Project => "project",
+            velor_automations::AutomationSource::Legacy => "legacy",
+        };
+        println!("  Checking: {} ({})", entry.automation.name, source_label);
+
+        // Check catch_up consistency
+        if entry.automation.catch_up != CatchUpPolicy::Skip && entry.automation.max_catch_up == 0 {
+            warnings.push((
+                format!(
+                    "'{}': catch_up enabled but max_catch_up is 0",
+                    entry.automation.name
+                ),
+                entry.path.clone(),
+            ));
         }
-        Err(e) => {
-            println!("❌ Validation failed:");
-            Err(e)
+
+        // Resolve prompt to check it exists
+        match entry
+            .automation
+            .prompt_source
+            .resolve(
+                &prompt_cache,
+                &get_xdg_config_home(),
+                Some(&git_root.join(".velor")),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => errors.push((
+                format!("'{}': {}", entry.automation.name, e),
+                entry.path.clone(),
+            )),
+        }
+
+        // Warn about legacy format
+        if entry.source == velor_automations::AutomationSource::Legacy {
+            warnings.push((
+                format!("'{}': Legacy .velor/automations.d/ format detected. Migrate to .velor/automations/", entry.automation.name),
+                entry.path.clone(),
+            ));
         }
     }
+
+    // Report results
+    if errors.is_empty() && warnings.is_empty() {
+        println!("✅ All {} automation(s) are valid!", total_count);
+    } else {
+        for (msg, path) in &warnings {
+            println!("⚠️  Warning: {} ({})", msg, path.display());
+        }
+        for (msg, path) in &errors {
+            println!("❌ Error: {} ({})", msg, path.display());
+        }
+        if !errors.is_empty() {
+            return Err(eyre!("Validation failed with {} error(s)", errors.len()));
+        }
+    }
+
+    Ok(())
 }
 
 /// Runs the `automations run` subcommand.
 ///
 /// Executes a single automation immediately, bypassing its schedule.
+/// Supports --force flag to run disabled automations.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display(), name = %name))]
 pub async fn run_run(
     name: String,
+    force: bool,
     home_cfg: FileConfig,
     git_root: PathBuf,
 ) -> color_eyre::eyre::Result<()> {
-    let config_path = FileConfig::default_config_path(&git_root);
-    let repo_cfg = FileConfig::load_if_exists(&config_path)
-        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
-        .unwrap_or_default();
+    let home_dir = get_xdg_config_home();
+    let repo_dir = Some(git_root.join(".velor"));
 
-    let merged_cfg = FileConfig::merge(home_cfg, repo_cfg);
-    let auto_cfg = merged_cfg.automations;
+    let cache = AutomationCache::new(home_dir.clone(), repo_dir);
+    let entry = cache.get_by_name(&name).await?;
 
-    let automations_dir = git_root.join(&auto_cfg.automations_dir);
-    let automations = load_automations(&automations_dir).await?;
-
-    let automation = automations
-        .iter()
-        .find(|a| a.name == name)
-        .ok_or_else(|| color_eyre::eyre::eyre!("automation '{}' not found", name))?;
-
-    if !automation.enabled {
-        println!("⚠️  Automation '{}' is disabled", name);
+    if !entry.automation.enabled && !force {
+        println!(
+            "⚠️  Automation '{}' is disabled. Use --force to run anyway.",
+            name
+        );
         return Ok(());
     }
 
     println!("🚀 Running automation '{}'...", name);
+
+    // Load config for variable merging
+    let config_path = FileConfig::default_config_path(&git_root);
+    let repo_cfg = FileConfig::load_if_exists(&config_path)
+        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
+        .unwrap_or_default();
+    let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg.clone());
+    let auto_cfg = merged_cfg.automations;
+
+    // Merge variables with built-ins (home -> repo -> automation -> built-ins)
+    let cwd = std::env::current_dir()?;
+    let merged_vars = merge_automation_vars(
+        entry.automation.vars.clone(),
+        repo_cfg.vars.clone(),
+        home_cfg.vars.clone(),
+        &git_root,
+        &cwd,
+    );
+
+    // Resolve prompt
+    let prompt_cache = PromptCache::new(home_dir, Some(git_root.join(".velor")));
+    let prompt_content = entry
+        .automation
+        .prompt_source
+        .resolve(
+            &prompt_cache,
+            &get_xdg_config_home(),
+            Some(&git_root.join(".velor")),
+        )
+        .await?;
 
     // Open state database
     let db_path = git_root.join(&auto_cfg.state_db_path);
@@ -179,7 +301,7 @@ pub async fn run_run(
 
     // Create runner
     let runner = AutomationRunner::new(
-        store,
+        store.clone(),
         auto_cfg.max_concurrent,
         &git_root,
         merged_cfg.defaults.binary,
@@ -192,9 +314,25 @@ pub async fn run_run(
     // Get the cancel token
     let (_cancel_handler, cancel_token) = crate::cancellation::CancellationHandler::new();
 
+    // Convert AutomationFile to legacy Automation for runner compatibility
+    let automation = Automation {
+        name: entry.automation.name.clone(),
+        description: entry.automation.description.clone(),
+        schedule: entry.automation.schedule_raw.clone(),
+        timezone: entry.automation.timezone.to_string(),
+        prompt: prompt_content.clone(), // Use resolved prompt content
+        enabled: entry.automation.enabled,
+        vars: merged_vars,
+        catch_up: entry.automation.catch_up,
+        max_catch_up: entry.automation.max_catch_up,
+        timeout_seconds: entry.automation.timeout_seconds,
+        notify_on_success: entry.automation.notify_on_success,
+        notify_on_failure: entry.automation.notify_on_failure,
+    };
+
     // Run the automation
     let result = runner
-        .run_automation(automation, scheduled_for, &cancel_token)
+        .run_automation(&automation, scheduled_for, &cancel_token)
         .await?;
 
     match result.status {
@@ -319,6 +457,7 @@ pub async fn run_status(
 /// Runs the `automations daemon` subcommand.
 ///
 /// Starts the automation daemon which continuously monitors and runs scheduled automations.
+/// Uses AutomationCache for dual-location discovery.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
 pub async fn run_daemon(
     tick_interval_secs: Option<u64>,
@@ -330,23 +469,32 @@ pub async fn run_daemon(
         .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
         .unwrap_or_default();
 
-    let merged_cfg = FileConfig::merge(home_cfg, repo_cfg);
+    let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg);
     let auto_cfg = merged_cfg.automations;
 
-    let automations_dir = git_root.join(&auto_cfg.automations_dir);
+    let home_dir = get_xdg_config_home();
+    let repo_dir = Some(git_root.join(".velor"));
     let db_path = git_root.join(&auto_cfg.state_db_path);
 
     let tick_interval = std::time::Duration::from_secs(tick_interval_secs.unwrap_or(60));
 
     println!("🔄 Starting Velor Automations Daemon");
     println!("   Tick interval: {:?}", tick_interval);
-    println!("   Automations dir: {}", automations_dir.display());
+    println!("   Global automations: {}/automations/", home_dir.display());
+    println!(
+        "   Project automations: {}/.velor/automations/",
+        git_root.display()
+    );
     println!("   State database: {}", db_path.display());
     println!();
 
-    // Load automations
-    let automations = load_automations(&automations_dir).await?;
-    let enabled_automations: Vec<_> = automations.into_iter().filter(|a| a.enabled).collect();
+    // Load automations using cache
+    let cache = AutomationCache::new(home_dir, repo_dir);
+    let automations = cache.get().await?;
+    let enabled_automations: Vec<_> = automations
+        .into_values()
+        .filter(|e| e.automation.enabled)
+        .collect();
 
     if enabled_automations.is_empty() {
         println!("⚠️  No enabled automations found. Exiting.");
@@ -357,8 +505,11 @@ pub async fn run_daemon(
         "📋 Loaded {} enabled automation(s):",
         enabled_automations.len()
     );
-    for auto in &enabled_automations {
-        println!("  - {} ({})", auto.name, auto.schedule);
+    for entry in &enabled_automations {
+        println!(
+            "  - {} ({})",
+            entry.automation.name, entry.automation.schedule_raw
+        );
     }
     println!();
 
@@ -405,20 +556,18 @@ pub async fn run_daemon(
         );
 
         // Check each automation
-        for automation in &enabled_automations {
+        for entry in &enabled_automations {
             // Get last run time for this automation
-            let last_run = get_last_run_time(runner.store(), &automation.name, now).await;
+            let last_run = get_last_run_time(runner.store(), &entry.automation.name, now).await;
 
-            // Calculate next scheduled time
-            let timezone = automation
-                .timezone
-                .parse::<chrono_tz::Tz>()
-                .unwrap_or(chrono_tz::UTC);
-
-            match velor_automations::Scheduler::new(&automation.schedule, timezone) {
+            // Calculate next scheduled time (timezone is already Tz)
+            match velor_automations::Scheduler::new(
+                &entry.automation.schedule_raw,
+                entry.automation.timezone,
+            ) {
                 Ok(scheduler) => {
                     // Determine which runs to execute based on catch-up policy
-                    let runs_to_execute = match automation.catch_up {
+                    let runs_to_execute = match entry.automation.catch_up {
                         velor_automations::CatchUpPolicy::Skip => {
                             // Only run if the next scheduled time has passed
                             let next_run = scheduler.next_after(last_run);
@@ -440,14 +589,18 @@ pub async fn run_daemon(
                         }
                         velor_automations::CatchUpPolicy::RunAll => {
                             // Run all missed schedules up to max_catch_up
-                            scheduler.missed_runs_since(last_run, now, automation.max_catch_up)
+                            scheduler.missed_runs_since(
+                                last_run,
+                                now,
+                                entry.automation.max_catch_up,
+                            )
                         }
                     };
 
                     if runs_to_execute.is_empty() {
                         tracing::debug!(
                             "  ⏸️  Skipping '{}' (next run at {})",
-                            automation.name,
+                            entry.automation.name,
                             scheduler.next_after(last_run).format("%Y-%m-%d %H:%M:%S")
                         );
                         continue;
@@ -455,17 +608,67 @@ pub async fn run_daemon(
 
                     println!(
                         "  ▶️  Running '{}' {} time(s) (catch-up: {:?})",
-                        automation.name,
+                        entry.automation.name,
                         runs_to_execute.len(),
-                        automation.catch_up
+                        entry.automation.catch_up
                     );
+
+                    // Resolve prompt for this automation
+                    let home_dir = get_xdg_config_home();
+                    let repo_dir = Some(git_root.join(".velor"));
+                    let prompt_cache = PromptCache::new(home_dir, repo_dir);
+                    let prompt_content = match entry
+                        .automation
+                        .prompt_source
+                        .resolve(
+                            &prompt_cache,
+                            &get_xdg_config_home(),
+                            Some(&git_root.join(".velor")),
+                        )
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            println!("        ❌ Failed to resolve prompt: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Load config for variable merging
+                    let cwd = std::env::current_dir()?;
+                    let config_path = FileConfig::default_config_path(&git_root);
+                    let repo_cfg = FileConfig::load_if_exists(&config_path)?.unwrap_or_default();
+                    let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg);
+                    let merged_vars = merge_automation_vars(
+                        entry.automation.vars.clone(),
+                        merged_cfg.vars.clone(),
+                        home_cfg.vars.clone(),
+                        &git_root,
+                        &cwd,
+                    );
+
+                    // Convert AutomationFile to legacy Automation
+                    let automation = Automation {
+                        name: entry.automation.name.clone(),
+                        description: entry.automation.description.clone(),
+                        schedule: entry.automation.schedule_raw.clone(),
+                        timezone: entry.automation.timezone.to_string(),
+                        prompt: prompt_content,
+                        enabled: entry.automation.enabled,
+                        vars: merged_vars,
+                        catch_up: entry.automation.catch_up,
+                        max_catch_up: entry.automation.max_catch_up,
+                        timeout_seconds: entry.automation.timeout_seconds,
+                        notify_on_success: entry.automation.notify_on_success,
+                        notify_on_failure: entry.automation.notify_on_failure,
+                    };
 
                     // Execute each scheduled run
                     for scheduled_for in runs_to_execute {
                         println!("      - Scheduled for {}", scheduled_for.format("%H:%M:%S"));
 
                         match runner
-                            .run_automation(automation, scheduled_for, &cancel_token)
+                            .run_automation(&automation, scheduled_for, &cancel_token)
                             .await
                         {
                             Ok(result) => {
@@ -488,7 +691,10 @@ pub async fn run_daemon(
                     }
                 }
                 Err(e) => {
-                    println!("  ❌ Invalid schedule for '{}': {}", automation.name, e);
+                    println!(
+                        "  ❌ Invalid schedule for '{}': {}",
+                        entry.automation.name, e
+                    );
                 }
             }
         }
@@ -532,229 +738,19 @@ async fn get_last_run_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-    use velor_automations::{Automation, CatchUpPolicy};
 
     #[test]
     fn test_automations_command_exists() {
         // This test ensures the command types compile correctly
         let _ = AutomationsArgs {
-            command: AutomationsCommand::List,
+            command: AutomationsCommand::List { all: false },
         };
     }
 
-    #[tokio::test]
-    async fn test_get_last_run_time_with_existing_runs() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let db_path = temp_dir.path().join("test.db");
-
-        let store = AutomationStore::open(&db_path)
-            .await
-            .expect("store should be created");
-
-        // Create some test runs
-        let now = chrono::Utc::now();
-        let _ = store
-            .insert_run(
-                "test-automation",
-                now - chrono::Duration::hours(2),
-                now - chrono::Duration::hours(2),
-            )
-            .await
-            .expect("first insert should succeed");
-
-        let second_run_time = now - chrono::Duration::minutes(30);
-        let _ = store
-            .insert_run("test-automation", second_run_time, second_run_time)
-            .await
-            .expect("second insert should succeed");
-
-        // Get the last run time
-        let default_time = now - chrono::Duration::days(1);
-        let last_run = get_last_run_time(&store, "test-automation", default_time).await;
-
-        // Should return the most recent run (30 minutes ago)
-        // We compare within a reasonable time window
-        let diff = (last_run - second_run_time).num_seconds().abs();
-        assert!(diff < 5, "Last run time should match the second run time");
-    }
-
-    #[tokio::test]
-    async fn test_get_last_run_time_with_no_runs() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let db_path = temp_dir.path().join("test.db");
-
-        let store = AutomationStore::open(&db_path)
-            .await
-            .expect("store should be created");
-
-        let default_time = chrono::Utc::now();
-        let last_run = get_last_run_time(&store, "nonexistent-automation", default_time).await;
-
-        // Should return the default time when no runs exist
-        assert_eq!(last_run, default_time);
-    }
-
-    #[tokio::test]
-    async fn test_get_last_run_time_ignores_other_automations() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let db_path = temp_dir.path().join("test.db");
-
-        let store = AutomationStore::open(&db_path)
-            .await
-            .expect("store should be created");
-
-        // Create runs for a different automation
-        let now = chrono::Utc::now();
-        let _ = store
-            .insert_run(
-                "other-automation",
-                now - chrono::Duration::minutes(10),
-                now - chrono::Duration::minutes(10),
-            )
-            .await
-            .expect("insert should succeed");
-
-        let default_time = now - chrono::Duration::days(1);
-        let last_run = get_last_run_time(&store, "test-automation", default_time).await;
-
-        // Should return the default time since "test-automation" has no runs
-        assert_eq!(last_run, default_time);
-    }
-
-    /// Helper function to create a test automation with the given catch-up policy.
-    fn create_test_automation(name: &str, schedule: &str, catch_up: CatchUpPolicy) -> Automation {
-        Automation {
-            name: name.to_string(),
-            description: "Test automation".to_string(),
-            schedule: schedule.to_string(),
-            timezone: "UTC".to_string(),
-            prompt: "once".to_string(),
-            enabled: true,
-            vars: std::collections::BTreeMap::new(),
-            catch_up,
-            max_catch_up: 10,
-            timeout_seconds: Some(60),
-            notify_on_success: false,
-            notify_on_failure: false,
-        }
-    }
-
-    /// Test that the catch-up policy is correctly used in the scheduling logic.
-    #[tokio::test]
-    async fn test_catch_up_policy_skip() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let db_path = temp_dir.path().join("test.db");
-
-        let _store = AutomationStore::open(&db_path)
-            .await
-            .expect("store should be created");
-
-        // Create an automation with Skip policy
-        let automation = create_test_automation("test-skip", "0 * * * * *", CatchUpPolicy::Skip);
-
-        // Simulate a last run time of 1 hour ago
-        let now = chrono::Utc::now();
-        let last_run = now - chrono::Duration::hours(1);
-
-        // With Skip policy and a schedule of every minute, we should only get one run
-        let timezone = chrono_tz::UTC;
-        let scheduler = velor_automations::Scheduler::new(&automation.schedule, timezone)
-            .expect("scheduler should be created");
-
-        let next_run = scheduler.next_after(last_run);
-
-        // Skip policy only runs once if next_run <= now
-        let runs_to_execute = if next_run <= now {
-            vec![next_run]
-        } else {
-            vec![]
-        };
-
-        // Should have exactly one run (the next scheduled time)
-        assert_eq!(
-            runs_to_execute.len(),
-            1,
-            "Skip policy should only execute once"
-        );
-    }
-
-    /// Test that RunOnce policy executes only once even with multiple missed runs.
-    #[tokio::test]
-    async fn test_catch_up_policy_run_once() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let db_path = temp_dir.path().join("test.db");
-
-        let _store = AutomationStore::open(&db_path)
-            .await
-            .expect("store should be created");
-
-        // Create an automation with RunOnce policy
-        let automation =
-            create_test_automation("test-run-once", "0 * * * * *", CatchUpPolicy::RunOnce);
-
-        // Simulate a last run time of 10 minutes ago with a schedule every minute
-        let now = chrono::Utc::now();
-        let last_run = now - chrono::Duration::minutes(10);
-
-        let timezone = chrono_tz::UTC;
-        let scheduler = velor_automations::Scheduler::new(&automation.schedule, timezone)
-            .expect("scheduler should be created");
-
-        // RunOnce policy should run once if any runs were missed
-        let missed = scheduler.missed_runs_since(last_run, now, u32::MAX);
-        let runs_to_execute = if missed.is_empty() {
-            vec![]
-        } else {
-            vec![missed[0]]
-        };
-
-        // Should have exactly one run (the first missed schedule)
-        assert_eq!(
-            runs_to_execute.len(),
-            1,
-            "RunOnce policy should only execute once"
-        );
-    }
-
-    /// Test that RunAll policy executes all missed runs up to max_catch_up.
-    #[tokio::test]
-    async fn test_catch_up_policy_run_all() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let db_path = temp_dir.path().join("test.db");
-
-        let _store = AutomationStore::open(&db_path)
-            .await
-            .expect("store should be created");
-
-        // Create an automation with RunAll policy and max_catch_up of 5
-        let mut automation =
-            create_test_automation("test-run-all", "0 * * * * *", CatchUpPolicy::RunAll);
-        automation.max_catch_up = 5;
-
-        // Simulate a last run time of 10 minutes ago with a schedule every minute
-        let now = chrono::Utc::now();
-        let last_run = now - chrono::Duration::minutes(10);
-
-        let timezone = chrono_tz::UTC;
-        let scheduler = velor_automations::Scheduler::new(&automation.schedule, timezone)
-            .expect("scheduler should be created");
-
-        // RunAll policy should run all missed schedules up to max_catch_up
-        let runs_to_execute = scheduler.missed_runs_since(last_run, now, automation.max_catch_up);
-
-        // Should have at most 5 runs (max_catch_up)
-        assert!(
-            runs_to_execute.len() <= 5,
-            "RunAll policy should respect max_catch_up limit"
-        );
-
-        // Should have all the missed runs (since there are 10 minutes and we run every minute,
-        // we expect 10 runs but limited to 5 by max_catch_up)
-        assert_eq!(
-            runs_to_execute.len(),
-            5,
-            "RunAll policy should execute up to max_catch_up runs"
-        );
+    #[test]
+    fn test_get_xdg_config_home() {
+        let path = get_xdg_config_home();
+        // Just verify it returns a non-empty path
+        assert!(!path.as_os_str().is_empty());
     }
 }

@@ -556,9 +556,11 @@ async fn run_automations(
     use automations::AutomationsCommand;
 
     match args.command {
-        AutomationsCommand::List => automations::run_list(home_cfg, git_root).await,
+        AutomationsCommand::List { all } => automations::run_list(all, home_cfg, git_root).await,
         AutomationsCommand::Validate => automations::run_validate(home_cfg, git_root).await,
-        AutomationsCommand::Run { name } => automations::run_run(name, home_cfg, git_root).await,
+        AutomationsCommand::Run { name, force } => {
+            automations::run_run(name, force, home_cfg, git_root).await
+        }
         AutomationsCommand::Status { name } => {
             automations::run_status(name, home_cfg, git_root).await
         }
@@ -720,7 +722,7 @@ async fn run_interactive_menu(
         }
         MenuChoice::Automations => {
             // When selected from TUI, show the list of automations
-            automations::run_list(home_cfg, git_root).await
+            automations::run_list(false, home_cfg, git_root).await
         }
         MenuChoice::Quit => Ok(()),
     }

@@ -954,11 +954,12 @@ ulid = "1.1"
 
 **File: `crates/automations/src/state.rs`** (new)
 
-Add state tracking with UNIQUE constraint pattern for idempotency:
+Add state tracking with UNIQUE constraint pattern for idempotency using sqlx:
 
 ```rust
-use rusqlite::{params, Connection};
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, ConnectOptions};
 use std::path::Path;
+use std::str::FromStr;
 
 /// Run status with string constants for consistency
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -992,17 +993,21 @@ impl RunStatus {
 
 /// State database for tracking automation runs with idempotency
 pub struct AutomationState {
-    conn: Connection,
+    pool: SqlitePool,
 }
 
 impl AutomationState {
     /// Open or create state database at given path
-    pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+    pub async fn open(path: &Path) -> Result<Self> {
+        let options = SqliteConnectOptions::from_str(path.to_str().unwrap())?
+            .create_if_missing(true);
+
+        let pool = SqlitePool::connect_with(options).await?;
 
         // Create runs table with UNIQUE constraint for idempotency
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS runs (
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 automation_name TEXT NOT NULL,
                 scheduled_for TEXT NOT NULL,
@@ -1011,25 +1016,30 @@ impl AutomationState {
                 finished_at TEXT,
                 error_message TEXT,
                 UNIQUE(automation_name, scheduled_for)
-            )",
-            [],
-        )?;
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
 
         // Create index for faster queries
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_runs_automation
-             ON runs(automation_name, scheduled_for DESC)",
-            [],
-        )?;
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_runs_automation
+            ON runs(automation_name, scheduled_for DESC)
+            "#,
+        )
+        .execute(&pool)
+        .await?;
 
-        Ok(Self { conn })
+        Ok(Self { pool })
     }
 
     /// Attempt to start a run for an automation at a scheduled time.
     /// Returns Ok(id) if the run was started, Err if already running/completed.
     ///
     /// Stale runs (exceeded stale_timeout) are allowed to retry.
-    pub fn try_start_run(
+    pub async fn try_start_run(
         &self,
         name: &str,
         scheduled_for: chrono::DateTime<chrono::Utc>,
@@ -1038,32 +1048,43 @@ impl AutomationState {
         let scheduled_str = scheduled_for.to_rfc3339();
         let started_at = chrono::Utc::now().to_rfc3339();
         let now = chrono::Utc::now();
+        let stale_cutoff = now - stale_timeout;
 
         // Try to insert - UNIQUE constraint prevents duplicates
-        match self.conn.execute(
-            "INSERT INTO runs (automation_name, scheduled_for, status, started_at)
-             VALUES (?, ?, ?, ?)",
-            params![name, scheduled_str, RunStatus::Running.as_str(), started_at],
-        ) {
-            Ok(_) => Ok(self.conn.last_insert_rowid()),
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
+        match sqlx::query(
+            r#"
+            INSERT INTO runs (automation_name, scheduled_for, status, started_at)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(name)
+        .bind(&scheduled_str)
+        .bind(RunStatus::Running.as_str())
+        .bind(&started_at)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(result) => Ok(result.last_insert_rowid()),
+            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // Check if there's a stale running run
-                let stale_cutoff = now - stale_timeout;
-
                 if let Some((id, started_at_str)) =
-                    self.get_run_info(name, scheduled_for)?
+                    self.get_run_info(name, scheduled_for).await?
                 {
                     if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&started_at_str) {
                         let started = started.with_timezone(&chrono::Utc);
                         if started < stale_cutoff {
                             // Stale run - allow retry by updating it
-                            self.conn.execute(
-                                "UPDATE runs SET status = ?, started_at = ?, error_message = NULL
-                                 WHERE id = ?",
-                                params![RunStatus::Running.as_str(), started_at, id],
-                            )?;
+                            sqlx::query(
+                                r#"
+                                UPDATE runs SET status = ?1, started_at = ?2, error_message = NULL
+                                WHERE id = ?3
+                                "#,
+                            )
+                            .bind(RunStatus::Running.as_str())
+                            .bind(&started_at)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await?;
                             return Ok(id);
                         }
                     }
@@ -1075,75 +1096,78 @@ impl AutomationState {
     }
 
     /// Mark a run as completed
-    pub fn complete_run(&self, id: i64) -> Result<()> {
+    pub async fn complete_run(&self, id: i64) -> Result<()> {
         let finished_at = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
+        sqlx::query(
             "UPDATE runs SET status = ?, finished_at = ? WHERE id = ?",
-            params![RunStatus::Completed.as_str(), finished_at, id],
-        )?;
+        )
+        .bind(RunStatus::Completed.as_str())
+        .bind(&finished_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     /// Mark a run as failed with an error message
-    pub fn fail_run(&self, id: i64, error: &str) -> Result<()> {
+    pub async fn fail_run(&self, id: i64, error: &str) -> Result<()> {
         let finished_at = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
+        sqlx::query(
             "UPDATE runs SET status = ?, finished_at = ?, error_message = ? WHERE id = ?",
-            params![RunStatus::Failed.as_str(), finished_at, error, id],
-        )?;
+        )
+        .bind(RunStatus::Failed.as_str())
+        .bind(&finished_at)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     /// Get the most recent completed run for an automation
-    pub fn get_last_completed_run(
+    pub async fn get_last_completed_run(
         &self,
         name: &str,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let mut stmt = self.conn.prepare(
+        let row = sqlx::query_as::<_, (String,)>(
             "SELECT scheduled_for FROM runs
              WHERE automation_name = ? AND status = ?
              ORDER BY scheduled_for DESC
              LIMIT 1"
-        )?;
+        )
+        .bind(name)
+        .bind(RunStatus::Completed.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
 
-        match stmt.query_row(
-            params![name, RunStatus::Completed.as_str()],
-            |row| {
-                let scheduled_for: String = row.get(0)?;
-                Ok(scheduled_for)
-            }
-        ) {
-            Ok(s) => {
+        match row {
+            Some((s,)) => {
                 let dt = chrono::DateTime::parse_from_rfc3339(&s)?
                     .with_timezone(&chrono::Utc);
                 Ok(Some(dt))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            None => Ok(None),
         }
     }
 
     /// Get run info for idempotency check
-    fn get_run_info(
+    async fn get_run_info(
         &self,
         name: &str,
         scheduled_for: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<(i64, String)>> {
         let scheduled_str = scheduled_for.to_rfc3339();
-        let mut stmt = self.conn.prepare(
+
+        let row = sqlx::query_as::<_, (i64, String)>(
             "SELECT id, started_at FROM runs
              WHERE automation_name = ? AND scheduled_for = ?"
-        )?;
+        )
+        .bind(name)
+        .bind(&scheduled_str)
+        .fetch_optional(&self.pool)
+        .await?;
 
-        match stmt.query_row(params![name, scheduled_str], |row| {
-            let id: i64 = row.get(0)?;
-            let started_at: String = row.get(1)?;
-            Ok((id, started_at))
-        }) {
-            Ok(info) => Ok(Some(info)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(row)
     }
 }
 ```
@@ -1152,9 +1176,16 @@ impl AutomationState {
 
 **Idempotency**: The `UNIQUE(automation_name, scheduled_for)` constraint ensures that the same scheduled run can never be executed twice, even if `tick` is invoked concurrently or the process crashes mid-execution. Stale runs are allowed to retry based on the automation's `stale_run_timeout()` (2x the automation's timeout, minimum 15 minutes).
 
-**RunStatus**: Uses consistent string constants to avoid typos that could cause runs to get stuck.
+**RunStatus**: Uses consistent string constants and `FromStr` impl to avoid typos that could cause runs to get stuck.
 
 **IMPORTANT**: All `scheduled_for` values are stored in UTC (RFC3339) to ensure the UNIQUE constraint is stable across DST transitions. The conversion from timezone-aware cron to UTC happens at evaluation time, before storage.
+
+**Dependencies** (add to `Cargo.toml`):
+
+```toml
+# For async SQLite with compile-time checked queries
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+```
 
 ### Phase 5: CLI Flags
 
@@ -1492,10 +1523,10 @@ pub use vars::merge_automation_vars;
 | `crates/automations/src/cache.rs` | New: `AutomationCache` (loads fresh, no TTL), `parse_automation_file()`, async metadata validation |
 | `crates/automations/src/vars.rs` | New: `merge_automation_vars()` with built-ins, best-effort branch lookup |
 | `crates/automations/src/runner.rs` | Modify: `resolve_git_root()` with OsStr, `generate_worktree_path()`, `init_worktrees_base()`, `prune_orphaned_worktrees()` |
-| `crates/automations/src/state.rs` | New: `AutomationState` with UNIQUE constraint, `RunStatus` constants, per-automation stale timeout |
+| `crates/automations/src/state.rs` | New: `AutomationState` with sqlx async SQLite, UNIQUE constraint, `RunStatus` constants, per-automation stale timeout |
 | `crates/automations/src/lib.rs` | Modify: Export new modules |
 | `apps/velor-cli/src/automations.rs` | Modify: Use `AutomationCache`, `get_xdg_config_home()`, `--all`, `--force`, `tick` command |
-| `Cargo.toml` (workspace) | Add dependencies: `cron = "0.12"`, `iana-time-zone = "0.1"`, `ulid = "1.1"` |
+| `Cargo.toml` (workspace) | Add dependencies: `cron = "0.12"`, `iana-time-zone = "0.1"`, `ulid = "1.1"`, `sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }` |
 
 ## Example Automation Files
 
