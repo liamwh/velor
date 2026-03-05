@@ -1,39 +1,41 @@
-# Progress Handoff - Fixed Svelte Non-Reactive Update Warning
+# Progress Handoff - Fixed Cancellation Test Flake
 
 ## Session Summary
 
-Fixed the non-reactive update warning in `apps/velor/src/lib/components/plan/PlanGenerator.svelte`. The issue was that `selectedSpecs` (a `SvelteSet`) was being reassigned rather than mutated. Fixed by replacing variable reassignments with mutations (`clear()` + `add()`).
+Fixed the `test_cancellation_handler_initial_state` test flakiness in `apps/velor-cli/src/cancellation.rs`. The issue was that `ctrlc::set_handler()` can only be called once per process, but multiple tests were trying to register Ctrl+C handlers, causing a `MultipleHandlers` error.
 
 ## Changes Made
 
 ### Modified Files
 
-1. **`apps/velor/src/lib/components/plan/PlanGenerator.svelte`**
-   - `loadSpecs()`: Replaced `selectedSpecs = new SvelteSet(...)` with `clear()` + loop of `add()`
-   - `selectAll()`: Replaced `selectedSpecs = new SvelteSet(...)` with `clear()` + loop of `add()`
-   - `deselectAll()`: Replaced `selectedSpecs = new SvelteSet()` with `clear()`
-
-The `SvelteSet` class from `svelte/reactivity` is already reactive for mutations. The svelte-check warning was triggered by variable reassignments, which are not reactive in Svelte 5. The fix uses mutations instead of reassignments.
+1. **`apps/velor-cli/src/cancellation.rs`**
+   - Added `new_with_handler(register_handler: bool)` private method to optionally skip Ctrl+C handler registration
+   - Updated `CancellationHandler::new()` to call `new_with_handler(true)`
+   - Updated tests to use `new_with_handler(false)` to avoid the "MultipleHandlers" error
 
 ## Plan Status
 
-The file-based automations plan (Phases 1-6) is **complete**. All required features have been implemented and tested (106 tests passing).
+The file-based automations plan (Phases 1-6) is **complete**. All required features have been implemented and tested:
 
-## Remaining Optional Work
+- **Phase 1**: Core types (`file_config.rs`) - `AutomationFile`, `PromptSource`, `AutomationSource`, cron parsing with DST tests
+- **Phase 2**: Automation Cache (`cache.rs`) - global/project discovery, override precedence
+- **Phase 2b**: Prompt Source Resolution - `resolve()` method for inline/prompt_file/prompt_name
+- **Phase 3**: Variable Merging (`vars.rs`) - built-ins, automation > repo > home precedence
+- **Phase 4**: Update AutomationRunner (`runner.rs`) - git root resolution, worktree handling, ULID collision resistance
+- **Phase 4b**: State Tracking (`state.rs`) - SQLite state DB with UNIQUE constraint, stale run handling
+- **Phase 5**: CLI Flags (`apps/velor-cli/src/automations.rs`) - list, validate, run, status, tick commands
+- **Phase 6**: Exports (`lib.rs`) - all modules exported
 
-1. Address Svelte warnings in AutomationRuns.svelte - These are intentionally ignored with `/* svelte-ignore css_unused_selector */` comments (CSS classes kept for future use)
+### Test Results
+- **226 tests passing** (106 in automations crate)
+- All verification steps covered: DST behavior, cron parsing, override precedence, variable merging, worktree handling, state idempotency, non-UTF8 paths, stale-run timeout
+
+### Optional Work
+The 6 intentionally-ignored Svelte CSS warnings in `AutomationRuns.svelte` remain. These are kept with `/* svelte-ignore css_unused_selector */` comments for future use and are not considered issues.
 
 ## No Blockers
 
-All checks pass with only 6 intentionally-ignored Svelte CSS warnings remaining (unrelated to this plan).
-
-## Previous Uncommitted Changes
-
-The following changes were present before this session and remain uncommitted:
-- `.velor/velor.toml`: Added `rules_dir = ".agents/rules/"`
-- `crates/automations/src/cache.rs`: Minor formatting fix (line break in error context)
-- `justfile`: Changed `velor` → `vel` (binary name references)
-- Deleted: `.agents/rules/always-test.mdc`
+All checks pass with only the intentionally-ignored Svelte warnings remaining.
 
 ## Commit Reference
 
