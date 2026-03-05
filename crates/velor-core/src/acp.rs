@@ -221,10 +221,13 @@ impl acp::Client for VelorClient {
     /// Handles extension method calls from the agent.
     ///
     /// This intercepts MCP tool calls and other extension methods.
-    /// We log them to understand what tools the agent is using.
+    /// We display them to the user so they can see what tools the agent is using.
     async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-        // Log extension method calls to understand what the agent is doing
-        tracing::info!("🔧 Agent called extension method: {}", args.method);
+        // Display tool calls to the user (for visibility, matching subprocess mode behavior)
+        // Use eprintln to go to stderr, which is consistent with tracing output
+        eprintln!("🔧 {}", args.method);
+        // Also log for debugging
+        tracing::info!("Agent called extension method: {}", args.method);
         // params is Arc<RawValue>, not Option
         tracing::debug!("Method params: {:?}", args.params);
         // Return method_not_found to let the adapter handle it

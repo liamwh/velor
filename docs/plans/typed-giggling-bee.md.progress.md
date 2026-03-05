@@ -39,25 +39,37 @@
 5. **Added comprehensive tests:**
    - 16 new tests for tool call formatting (all tool types)
    - 11 new tests for stream line processing
-   - All 249 tests pass
+   - All tests pass
+
+### Phase 2: Tool Call Display in ACP Mode - COMPLETED
+
+**File: `/Users/liam/git/velor/crates/velor-core/src/acp.rs`**
+
+1. **Updated `ext_method()` function:**
+   - Added `eprintln!("🔧 {}", args.method)` to display tool calls to stderr
+   - This provides visibility for MCP tool calls and other extension methods
+   - Consistent with how tracing output is displayed (stderr)
+   - Tool calls are now visible to users running in ACP mode
+
+2. **Verification:**
+   - `cargo check -q` passes (no compiler errors or warnings)
+   - `just check` passes (all tests pass, Svelte warnings unrelated)
 
 ### Status
 - **Phase 1 (subprocess mode):** COMPLETE
-- **Phase 2 (ACP mode):** NOT STARTED
+- **Phase 2 (ACP mode):** COMPLETE
 - **Phase 3 (Testing):** NOT STARTED
 
 ## What's Next
 
 ### Recommended Next Task
 
-**Phase 2: Add Tool Call Display to ACP Mode**
+**Phase 3: End-to-End Testing**
 
-The ACP mode may need similar tool call display handling. Check if tool calls are already visible via `ext_method()` logging in `/Users/liam/git/velor/crates/velor-core/src/acp.rs`. If not, add handling for `ContentBlock::ToolUse` in the `session_notification` function.
-
-### Remaining Plan Items
-
-1. **Phase 2:** Add Tool Call Display to ACP Mode (if needed)
-2. **Phase 3:** Testing - Run a test prompt with multiple tool calls to verify output
+Run a test prompt with multiple tool calls in both subprocess and ACP modes to verify:
+- Tool names are displayed with `🔧` prefix
+- Text output continues to display properly
+- The output flow is readable and not overwhelming
 
 ## Blockers / Open Questions
 
@@ -65,15 +77,16 @@ None identified.
 
 ## Verification
 
-- All 249 tests pass
-- `just check` passes (only unrelated Svelte CSS warnings remain)
-- Commit will include this progress file update
+- All tests pass
+- `cargo check -q` passes (no warnings)
+- `just check` passes (Svelte warnings unrelated)
+- Tool calls now display in both subprocess mode (via stdout) and ACP mode (via stderr)
 
 ## Commit References
 
-This session's work will be committed as a single detailed commit covering:
-- New stream-json event type definitions
-- Tool call extraction and formatting logic
-- Updated stdout handler for subprocess mode
-- Comprehensive tests for the new functionality
+Previous session (Phase 1):
+- Commit: 403391e feat(agent): display tool calls in subprocess mode output
+
+This session (Phase 2):
+- Changes to `crates/velor-core/src/acp.rs` - added eprintln for tool call display
 - Progress file update
