@@ -582,6 +582,11 @@ async fn run_automations(
         AutomationsCommand::Daemon { tick_interval_secs } => {
             automations::run_daemon(tick_interval_secs, home_cfg, git_root).await
         }
+        AutomationsCommand::Install { interval } => {
+            automations::launchd::run_install(interval).await
+        }
+        AutomationsCommand::Uninstall => automations::launchd::run_uninstall().await,
+        AutomationsCommand::ServiceStatus => automations::launchd::run_status().await,
     }
 }
 
