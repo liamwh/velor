@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use color_eyre::eyre::eyre;
-use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -307,6 +307,7 @@ impl AutomationState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row;
 
     #[test]
     fn test_run_status_as_str() {
