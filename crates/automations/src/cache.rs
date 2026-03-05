@@ -235,8 +235,9 @@ async fn validate_and_convert(name: String, raw: AutomationFileRaw) -> Result<Au
                 return Err(eyre!("project path {} does not exist", proj.display()));
             }
             Err(e) => {
-                return Err(e)
-                    .wrap_err_with(|| format!("Failed to access project path: {}", proj.display()));
+                return Err(e).wrap_err_with(|| {
+                    format!("Failed to access project path: {}", proj.display())
+                });
             }
         }
     }

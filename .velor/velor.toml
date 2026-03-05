@@ -46,6 +46,7 @@ repo_name = "my-repo"
 pin = "AGENTS.md" # Pinned information to the start of each agent
 plan = "~/.claude/plans/vast-hugging-puffin.md"
 rust_rules_file = ".agents/rules/rust.mdc"
+rules_dir = ".agents/rules/"
 
 # Development commands - customise for your project
 # test_rust_cmd = "cargo test"

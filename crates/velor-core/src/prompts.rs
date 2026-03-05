@@ -463,7 +463,8 @@ This is the content."#;
     #[test]
     fn test_prompt_frontmatter_defaults() {
         let yaml = r#"description: Test prompt"#;
-        let frontmatter: PromptFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let frontmatter: PromptFrontmatter =
+            serde_yaml::from_str(yaml).expect("valid YAML frontmatter should parse successfully");
 
         assert_eq!(frontmatter.description, "Test prompt");
         assert!(frontmatter.complete_token.is_none());
@@ -476,7 +477,8 @@ This is the content."#;
 description: Test prompt
 complete_token: "<promise>DONE</promise>"
 "#;
-        let frontmatter: PromptFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let frontmatter: PromptFrontmatter =
+            serde_yaml::from_str(yaml).expect("valid YAML frontmatter should parse successfully");
 
         assert_eq!(frontmatter.description, "Test prompt");
         assert_eq!(
@@ -489,7 +491,8 @@ complete_token: "<promise>DONE</promise>"
     #[test]
     fn test_prompt_frontmatter_empty() {
         let yaml = "";
-        let frontmatter: PromptFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let frontmatter: PromptFrontmatter =
+            serde_yaml::from_str(yaml).expect("valid YAML frontmatter should parse successfully");
 
         assert_eq!(frontmatter.description, "Unnamed prompt");
         assert!(frontmatter.complete_token.is_none());
