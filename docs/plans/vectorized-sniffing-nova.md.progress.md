@@ -1,33 +1,42 @@
-# Progress Handoff - Tick Command Implementation
+# Progress Handoff - Fixed unwrap() Warnings
 
 ## Session Summary
 
-Implemented the `tick` command for automations (Phase 5 from the plan). This command executes a single tick of the scheduler and exits, designed for use with external schedulers like launchd (macOS) or cron (Linux).
+Fixed the `unwrap()` warnings in `crates/velor-core/src/prompts.rs` that violated the workspace's `unwrap_used = "deny"` lint setting. Replaced 3 occurrences of `unwrap()` with `.expect()` to provide better error messages in test failures.
 
 ## Changes Made
 
 ### Modified Files
 
-1. **`apps/velor-cli/src/automations.rs`**
-   - Added `Tick {}` variant to `AutomationsCommand` enum
-   - Implemented `run_tick()` function that executes one scheduler tick and exits
-   - Extracted common tick logic from `run_daemon()` into shared `process_automations_tick()` function
-   - Updated `run_daemon()` to use the shared tick processing logic
+1. **`crates/velor-core/src/prompts.rs`**
+   - Line 466: Replaced `unwrap()` with `.expect("valid YAML frontmatter should parse successfully")`
+   - Line 479: Replaced `unwrap()` with `.expect("valid YAML frontmatter should parse successfully")`
+   - Line 492: Replaced `unwrap()` with `.expect("valid YAML frontmatter should parse successfully")`
 
-2. **`apps/velor-cli/src/main.rs`**
-   - Added match case for `AutomationsCommand::Tick {}` in `run_automations()`
+All three occurrences were in test functions:
+- `test_prompt_frontmatter_defaults()`
+- `test_prompt_frontmatter_all_fields()`
+- `test_prompt_frontmatter_empty()`
 
-## What's Next (Recommended)
+## Plan Status
 
-The file-based automations feature (Phases 1-6) is now complete including the `tick` command. The plan is fully implemented.
+The file-based automations plan (Phases 1-6) is **complete**. All required features have been implemented.
 
-Remaining optional work from the plan:
-1. Address pre-existing `unwrap()` warnings in `prompts.rs` (3 occurrences)
-2. Address pre-existing Svelte warnings (unused CSS selectors in AutomationRuns.svelte, non-reactive update in PlanGenerator.svelte)
+## Remaining Optional Work
+
+1. Address Svelte warnings (unused CSS selectors in AutomationRuns.svelte, non-reactive update in PlanGenerator.svelte)
 
 ## No Blockers
 
-All checks pass. Only pre-existing warnings remain (unwrap() in prompts.rs, Svelte warnings).
+All checks pass with only Svelte warnings remaining (unrelated to this plan).
+
+## Uncommitted Changes (Previously Existing)
+
+The following changes were present before this session and remain uncommitted:
+- `.velor/velor.toml`: Added `rules_dir = ".agents/rules/"`
+- `crates/automations/src/cache.rs`: Minor formatting fix (line break in error context)
+- `justfile`: Changed `velor` → `vel` (binary name references)
+- Deleted: `.agents/rules/always-test.mdc`
 
 ## Commit Reference
 

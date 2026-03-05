@@ -9,21 +9,21 @@ build:
 build-release:
     cargo build --release
 
-# Run the velor once command (single-shot prompt)
+# Run the vel once command (single-shot prompt)
 once:
-    cargo build -q && ./target/debug/velor once
+    cargo build -q && ./target/debug/vel once
 
-# Run the velor auto command (iterative execution)
+# Run the vel auto command (iterative execution)
 auto:
-    cargo build -q && ./target/debug/velor auto
+    cargo build -q && ./target/debug/vel auto
 
 # Dry-run the once command to see rendered prompt without executing
 once-dry:
-    cargo build -q && ./target/debug/velor once --dry-run
+    cargo build -q && ./target/debug/vel once --dry-run
 
 # Dry-run the auto command to see rendered prompt without executing
 auto-dry:
-    cargo build -q && ./target/debug/velor auto --dry-run
+    cargo build -q && ./target/debug/vel auto --dry-run
 
 # Run tests
 test:
@@ -54,27 +54,27 @@ lint-rust:
 lint-typescript:
     cd apps/velor && bunx svelte-kit sync && bunx svelte-check --tsconfig ./tsconfig.json --diagnostic-sources "js,svelte" && bunx eslint .
 
-# Install velor to ~/bin (backs up existing binary with timestamp)
+# Install velor CLI to ~/bin (backs up existing binary with timestamp)
 install:
-    @echo "📦 Building velor binary..."
-    cargo build --release -q
+    @echo "📦 Building velor CLI binary..."
+    cargo build --release -p velor-cli -q
     @echo "📥 Installing to ~/bin..."
     @mkdir -p ~/bin
-    @if [ -f ~/bin/velor ]; then \
-        backup=~/bin/velor.backup.$(date +%Y%m%d-%H%M%S); \
-        echo "💾 Backing up existing velor to $$backup"; \
-        cp ~/bin/velor "$$backup"; \
+    @if [ -f ~/bin/vel ]; then \
+        backup=~/bin/vel.backup.$(date +%Y%m%d-%H%M%S); \
+        echo "💾 Backing up existing vel to $$backup"; \
+        cp ~/bin/vel "$$backup"; \
     fi
-    @cp target/release/velor ~/bin/
-    @echo "✅ velor installed to ~/bin/velor"
+    @cp target/release/vel ~/bin/
+    @echo "✅ vel installed to ~/bin/vel"
 
-# Show velor version
+# Show vel version
 version:
-    ./target/debug/velor --version
+    ./target/debug/vel --version
 
-# Show velor help
+# Show vel help
 help:
-    ./target/debug/velor --help
+    ./target/debug/vel --help
 
 # Clean build artifacts
 clean:
@@ -82,15 +82,15 @@ clean:
 
 # Watch mode for development (requires cargo-watch)
 watch:
-    cargo watch -x 'build --bin velor' -x test -x 'run --bin velor -- once'
+    cargo watch -x 'build --bin vel' -x test -x 'run --bin vel -- once'
 
 # Run velor with custom prompt (usage: just custom --set "key=value")
 custom *args:
     cargo build -q && ./target/debug/velor {{ args }}
 
-# Initialise velor in the current repository
+# Initialise vel in the current repository
 init:
-    cargo build -q && ./target/debug/velor init
+    cargo build -q && ./target/debug/vel init
 
 # Open the config file in $EDITOR
 edit-config:
@@ -102,7 +102,7 @@ show-prompts:
 
 # Test notification configuration
 test-notification:
-    cargo build -q && ./target/debug/velor test-notification
+    cargo build -q && ./target/debug/vel test-notification
 
 # Run the Tauri GUI app in dev mode
 tauri-dev:
