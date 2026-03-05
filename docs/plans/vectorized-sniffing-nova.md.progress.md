@@ -1,89 +1,87 @@
-# Progress Handoff - File-Based Automations (Phase 4)
+# Progress Handoff - File-Based Automations (Phase 4b)
 
 ## Session Summary
 
-Completed **Phase 4: Update AutomationRunner** of the file-based automations plan. This phase updates the AutomationRunner to support file-based automations with git root resolution, worktree handling, and project path support.
+Completed **Phase 4b: State Tracking for Scheduled Runs** of the file-based automations plan. This phase adds state tracking with UNIQUE constraint pattern for idempotency using `sqlx`.
+
+**Previous session issue:** The `state.rs` file was created using `rusqlite` instead of the project's standard `sqlx` crate, causing compilation failures. This session fixed the implementation.
 
 ## Changes Made
 
 ### Modified Files
 
-1. **`crates/automations/src/runner.rs`** (extensively modified)
-   - Added `resolve_git_root()` async method that handles non-UTF8 paths using `.arg()` with `OsStr`
-   - Added `sanitize_worktree_name()` static method to sanitize automation names for use in paths
-   - Added `generate_worktree_path()` static method using ULID for collision resistance
-   - Added `init_worktrees_base()` async method to create worktrees directory at runner init
-   - Added `prune_orphaned_worktrees()` async method to clean up orphaned worktrees
-   - Added `run_file_automation()` async method for running `AutomationFile` with full worktree/project support
-   - Added `execute_velor_file()` helper method that resolves prompt content for file-based automations
-   - Updated imports to include `color_eyre::eyre::WrapErr` and `std::str::FromStr` (in test module)
+1. **`crates/automations/src/state.rs`** (rewritten)
+   - Replaced `rusqlite` with `sqlx` for async database operations
+   - Uses `SqlitePool` instead of `Connection` for async compatibility
+   - Implements `RunStatus` enum with `FromStr` trait (removed invalid const fn approach)
+   - Implements `AutomationState` struct with async methods:
+     - `open()` - Opens/creates state database with WAL mode enabled
+     - `try_start_run()` - Atomically starts a run with UNIQUE constraint idempotency
+     - `complete_run()` - Marks a run as completed
+     - `fail_run()` - Marks a run as failed with error message
+     - `get_last_completed_run()` - Gets most recent completed run for an automation
+     - `get_run_info()` - Private helper for idempotency checks
+   - All `scheduled_for` values stored in UTC (RFC3339) for DST stability
 
-2. **`Cargo.toml`** (workspace root)
-   - Added `ulid = "1"` to workspace dependencies
-
-3. **`crates/automations/Cargo.toml`**
-   - Added `dirs = "5"` dependency for home directory resolution
-   - Added `ulid = { workspace = true }` dependency
+2. **`crates/automations/src/vars.rs`** (minor fix)
+   - Fixed doctest to include `use velor_automations::merge_automation_vars;`
+   - Removed invalid doctest for private `get_current_branch()` function
 
 ### Key Implementation Details
 
-**Git Root Resolution:**
-- Uses `git rev-parse --show-toplevel` with `.arg()` to handle non-UTF8 paths
-- Returns canonicalized path (handles macOS symlink issues)
+**Idempotency Pattern:**
+- UNIQUE constraint on `(automation_name, scheduled_for)` prevents duplicate runs
+- Stale runs (exceeded `stale_timeout`) are allowed to retry
+- Uses 2x automation timeout for stale threshold (minimum 15 minutes)
 
-**Worktree Semantics:**
-- `project` is the working directory (can be inside a repo)
-- Git root is derived from `project` via `resolve_git_root()`
-- If `worktree=true` and `project` is outside a git repo → returns error
-- If `worktree=false`, uses `project` directly (or `git_root` if no project)
+**Async Patterns:**
+- Uses `sqlx::SqlitePool` for connection pooling
+- WAL mode enabled for better concurrency
+- All methods are `async fn` following project patterns
 
-**Worktree Naming:**
-- Uses `sanitize_worktree_name()` to clean automation names
-- Appends 8-character ULID suffix for collision resistance
-- Worktrees stored in `.velor-worktrees/` directory alongside git root
+**RunStatus Enum:**
+- `as_str()` returns static string constants
+- `FromStr` trait implemented for parsing (not const fn to avoid Rust limitations)
+- Includes `ParseRunStatusError` for proper error handling
 
-**Backward Compatibility:**
-- Legacy `run_automation()` method preserved for old `Automation` type
-- New `run_file_automation()` method for `AutomationFile` type
-
-## Test Coverage
-
-Added 8 comprehensive tests for the new functionality:
-- `test_automation_result_debug` - Tests debug formatting
-- `test_runner_new` - Tests runner creation
-- `test_runner_store_access` - Tests store access
-- `test_worktree_cleanup_new` - Tests worktree cleanup creation
-- `test_sanitize_worktree_name` - Tests name sanitization (underscores preserved, hyphens collapsed)
-- `test_generate_worktree_path` - Tests worktree path generation with ULID suffix
-- `test_resolve_git_root_valid_repo` - Tests git root resolution (handles canonicalization)
-- `test_resolve_git_root_non_repo` - Tests error handling for non-repo directories
-- `test_init_worktrees_base` - Tests worktrees base directory creation
-- `test_prune_orphaned_worktrees_no_base_dir` - Tests prune without base dir
-- `test_setup_worktree_returns_none_for_non_git_repo` - Tests worktree setup for non-git
-- `test_setup_worktree_creates_worktree_for_git_repo` - Tests full worktree creation
-
-All 93 tests pass (77 existing + 16 new for this session).
+**Test Coverage:**
+Added 12 comprehensive tests:
+- `test_run_status_as_str` - Tests string conversion
+- `test_run_status_from_str` - Tests parsing with error handling
+- `test_state_open_creates_tables` - Tests schema initialization
+- `test_try_start_run_new` - Tests successful run start
+- `test_try_start_run_idempotent` - Tests UNIQUE constraint prevents duplicates
+- `test_try_start_run_stale_retry` - Tests stale run retry logic
+- `test_complete_run` - Tests run completion
+- `test_fail_run` - Tests run failure with error message
+- `test_get_last_completed_run_none` - Tests empty state
+- `test_get_last_completed_run_some` - Tests retrieving last completed run
+- `test_unique_constraint_prevents_duplicates` - Tests idempotency after completion
+- `test_different_automations_same_time` - Tests concurrent different automations
+- `test_same_automation_different_times` - Tests sequential runs
 
 ## Remaining Phases (from plan)
 
-- **Phase 4b: State Tracking** - Create `AutomationState` for run tracking with idempotency
 - **Phase 5: CLI Flags** - Add list, validate, run, status, tick commands
-- **Phase 6: Exports** - Update lib.rs with new module exports
+- **Phase 6: Exports** - Update lib.rs with new module exports (mostly done)
 
 ## What's Next (Recommended)
 
-**Phase 4b: State Tracking** - Create state tracking for automation runs:
+**Phase 5: CLI Flags** - Add CLI commands to interact with file-based automations:
 
-1. Add `AutomationState` type to track run metadata
-2. Add UNIQUE constraint on (automation_name, run_id) for idempotency
-3. Update `run_file_automation()` to record state
+The `state` module is already exported in lib.rs, so Phase 6 is essentially complete.
 
-**Alternative next step:**
-- **Phase 5: CLI Flags** - Add CLI commands to interact with file-based automations (depends on Phase 4)
+Next steps would be to:
+1. Add CLI subcommands to `apps/velor-cli/src/automations.rs`:
+   - `velor automations list` - List all automations
+   - `velor automations validate <name>` - Validate automation config
+   - `velor automations run <name>` - Run an automation manually
+   - `velor automations status <name>` - Show automation run status
+   - `velor automations tick` - Run scheduled automations (daemon mode)
 
 ## No Blockers
 
-All dependencies resolved. Ready to proceed with Phase 4b or alternative.
+All dependencies resolved. `state.rs` now compiles and all 106 tests pass.
 
 ## Commit Reference
 
