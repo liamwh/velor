@@ -8,6 +8,7 @@
 pub mod cache;
 pub mod config;
 pub mod file_config;
+pub mod registry;
 pub mod runner;
 pub mod scheduler;
 pub mod state;
@@ -21,6 +22,7 @@ pub use file_config::{
     AutomationEntry, AutomationFile, AutomationFileRaw, AutomationSource, PromptSource,
     PromptSourceRaw,
 };
+pub use registry::{ProjectEntry, ProjectRegistry};
 pub use runner::{AutomationResult, AutomationRunner, WorktreeCleanup};
 pub use scheduler::Scheduler;
 pub use state::{AutomationState, RunStatus};
