@@ -62,10 +62,10 @@ impl CancellationHandler {
         };
 
         if register_handler {
-            // Register Ctrl+C handler
+            // Register Ctrl+C handler (if not already registered, e.g., in tests or scripts)
             let inner = handler.inner.clone();
             let token_for_handler = cancel_token.clone();
-            ctrlc::set_handler(move || {
+            if ctrlc::set_handler(move || {
                 let now = now_millis();
 
                 // Check if this is the first or second press
@@ -94,7 +94,10 @@ impl CancellationHandler {
                     }
                 }
             })
-            .expect("failed to register Ctrl+C handler");
+            .is_err() {
+                // Handler already registered (e.g., in tests or non-interactive shell)
+                // This is fine - the automation will still work, just without Ctrl+C handling
+            }
         }
 
         (handler, cancel_token)
