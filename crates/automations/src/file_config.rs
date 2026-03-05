@@ -9,12 +9,14 @@
 
 use crate::config::CatchUpPolicy;
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{WrapErr, eyre};
 use cron::Schedule;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use tokio::fs;
+use velor_core::prompts::PromptCache;
 
 /// Source of an automation definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +207,70 @@ impl PromptSource {
             } => PromptSource::Name(n),
             _ => unreachable!(),
         })
+    }
+
+    /// Resolve to actual prompt content.
+    ///
+    /// For `PromptsDirFile` references: Try repo prompts first, then global (override pattern).
+    /// Uses try-read approach instead of exists() to avoid sync filesystem calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The prompt file cannot be found in repo or global prompts directories
+    /// - The prompt file cannot be read
+    /// - The named prompt is not found in the PromptCache
+    pub async fn resolve(
+        &self,
+        prompt_cache: &PromptCache,
+        home_dir: &Path,
+        repo_dir: Option<&Path>,
+    ) -> Result<String> {
+        match self {
+            PromptSource::Inline(content) => Ok(content.clone()),
+            PromptSource::PromptsDirFile(name) => {
+                let filename = format!("{name}.md");
+
+                // Try repo prompts first
+                if let Some(repo) = repo_dir {
+                    let repo_path = repo.join("prompts").join(&filename);
+                    match fs::read_to_string(&repo_path).await {
+                        Ok(content) => return Ok(content),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Fall through to global
+                        }
+                        Err(e) => {
+                            return Err(e).wrap_err_with(|| {
+                                format!("Failed to read prompt file: {}", repo_path.display())
+                            });
+                        }
+                    }
+                }
+
+                // Try global prompts
+                let global_path = home_dir.join("prompts").join(&filename);
+                fs::read_to_string(&global_path).await.wrap_err_with(|| {
+                    let tried = match repo_dir {
+                        Some(repo) => format!(
+                            "{}/prompts/{} and {}/prompts/{}",
+                            repo.display(),
+                            filename,
+                            home_dir.display(),
+                            filename
+                        ),
+                        None => format!("{}/prompts/{}", home_dir.display(), filename),
+                    };
+                    format!(
+                        "Prompt file '{name}' not found in repo or global prompts directories (tried: {tried})",
+                    )
+                })
+            }
+            PromptSource::Name(name) => prompt_cache
+                .get_by_name(name)
+                .await
+                .map(|p| p.content)
+                .wrap_err_with(|| format!("Named prompt '{name}' not found in PromptCache")),
+        }
     }
 }
 
@@ -621,5 +687,251 @@ mod tests {
         assert_eq!(AutomationSource::Global, AutomationSource::Global);
         assert_ne!(AutomationSource::Global, AutomationSource::Project);
         assert_ne!(AutomationSource::Project, AutomationSource::Legacy);
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio;
+
+    /// Helper to create a test PromptCache with a named prompt.
+    async fn create_test_prompt_cache(home_dir: &Path, repo_dir: &Path) -> PromptCache {
+        // Create a named prompt in home directory
+        let home_prompts_dir = home_dir.join("prompts");
+        fs::create_dir_all(&home_prompts_dir).await.unwrap();
+
+        let home_prompt_path = home_prompts_dir.join("test-named.md");
+        fs::write(
+            &home_prompt_path,
+            "# Test Named Prompt\n\nThis is a test prompt from home directory.",
+        )
+        .await
+        .unwrap();
+
+        // Create PromptCache
+        PromptCache::new(home_dir.to_path_buf(), Some(repo_dir.to_path_buf()))
+    }
+
+    #[tokio::test]
+    async fn test_resolve_inline() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        let source = PromptSource::Inline("test inline prompt".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(result, "test inline prompt");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_prompts_dir_file_from_repo() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        // Create a prompt file in repo directory
+        let repo_prompts_dir = repo_dir.path().join("prompts");
+        fs::create_dir_all(&repo_prompts_dir).await.unwrap();
+
+        let repo_prompt_path = repo_prompts_dir.join("test-repo-prompt.md");
+        fs::write(
+            &repo_prompt_path,
+            "# Test Repo Prompt\n\nThis is a test prompt from repo directory.",
+        )
+        .await
+        .unwrap();
+
+        // Also create the same file in home (should be overridden by repo)
+        let home_prompts_dir = home_dir.path().join("prompts");
+        fs::create_dir_all(&home_prompts_dir).await.unwrap();
+
+        let home_prompt_path = home_prompts_dir.join("test-repo-prompt.md");
+        fs::write(&home_prompt_path, "Home version - should not be used")
+            .await
+            .unwrap();
+
+        let source = PromptSource::PromptsDirFile("test-repo-prompt".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+            .await
+            .unwrap();
+
+        assert!(result.contains("repo directory"));
+        assert!(!result.contains("Home version"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_prompts_dir_file_fallback_to_home() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        // Create a prompt file only in home directory
+        let home_prompts_dir = home_dir.path().join("prompts");
+        fs::create_dir_all(&home_prompts_dir).await.unwrap();
+
+        let home_prompt_path = home_prompts_dir.join("home-only-prompt.md");
+        fs::write(
+            &home_prompt_path,
+            "# Test Home Prompt\n\nThis is a test prompt from home directory only.",
+        )
+        .await
+        .unwrap();
+
+        let source = PromptSource::PromptsDirFile("home-only-prompt".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+            .await
+            .unwrap();
+
+        assert!(result.contains("home directory only"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_prompts_dir_file_not_found() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        // Don't create any prompt files
+        let source = PromptSource::PromptsDirFile("nonexistent".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_prompts_dir_file_no_repo() {
+        let home_dir = TempDir::new().unwrap();
+        let prompt_cache = PromptCache::new(home_dir.path().to_path_buf(), None);
+
+        // Create a prompt file only in home directory
+        let home_prompts_dir = home_dir.path().join("prompts");
+        fs::create_dir_all(&home_prompts_dir).await.unwrap();
+
+        let home_prompt_path = home_prompts_dir.join("no-repo-prompt.md");
+        fs::write(
+            &home_prompt_path,
+            "# Test No Repo Prompt\n\nThis is a test prompt with no repo.",
+        )
+        .await
+        .unwrap();
+
+        let source = PromptSource::PromptsDirFile("no-repo-prompt".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), None)
+            .await
+            .unwrap();
+
+        assert!(result.contains("no repo"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_name_from_cache() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        let source = PromptSource::Name("test-named".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+            .await
+            .unwrap();
+
+        assert!(result.contains("test prompt from home directory"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_name_not_found() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        let source = PromptSource::Name("nonexistent-named".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_prompts_dir_file_with_md_suffix() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        // Create a prompt file
+        let home_prompts_dir = home_dir.path().join("prompts");
+        fs::create_dir_all(&home_prompts_dir).await.unwrap();
+
+        let home_prompt_path = home_prompts_dir.join("test-suffix.md");
+        fs::write(
+            &home_prompt_path,
+            "# Test Suffix Prompt\n\nThis is a test prompt.",
+        )
+        .await
+        .unwrap();
+
+        // Test with the .md suffix already stripped (as it should be after from_raw)
+        let source = PromptSource::PromptsDirFile("test-suffix".to_string());
+        let result = source
+            .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+            .await
+            .unwrap();
+
+        assert!(result.contains("test prompt"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_all_three_variants() {
+        let home_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let prompt_cache = create_test_prompt_cache(home_dir.path(), repo_dir.path()).await;
+
+        // Create a prompt file for PromptsDirFile variant
+        let home_prompts_dir = home_dir.path().join("prompts");
+        fs::create_dir_all(&home_prompts_dir).await.unwrap();
+
+        let home_prompt_path = home_prompts_dir.join("variant-test.md");
+        fs::write(&home_prompt_path, "File variant content")
+            .await
+            .unwrap();
+
+        // Test all three variants
+        let inline = PromptSource::Inline("inline content".to_string());
+        assert_eq!(
+            inline
+                .resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+                .await
+                .unwrap(),
+            "inline content"
+        );
+
+        let file = PromptSource::PromptsDirFile("variant-test".to_string());
+        assert_eq!(
+            file.resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+                .await
+                .unwrap(),
+            "File variant content"
+        );
+
+        let name = PromptSource::Name("test-named".to_string());
+        assert!(
+            name.resolve(&prompt_cache, home_dir.path(), Some(repo_dir.path()))
+                .await
+                .unwrap()
+                .contains("test prompt from home directory")
+        );
     }
 }

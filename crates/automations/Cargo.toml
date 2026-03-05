@@ -19,5 +19,8 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 
+# Local dependencies
+velor-core = { path = "../velor-core" }
+
 [dev-dependencies]
 tempfile = { workspace = true }
