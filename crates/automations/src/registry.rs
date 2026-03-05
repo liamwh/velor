@@ -182,6 +182,48 @@ impl ProjectRegistry {
     pub fn enabled_projects(&self) -> Vec<&ProjectEntry> {
         self.projects.iter().filter(|p| p.enabled).collect()
     }
+
+    /// Enables a project by ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The unique identifier of the project to enable
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no project with the given ID exists.
+    #[instrument(skip(self), fields(id = %id))]
+    pub async fn enable(&mut self, id: &str) -> Result<()> {
+        let project = self
+            .projects
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| eyre!("Project '{}' not found", id))?;
+
+        project.enabled = true;
+        Ok(())
+    }
+
+    /// Disables a project by ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The unique identifier of the project to disable
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no project with the given ID exists.
+    #[instrument(skip(self), fields(id = %id))]
+    pub async fn disable(&mut self, id: &str) -> Result<()> {
+        let project = self
+            .projects
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| eyre!("Project '{}' not found", id))?;
+
+        project.enabled = false;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -437,5 +479,131 @@ mod tests {
         let expected_path =
             std::fs::canonicalize(temp_dir.path()).expect("should canonicalize temp dir path");
         assert_eq!(registered_path, expected_path);
+    }
+
+    #[tokio::test]
+    async fn test_enable_project() {
+        let temp_dir = create_test_repo().expect("should create temp repo");
+        let mut registry = ProjectRegistry::default();
+
+        registry
+            .add(
+                temp_dir.path().to_path_buf(),
+                Some("test-project".to_string()),
+            )
+            .await
+            .expect("should add project");
+
+        // Disable the project first
+        registry.projects[0].enabled = false;
+
+        // Enable it
+        registry
+            .enable("test-project")
+            .await
+            .expect("should enable project");
+
+        assert!(registry.projects[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn test_enable_fails_for_nonexistent_id() {
+        let mut registry = ProjectRegistry::default();
+
+        let result = registry.enable("nonexistent").await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_disable_project() {
+        let temp_dir = create_test_repo().expect("should create temp repo");
+        let mut registry = ProjectRegistry::default();
+
+        registry
+            .add(
+                temp_dir.path().to_path_buf(),
+                Some("test-project".to_string()),
+            )
+            .await
+            .expect("should add project");
+
+        // Disable it
+        registry
+            .disable("test-project")
+            .await
+            .expect("should disable project");
+
+        assert!(!registry.projects[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn test_disable_fails_for_nonexistent_id() {
+        let mut registry = ProjectRegistry::default();
+
+        let result = registry.disable("nonexistent").await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_enable_affects_enabled_projects() {
+        let temp_dir1 = create_test_repo().expect("should create temp repo");
+        let temp_dir2 = create_test_repo().expect("should create temp repo");
+        let mut registry = ProjectRegistry::default();
+
+        registry
+            .add(temp_dir1.path().to_path_buf(), Some("project1".to_string()))
+            .await
+            .expect("should add first project");
+
+        let entry = ProjectEntry {
+            id: "project2".to_string(),
+            path: temp_dir2.path().to_path_buf(),
+            enabled: false,
+        };
+        registry.projects.push(entry);
+
+        assert_eq!(registry.enabled_projects().len(), 1);
+
+        // Enable project2
+        registry
+            .enable("project2")
+            .await
+            .expect("should enable project2");
+
+        assert_eq!(registry.enabled_projects().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_disable_affects_enabled_projects() {
+        let temp_dir1 = create_test_repo().expect("should create temp repo");
+        let temp_dir2 = create_test_repo().expect("should create temp repo");
+        let mut registry = ProjectRegistry::default();
+
+        registry
+            .add(temp_dir1.path().to_path_buf(), Some("project1".to_string()))
+            .await
+            .expect("should add first project");
+
+        registry
+            .add(temp_dir2.path().to_path_buf(), Some("project2".to_string()))
+            .await
+            .expect("should add second project");
+
+        assert_eq!(registry.enabled_projects().len(), 2);
+
+        // Disable project1
+        registry
+            .disable("project1")
+            .await
+            .expect("should disable project1");
+
+        assert_eq!(registry.enabled_projects().len(), 1);
+        assert_eq!(registry.enabled_projects()[0].id, "project2");
     }
 }
