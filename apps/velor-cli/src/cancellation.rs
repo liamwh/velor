@@ -42,6 +42,14 @@ impl CancellationHandler {
     /// Creates a new cancellation handler with an associated cancellation token.
     #[must_use]
     pub fn new() -> (Self, CancellationToken) {
+        Self::new_with_handler(true)
+    }
+
+    /// Creates a new cancellation handler, optionally registering the Ctrl+C handler.
+    ///
+    /// For tests, pass `register_handler = false` to avoid the "MultipleHandlers" error.
+    #[must_use]
+    fn new_with_handler(register_handler: bool) -> (Self, CancellationToken) {
         let cancel_token = CancellationToken::new();
 
         let handler = Self {
@@ -53,39 +61,41 @@ impl CancellationHandler {
             cancel_token: cancel_token.clone(),
         };
 
-        // Register Ctrl+C handler
-        let inner = handler.inner.clone();
-        let token_for_handler = cancel_token.clone();
-        ctrlc::set_handler(move || {
-            let now = now_millis();
+        if register_handler {
+            // Register Ctrl+C handler
+            let inner = handler.inner.clone();
+            let token_for_handler = cancel_token.clone();
+            ctrlc::set_handler(move || {
+                let now = now_millis();
 
-            // Check if this is the first or second press
-            if !inner.graceful_shutdown_requested.load(Ordering::SeqCst) {
-                // First Ctrl+C - request graceful shutdown
-                inner.graceful_shutdown_requested.store(true, Ordering::SeqCst);
-                inner.first_press_time.store(now, Ordering::SeqCst);
-
-                println!("\n⚠️  Graceful shutdown requested. Will stop after current iteration completes.");
-                println!("💡 Press Ctrl+C again within 3 seconds to force quit immediately.");
-            } else {
-                // Second Ctrl+C - check if within the time window
-                let first_press = inner.first_press_time.load(Ordering::SeqCst);
-                let elapsed = now.saturating_sub(first_press);
-
-                if elapsed <= FORCE_CANCEL_WINDOW.as_millis() as u64 {
-                    // Within time window - force cancel
-                    inner.force_cancel_requested.store(true, Ordering::SeqCst);
-                    token_for_handler.cancel();
-                    println!("\n🛑 Force quit requested! Shutting down immediately...");
-                } else {
-                    // Outside time window - treat as new graceful shutdown request
+                // Check if this is the first or second press
+                if !inner.graceful_shutdown_requested.load(Ordering::SeqCst) {
+                    // First Ctrl+C - request graceful shutdown
+                    inner.graceful_shutdown_requested.store(true, Ordering::SeqCst);
                     inner.first_press_time.store(now, Ordering::SeqCst);
-                    println!("\n⚠️  Graceful shutdown requested again. Will stop after current iteration.");
+
+                    println!("\n⚠️  Graceful shutdown requested. Will stop after current iteration completes.");
                     println!("💡 Press Ctrl+C again within 3 seconds to force quit immediately.");
+                } else {
+                    // Second Ctrl+C - check if within the time window
+                    let first_press = inner.first_press_time.load(Ordering::SeqCst);
+                    let elapsed = now.saturating_sub(first_press);
+
+                    if elapsed <= FORCE_CANCEL_WINDOW.as_millis() as u64 {
+                        // Within time window - force cancel
+                        inner.force_cancel_requested.store(true, Ordering::SeqCst);
+                        token_for_handler.cancel();
+                        println!("\n🛑 Force quit requested! Shutting down immediately...");
+                    } else {
+                        // Outside time window - treat as new graceful shutdown request
+                        inner.first_press_time.store(now, Ordering::SeqCst);
+                        println!("\n⚠️  Graceful shutdown requested again. Will stop after current iteration.");
+                        println!("💡 Press Ctrl+C again within 3 seconds to force quit immediately.");
+                    }
                 }
-            }
-        })
-        .expect("failed to register Ctrl+C handler");
+            })
+            .expect("failed to register Ctrl+C handler");
+        }
 
         (handler, cancel_token)
     }
@@ -151,7 +161,7 @@ mod tests {
 
     #[test]
     fn test_cancellation_handler_initial_state() {
-        let (handler, _token) = CancellationHandler::new();
+        let (handler, _token) = CancellationHandler::new_with_handler(false);
         assert!(!handler.graceful_shutdown_requested());
         assert!(!handler.force_cancel_requested());
         assert!(!handler.is_cancelled());
@@ -159,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_cancellation_handler_reset() {
-        let (handler, _token) = CancellationHandler::new();
+        let (handler, _token) = CancellationHandler::new_with_handler(false);
         handler
             .inner
             .graceful_shutdown_requested
