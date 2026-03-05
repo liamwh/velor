@@ -20,6 +20,8 @@ Implemented complete project registry module:
    - `save()` - Persists registry to disk with directory creation
    - `add()` - Adds project with git repo validation and duplicate detection
    - `remove()` - Removes project by ID with error if not found
+   - `enable()` - Enables a project by ID
+   - `disable()` - Disables a project by ID
    - `list()` - Returns reference to all projects
    - `enabled_projects()` - Returns only enabled projects
 
@@ -29,34 +31,68 @@ Implemented complete project registry module:
    - Duplicate ID detection
    - Optional ID (defaults to directory name)
    - Proper error handling with color-eyre
-   - Comprehensive test coverage (13 tests, all passing)
+   - Comprehensive test coverage (21 tests, all passing)
 
 **Modified File: `/Users/liam/git/velor/crates/automations/src/lib.rs`**
 
 - Added `pub mod registry;`
 - Re-exported `ProjectEntry` and `ProjectRegistry`
 
+### Phase 2: Project Management Commands - COMPLETED
+
+**New File: `/Users/liam/git/velor/apps/velor-cli/src/projects.rs`**
+
+Implemented complete project management CLI:
+
+1. **Command structures:**
+   - `ProjectArgs` - Top-level command arguments
+   - `ProjectCommand` enum with variants: Add, Remove, List, Enable, Disable
+
+2. **Command handlers:**
+   - `run_add()` - Registers a project (path defaults to current directory)
+   - `run_remove()` - Removes a project by ID
+   - `run_list()` - Lists all registered projects with status
+   - `run_enable()` - Enables a disabled project
+   - `run_disable()` - Disables a project temporarily
+   - `run_project()` - Main dispatch function
+
+3. **Features:**
+   - Emoji status indicators (✅ for enabled, ❌ for disabled)
+   - User-friendly output messages
+   - Proper error handling with context
+   - Tracing instrumentation for debugging
+
+**Modified File: `/Users/liam/git/velor/apps/velor-cli/src/main.rs`**
+
+- Added `mod projects;` import
+- Added `Project(ProjectArgs)` variant to `Commands` enum
+- Added `run_project()` function as wrapper
+- Added dispatch for Project command in main match statement
+
 ## Status
 - **Phase 1 (Project Registry):** COMPLETE
-- **Phase 2 (Project Management Commands):** TODO
+- **Phase 2 (Project Management Commands):** COMPLETE
 - **Phase 3 (Multi-Repo Tick):** TODO
 - **Phase 4 (Launchd Management Commands):** TODO
-- **Phase 5 (Dependency Addition):** TODO (dirs already in dependencies)
+- **Phase 5 (Dependency Addition):** COMPLETE (dirs already in dependencies)
 - **Phase 6 (Clean Up Old Script):** TODO
 
 ## What's Next
 
-**Phase 2: Project Management Commands**
+**Phase 3: Multi-Repo Tick with Lock**
 
 This is the next most important task because:
-1. It provides the CLI interface for managing projects
-2. Testing the registry requires commands to use it
-3. Phase 3 (Multi-Repo Tick) depends on projects being registered via commands
+1. It enables the core multi-repo automation functionality
+2. The tick command processes all registered projects for due automations
+3. Phase 4 (Launchd Management) depends on the tick command working
 
 Implementation:
-1. Create `apps/velor-cli/src/projects.rs` with `run_project()` handler
-2. Add `Project` top-level command to main.rs with Add/Remove/List subcommands
-3. Implement handlers for Add (register), Remove (unregister), List (show all)
+1. Modify `run_tick()` in `apps/velor-cli/src/automations.rs` to:
+   - Add file-based locking (`fs2` crate) for single-instance guarantee
+   - Load `ProjectRegistry` to get all enabled projects
+   - Fall back to legacy mode if registry is empty
+   - Process each project with path-explicit execution (no `set_current_dir`)
+2. Update precedence documentation: global config → repo config → automation file fields
 
 ## Blockers / Open Questions
 
@@ -64,16 +100,19 @@ None.
 
 ## Verification
 
-- All 13 registry module tests pass
+- All 292 tests pass (21 new registry tests including enable/disable)
 - `cargo check -q` passes (no compiler errors or warnings)
 - `just check` passes (all tests pass, Svelte warnings unrelated)
+- Can register, list, enable, disable, and remove projects via CLI
 
 ## Commit References
 
-Previous session (preparation):
+Previous sessions:
 - Commit: 7a160ce fix(cli): make Ctrl+C handler registration more graceful
+- Commit: d8bd0c2 feat(automations): add Phase 1 - Project Registry for multi-repo automation discovery
 
-This session (Phase 1):
-- Created `crates/automations/src/registry.rs` - Complete project registry module with 13 tests
-- Updated `crates/automations/src/lib.rs` - Added registry module and re-exports
+This session (Phase 2):
+- Modified `crates/automations/src/registry.rs` - Added `enable()` and `disable()` methods with tests
+- Created `apps/velor-cli/src/projects.rs` - Complete project management CLI module
+- Modified `apps/velor-cli/src/main.rs` - Added Project command and dispatch
 - Progress file update

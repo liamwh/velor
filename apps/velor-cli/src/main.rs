@@ -14,6 +14,7 @@ use std::sync::Arc;
 mod automations;
 mod cancellation;
 mod plan;
+mod projects;
 mod tui;
 
 // Re-export from velor-core
@@ -23,6 +24,7 @@ use cancellation::CancellationHandler;
 
 use automations::AutomationsArgs;
 use plan::{PlanRunConfig, run_plan_generation};
+use projects::ProjectArgs;
 
 use core::{
     agent::{AgentRunner, require_claude_on_path},
@@ -67,6 +69,9 @@ enum Commands {
 
     /// Manage and run scheduled automations
     Automations(AutomationsArgs),
+
+    /// Manage project registry for multi-repo automation discovery
+    Project(ProjectArgs),
 }
 
 /// Arguments common to both subcommands
@@ -415,6 +420,15 @@ async fn run_init(git_root: std::path::PathBuf) -> color_eyre::eyre::Result<()> 
     Ok(())
 }
 
+/// Runs the `project` subcommand to manage the project registry.
+///
+/// This command provides a way to register, list, enable, and disable
+/// projects for multi-repo automation discovery.
+#[tracing::instrument(level = "debug", ret, err)]
+async fn run_project(args: ProjectArgs) -> color_eyre::eyre::Result<()> {
+    projects::run_project(args).await
+}
+
 /// Runs the `plan` subcommand to generate an implementation plan from spec files.
 ///
 /// # Errors
@@ -633,6 +647,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root).await,
         Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root).await,
         Some(Commands::Automations(args)) => run_automations(args, home_cfg, git_root).await,
+        Some(Commands::Project(args)) => run_project(args).await,
         None => run_interactive_menu(home_cfg, git_root, cwd).await,
     }
 }
