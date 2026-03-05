@@ -564,6 +564,7 @@ async fn run_automations(
         AutomationsCommand::Status { name } => {
             automations::run_status(name, home_cfg, git_root).await
         }
+        AutomationsCommand::Tick {} => automations::run_tick(home_cfg, git_root).await,
         AutomationsCommand::Daemon { tick_interval_secs } => {
             automations::run_daemon(tick_interval_secs, home_cfg, git_root).await
         }

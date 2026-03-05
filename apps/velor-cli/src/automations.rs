@@ -8,10 +8,10 @@ use crate::core::config::FileConfig;
 use clap::Args;
 use color_eyre::eyre::WrapErr;
 use color_eyre::eyre::eyre;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use velor_automations::{
-    Automation, AutomationCache, AutomationRunner, AutomationStore, CatchUpPolicy,
+    Automation, AutomationCache, AutomationEntry, AutomationRunner, AutomationStore, CatchUpPolicy,
     merge_automation_vars,
 };
 use velor_core::prompts::PromptCache;
@@ -50,6 +50,9 @@ pub enum AutomationsCommand {
         /// Optional automation name to filter by
         name: Option<String>,
     },
+
+    /// Run one tick of the scheduler (for use with external schedulers like launchd/cron)
+    Tick {},
 
     /// Start the automation daemon (runs continuously)
     Daemon {
@@ -454,6 +457,71 @@ pub async fn run_status(
     Ok(())
 }
 
+/// Runs the `automations tick` subcommand.
+///
+/// Executes a single tick of the scheduler - runs all scheduled automations once and exits.
+/// This is designed for use with external schedulers like launchd (macOS) or cron (Linux).
+#[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display()))]
+pub async fn run_tick(home_cfg: FileConfig, git_root: PathBuf) -> color_eyre::eyre::Result<()> {
+    let config_path = FileConfig::default_config_path(&git_root);
+    let repo_cfg = FileConfig::load_if_exists(&config_path)
+        .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
+        .unwrap_or_default();
+
+    let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg);
+    let auto_cfg = merged_cfg.automations;
+
+    let home_dir = get_xdg_config_home();
+    let repo_dir = Some(git_root.join(".velor"));
+    let db_path = git_root.join(&auto_cfg.state_db_path);
+
+    // Load automations using cache
+    let cache = AutomationCache::new(home_dir, repo_dir);
+    let automations = cache.get().await?;
+    let enabled_automations: Vec<_> = automations
+        .into_values()
+        .filter(|e| e.automation.enabled)
+        .collect();
+
+    if enabled_automations.is_empty() {
+        println!("⚠️  No enabled automations found. Exiting.");
+        return Ok(());
+    }
+
+    // Open state database
+    let store = AutomationStore::open(&db_path).await?;
+
+    // Create runner
+    let runner = AutomationRunner::new(
+        store.clone(),
+        auto_cfg.max_concurrent,
+        &git_root,
+        merged_cfg.defaults.binary,
+        auto_cfg.max_output_bytes,
+    );
+
+    // Create cancellation handler
+    let (_cancel_handler, cancel_token) = crate::cancellation::CancellationHandler::new();
+
+    let now = chrono::Utc::now();
+    println!("🕐 Tick at {}", now.format("%Y-%m-%d %H:%M:%S UTC"));
+
+    // Process all automations once
+    process_automations_tick(
+        &enabled_automations,
+        &runner,
+        &cancel_token,
+        &home_cfg,
+        &git_root,
+        now,
+    )
+    .await?;
+
+    println!("✅ Tick complete.");
+
+    Ok(())
+}
+
 /// Runs the `automations daemon` subcommand.
 ///
 /// Starts the automation daemon which continuously monitors and runs scheduled automations.
@@ -555,148 +623,18 @@ pub async fn run_daemon(
             now.format("%Y-%m-%d %H:%M:%S UTC")
         );
 
-        // Check each automation
-        for entry in &enabled_automations {
-            // Get last run time for this automation
-            let last_run = get_last_run_time(runner.store(), &entry.automation.name, now).await;
-
-            // Calculate next scheduled time (timezone is already Tz)
-            match velor_automations::Scheduler::new(
-                &entry.automation.schedule_raw,
-                entry.automation.timezone,
-            ) {
-                Ok(scheduler) => {
-                    // Determine which runs to execute based on catch-up policy
-                    let runs_to_execute = match entry.automation.catch_up {
-                        velor_automations::CatchUpPolicy::Skip => {
-                            // Only run if the next scheduled time has passed
-                            let next_run = scheduler.next_after(last_run);
-                            if next_run <= now {
-                                vec![next_run]
-                            } else {
-                                vec![]
-                            }
-                        }
-                        velor_automations::CatchUpPolicy::RunOnce => {
-                            // Run once if any runs were missed
-                            let missed = scheduler.missed_runs_since(last_run, now, u32::MAX);
-                            if missed.is_empty() {
-                                vec![]
-                            } else {
-                                // Run only the first missed schedule
-                                vec![missed[0]]
-                            }
-                        }
-                        velor_automations::CatchUpPolicy::RunAll => {
-                            // Run all missed schedules up to max_catch_up
-                            scheduler.missed_runs_since(
-                                last_run,
-                                now,
-                                entry.automation.max_catch_up,
-                            )
-                        }
-                    };
-
-                    if runs_to_execute.is_empty() {
-                        tracing::debug!(
-                            "  ⏸️  Skipping '{}' (next run at {})",
-                            entry.automation.name,
-                            scheduler.next_after(last_run).format("%Y-%m-%d %H:%M:%S")
-                        );
-                        continue;
-                    }
-
-                    println!(
-                        "  ▶️  Running '{}' {} time(s) (catch-up: {:?})",
-                        entry.automation.name,
-                        runs_to_execute.len(),
-                        entry.automation.catch_up
-                    );
-
-                    // Resolve prompt for this automation
-                    let home_dir = get_xdg_config_home();
-                    let repo_dir = Some(git_root.join(".velor"));
-                    let prompt_cache = PromptCache::new(home_dir, repo_dir);
-                    let prompt_content = match entry
-                        .automation
-                        .prompt_source
-                        .resolve(
-                            &prompt_cache,
-                            &get_xdg_config_home(),
-                            Some(&git_root.join(".velor")),
-                        )
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            println!("        ❌ Failed to resolve prompt: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Load config for variable merging
-                    let cwd = std::env::current_dir()?;
-                    let config_path = FileConfig::default_config_path(&git_root);
-                    let repo_cfg = FileConfig::load_if_exists(&config_path)?.unwrap_or_default();
-                    let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg);
-                    let merged_vars = merge_automation_vars(
-                        entry.automation.vars.clone(),
-                        merged_cfg.vars.clone(),
-                        home_cfg.vars.clone(),
-                        &git_root,
-                        &cwd,
-                    );
-
-                    // Convert AutomationFile to legacy Automation
-                    let automation = Automation {
-                        name: entry.automation.name.clone(),
-                        description: entry.automation.description.clone(),
-                        schedule: entry.automation.schedule_raw.clone(),
-                        timezone: entry.automation.timezone.to_string(),
-                        prompt: prompt_content,
-                        enabled: entry.automation.enabled,
-                        vars: merged_vars,
-                        catch_up: entry.automation.catch_up,
-                        max_catch_up: entry.automation.max_catch_up,
-                        timeout_seconds: entry.automation.timeout_seconds,
-                        notify_on_success: entry.automation.notify_on_success,
-                        notify_on_failure: entry.automation.notify_on_failure,
-                    };
-
-                    // Execute each scheduled run
-                    for scheduled_for in runs_to_execute {
-                        println!("      - Scheduled for {}", scheduled_for.format("%H:%M:%S"));
-
-                        match runner
-                            .run_automation(&automation, scheduled_for, &cancel_token)
-                            .await
-                        {
-                            Ok(result) => {
-                                let status_icon = match result.status {
-                                    velor_automations::AutomationRunStatus::Completed => "✅",
-                                    velor_automations::AutomationRunStatus::Failed => "❌",
-                                    velor_automations::AutomationRunStatus::Cancelled => "⚠️",
-                                    _ => "⏳",
-                                };
-                                println!(
-                                    "        {} Status: {}",
-                                    status_icon,
-                                    result.status.as_str()
-                                );
-                            }
-                            Err(e) => {
-                                println!("        ❌ Error: {}", e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!(
-                        "  ❌ Invalid schedule for '{}': {}",
-                        entry.automation.name, e
-                    );
-                }
-            }
+        // Process all automations using shared tick logic
+        if let Err(e) = process_automations_tick(
+            &enabled_automations,
+            &runner,
+            &cancel_token,
+            &home_cfg,
+            &git_root,
+            now,
+        )
+        .await
+        {
+            println!("  ❌ Error processing tick: {}", e);
         }
 
         println!();
@@ -712,6 +650,156 @@ pub async fn run_daemon(
     }
 
     println!("👋 Daemon stopped.");
+
+    Ok(())
+}
+
+/// Processes a single tick for all enabled automations.
+///
+/// This is shared logic used by both `run_tick()` (single execution) and `run_daemon()` (continuous loop).
+#[tracing::instrument(level = "debug", ret, err, skip_all)]
+async fn process_automations_tick(
+    enabled_automations: &[AutomationEntry],
+    runner: &AutomationRunner,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    home_cfg: &FileConfig,
+    git_root: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> color_eyre::eyre::Result<()> {
+    for entry in enabled_automations {
+        // Get last run time for this automation
+        let last_run = get_last_run_time(runner.store(), &entry.automation.name, now).await;
+
+        // Calculate next scheduled time (timezone is already Tz)
+        match velor_automations::Scheduler::new(
+            &entry.automation.schedule_raw,
+            entry.automation.timezone,
+        ) {
+            Ok(scheduler) => {
+                // Determine which runs to execute based on catch-up policy
+                let runs_to_execute = match entry.automation.catch_up {
+                    velor_automations::CatchUpPolicy::Skip => {
+                        // Only run if the next scheduled time has passed
+                        let next_run = scheduler.next_after(last_run);
+                        if next_run <= now {
+                            vec![next_run]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    velor_automations::CatchUpPolicy::RunOnce => {
+                        // Run once if any runs were missed
+                        let missed = scheduler.missed_runs_since(last_run, now, u32::MAX);
+                        if missed.is_empty() {
+                            vec![]
+                        } else {
+                            // Run only the first missed schedule
+                            vec![missed[0]]
+                        }
+                    }
+                    velor_automations::CatchUpPolicy::RunAll => {
+                        // Run all missed schedules up to max_catch_up
+                        scheduler.missed_runs_since(last_run, now, entry.automation.max_catch_up)
+                    }
+                };
+
+                if runs_to_execute.is_empty() {
+                    tracing::debug!(
+                        "  ⏸️  Skipping '{}' (next run at {})",
+                        entry.automation.name,
+                        scheduler.next_after(last_run).format("%Y-%m-%d %H:%M:%S")
+                    );
+                    continue;
+                }
+
+                println!(
+                    "  ▶️  Running '{}' {} time(s) (catch-up: {:?})",
+                    entry.automation.name,
+                    runs_to_execute.len(),
+                    entry.automation.catch_up
+                );
+
+                // Resolve prompt for this automation
+                let home_dir = get_xdg_config_home();
+                let repo_dir = Some(git_root.join(".velor"));
+                let prompt_cache = PromptCache::new(home_dir, repo_dir);
+                let prompt_content = match entry
+                    .automation
+                    .prompt_source
+                    .resolve(
+                        &prompt_cache,
+                        &get_xdg_config_home(),
+                        Some(&git_root.join(".velor")),
+                    )
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        println!("        ❌ Failed to resolve prompt: {}", e);
+                        continue;
+                    }
+                };
+
+                // Load config for variable merging
+                let cwd = std::env::current_dir()?;
+                let config_path = FileConfig::default_config_path(git_root);
+                let repo_cfg = FileConfig::load_if_exists(&config_path)?.unwrap_or_default();
+                let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg);
+                let merged_vars = merge_automation_vars(
+                    entry.automation.vars.clone(),
+                    merged_cfg.vars.clone(),
+                    home_cfg.vars.clone(),
+                    git_root,
+                    &cwd,
+                );
+
+                // Convert AutomationFile to legacy Automation
+                let automation = Automation {
+                    name: entry.automation.name.clone(),
+                    description: entry.automation.description.clone(),
+                    schedule: entry.automation.schedule_raw.clone(),
+                    timezone: entry.automation.timezone.to_string(),
+                    prompt: prompt_content,
+                    enabled: entry.automation.enabled,
+                    vars: merged_vars,
+                    catch_up: entry.automation.catch_up,
+                    max_catch_up: entry.automation.max_catch_up,
+                    timeout_seconds: entry.automation.timeout_seconds,
+                    notify_on_success: entry.automation.notify_on_success,
+                    notify_on_failure: entry.automation.notify_on_failure,
+                };
+
+                // Execute each scheduled run
+                for scheduled_for in runs_to_execute {
+                    println!("      - Scheduled for {}", scheduled_for.format("%H:%M:%S"));
+
+                    match runner
+                        .run_automation(&automation, scheduled_for, cancel_token)
+                        .await
+                    {
+                        Ok(result) => {
+                            let status_icon = match result.status {
+                                velor_automations::AutomationRunStatus::Completed => "✅",
+                                velor_automations::AutomationRunStatus::Failed => "❌",
+                                velor_automations::AutomationRunStatus::Cancelled => "⚠️",
+                                _ => "⏳",
+                            };
+                            println!("        {} Status: {}", status_icon, result.status.as_str());
+                        }
+                        Err(e) => {
+                            println!("        ❌ Error: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!(
+                    "  ❌ Invalid schedule for '{}': {}",
+                    entry.automation.name, e
+                );
+            }
+        }
+    }
 
     Ok(())
 }
