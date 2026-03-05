@@ -19,6 +19,8 @@ use velor_automations::{
 };
 use velor_core::prompts::PromptCache;
 
+pub mod launchd;
+
 /// Arguments for the `automations` subcommand.
 #[derive(Debug, Args)]
 pub struct AutomationsArgs {
@@ -63,6 +65,19 @@ pub enum AutomationsCommand {
         #[arg(long)]
         tick_interval_secs: Option<u64>,
     },
+
+    /// Install launchd service
+    Install {
+        /// Tick interval in seconds
+        #[arg(long)]
+        interval: Option<u64>,
+    },
+
+    /// Uninstall launchd service
+    Uninstall,
+
+    /// Show launchd service status
+    ServiceStatus,
 }
 
 /// Gets the XDG config home directory for velor.
