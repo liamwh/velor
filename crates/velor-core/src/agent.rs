@@ -922,4 +922,156 @@ mod tests {
         assert_eq!(tool_call.name, "Bash");
         assert_eq!(tool_call.args_display, "");
     }
+
+    // ===== Integration tests for multi-tool conversation streams =====
+
+    #[test]
+    fn integration_multi_tool_conversation_sequence() {
+        // Simulates a realistic conversation where Claude uses multiple tools
+        let stream_lines = vec![
+            // Assistant starts with text
+            r#"{"type":"content_block_delta","delta":{"text":"I'll examine the codebase structure."}}"#,
+            // Then uses Glob
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Glob","input":{"pattern":"**/*.rs"}}]}}"#,
+            // Then some more text
+            r#"{"type":"content_block_delta","delta":{"text":"Found the files."}}"#,
+            // Then uses Read
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+            // Then uses Grep
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_3","name":"Grep","input":{"pattern":"test","path":"src/"}}]}}"#,
+            // Final response
+            r#"{"type":"content_block_delta","delta":{"text":"Analysis complete."}}"#,
+        ];
+
+        let mut tool_calls = Vec::new();
+        let mut text_parts = Vec::new();
+
+        for line in stream_lines {
+            let (text, tool_call) = process_stream_line(line);
+            if let Some(tc) = tool_call {
+                tool_calls.push(tc);
+            }
+            if let Some(t) = text {
+                text_parts.push(t);
+            }
+        }
+
+        // Verify we extracted all tool calls
+        assert_eq!(tool_calls.len(), 3, "should extract 3 tool calls");
+
+        // Verify tool call types and display formats
+        assert_eq!(tool_calls[0].name, "Glob");
+        assert_eq!(tool_calls[0].args_display, "**/*.rs");
+        assert_eq!(tool_calls[0].format_display(), "🔧 Glob: **/*.rs");
+
+        assert_eq!(tool_calls[1].name, "Read");
+        assert_eq!(tool_calls[1].args_display, "src/main.rs");
+        assert_eq!(tool_calls[1].format_display(), "🔧 Read: src/main.rs");
+
+        assert_eq!(tool_calls[2].name, "Grep");
+        assert_eq!(tool_calls[2].args_display, "test path=src/");
+        assert_eq!(tool_calls[2].format_display(), "🔧 Grep: test path=src/");
+
+        // Verify text was also extracted
+        assert_eq!(text_parts.len(), 3, "should extract 3 text parts");
+        assert_eq!(text_parts[0], "I'll examine the codebase structure.");
+        assert_eq!(text_parts[1], "Found the files.");
+        assert_eq!(text_parts[2], "Analysis complete.");
+    }
+
+    #[test]
+    fn integration_all_common_tools_in_one_stream() {
+        // Tests all common tool types in a single stream
+        let stream_lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"Cargo.toml"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"3","name":"Glob","input":{"pattern":"src/**/*.rs"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"4","name":"Grep","input":{"pattern":"TODO"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"5","name":"Edit","input":{"file_path":"src/lib.rs"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"6","name":"Write","input":{"file_path":"tests/new_test.rs"}}]}}"#,
+        ];
+
+        let mut tool_calls = Vec::new();
+        for line in stream_lines {
+            let (_, tool_call) = process_stream_line(line);
+            if let Some(tc) = tool_call {
+                tool_calls.push(tc);
+            }
+        }
+
+        assert_eq!(tool_calls.len(), 6, "should extract all 6 tool calls");
+
+        // Verify each tool call has correct display format with emoji
+        for tc in &tool_calls {
+            let display = tc.format_display();
+            assert!(
+                display.starts_with("🔧 "),
+                "tool call should start with 🔧 emoji"
+            );
+            assert!(
+                display.contains(": "),
+                "tool call should have colon separator"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_mixed_text_and_tools_stream() {
+        // Tests realistic interleaving of text and tool calls
+        let stream_lines = vec![
+            r#"{"type":"content_block_delta","delta":{"text":"Let me check"}}"#,
+            r#"{"type":"content_block_delta","delta":{"text":" the project structure."}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"1","name":"Read","input":{"file_path":"README.md"}}]}}"#,
+            r#"{"type":"content_block_delta","delta":{"text":"Now I'll "}}"#,
+            r#"{"type":"content_block_delta","delta":{"text":"search for tests."}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"2","name":"Grep","input":{"pattern":"test","path":"src/"}}]}}"#,
+            r#"{"type":"content_block_delta","delta":{"text":"Done searching."}}"#,
+        ];
+
+        let mut tool_calls = Vec::new();
+        let mut full_text = String::new();
+
+        for line in stream_lines {
+            let (text, tool_call) = process_stream_line(line);
+            if let Some(tc) = tool_call {
+                tool_calls.push(tc);
+            }
+            if let Some(t) = text {
+                full_text.push_str(&t);
+            }
+        }
+
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].name, "Read");
+        assert_eq!(tool_calls[1].name, "Grep");
+        assert_eq!(
+            full_text,
+            "Let me check the project structure.Now I'll search for tests.Done searching."
+        );
+    }
+
+    #[test]
+    fn integration_long_command_truncation() {
+        // Verifies long commands are properly truncated for display
+        let long_command = "cargo test -- --test-threads=1 --show-output --nocapture some_very_long_test_name_that_exceeds_limit";
+
+        // Test format_tool_args directly (JSON escaping makes raw string test difficult)
+        let input = serde_json::json!({"command": long_command});
+        let tool_call = format_tool_args("Bash", &input);
+
+        assert_eq!(tool_call.name, "Bash");
+        assert!(
+            tool_call.args_display.len() <= super::MAX_COMMAND_DISPLAY_LEN + 3,
+            "display should be truncated to {} + 3 for ...",
+            super::MAX_COMMAND_DISPLAY_LEN
+        );
+        assert!(
+            tool_call.args_display.ends_with("..."),
+            "truncated display should end with ..."
+        );
+        assert!(
+            tool_call.format_display().starts_with("🔧 Bash: "),
+            "display should have emoji prefix"
+        );
+    }
 }
