@@ -110,46 +110,15 @@ tauri-dev:
 
 # Install velor CLI and set up launchd service for automations
 install-launchd: install
-    @bash scripts/install-launchd.sh
+    @~/bin/vel automations install
 
 # Uninstall the launchd service
 uninstall-launchd:
-    #!/usr/bin/env bash
-    set -e
-    echo "🛑 Stopping and removing velor automations service..."
-    PLIST_PATH="$HOME/Library/LaunchAgents/com.velor.automations.plist"
-
-    if [ -f "$PLIST_PATH" ]; then
-        if launchctl list | grep -q "com.velor.automations"; then
-            echo "🔄 Unloading service..."
-            launchctl unload "$PLIST_PATH"
-        fi
-        echo "🗑️  Removing plist..."
-        rm "$PLIST_PATH"
-        echo "✅ Velor automations service removed"
-    else
-        echo "ℹ️  No launchd service found"
-    fi
+    @~/bin/vel automations uninstall
 
 # Check status of velor automations launchd service
 launchd-status:
-    #!/usr/bin/env bash
-    set -e
-    echo "📊 Velor automations service status:"
-
-    if launchctl list | grep -q "com.velor.automations"; then
-        echo "✅ Service is loaded"
-        echo ""
-        echo "Recent logs:"
-        if [ -f ~/.velor/automations.log ]; then
-            tail -10 ~/.velor/automations.log
-        else
-            echo "No logs found yet"
-        fi
-    else
-        echo "❌ Service is not loaded"
-        echo "Run 'just install-launchd' to install it"
-    fi
+    @~/bin/vel automations status
 
 # List all justfile recipes
 default:
