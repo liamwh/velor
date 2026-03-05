@@ -34,6 +34,7 @@ use std::process::Command;
 /// ```
 /// use std::collections::BTreeMap;
 /// use std::path::PathBuf;
+/// use velor_automations::merge_automation_vars;
 ///
 /// let automation_vars = BTreeMap::from([("custom".to_string(), "value".to_string())]);
 /// let repo_vars = BTreeMap::from([("repo_var".to_string(), "repo_value".to_string())]);
@@ -112,16 +113,6 @@ pub fn merge_automation_vars(
 /// Returns an error if the git command cannot be executed, but the error
 /// is converted to `Ok(String::new())` for the actual output to maintain
 /// best-effort semantics.
-///
-/// # Examples
-///
-/// ```
-/// use std::path::PathBuf;
-///
-/// let git_root = PathBuf::from("/path/to/repo");
-/// let branch = get_current_branch(&git_root).unwrap();
-/// // branch will be the current branch name or empty string
-/// ```
 fn get_current_branch(git_root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git")
         .arg("-C")
