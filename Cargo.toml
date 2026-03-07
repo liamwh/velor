@@ -40,6 +40,8 @@ globset = "0.4"
 regex = "1.10"
 
 # Automation-specific dependencies
+dirs = "5"
+fs2 = "0.4"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
 cron = "0.12"
 iana-time-zone = "0.1"
@@ -47,6 +49,14 @@ tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
 ulid = "1"
+
+# Vault/crypto dependencies
+chacha20poly1305 = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+thiserror = "2.0"
 
 # Tauri dependencies
 tauri = { version = "2", features = ["tray-icon"] }
