@@ -81,6 +81,30 @@ Modified `execute_velor_file` to inject secrets at execution time:
 
 **Note:** Legacy automations (`execute_velor_legacy`) do NOT use vault secrets since they don't have secret declarations. This is by design - legacy automations are deprecated.
 
+### Phase 5: Security Guardrails - COMPLETED
+
+All security features from the plan are implemented:
+- ✅ Never log secret values (SecretString usage throughout)
+- ✅ SecretString exposed only at Command::env() call site
+- ✅ Secret name validation (`^[A-Z][A-Z0-9_]*$` pattern)
+- ✅ Permission checks (vault.rs line 627: `mode & 0o077 != 0`)
+- ✅ Atomic writes with backup (vault.rs: creates .bak file via rename)
+- ✅ Advisory .gitignore check (vault.rs CLI: `check_gitignore()`)
+
+### Phase 6: Documentation - COMPLETED
+
+**File Created:**
+- `docs/vault.md` - Comprehensive user documentation (9KB)
+
+**Contents:**
+- Quick start guide (4-step setup)
+- Storage locations table (global vs project)
+- Full CLI reference (8 commands with examples)
+- Automation integration guide
+- Security model (encryption, backend comparison)
+- Troubleshooting section (7 common issues)
+- Architecture diagram
+
 ## Verification
 
 ```bash
@@ -96,25 +120,16 @@ cargo test --package velor-automations --lib runner::
 
 ## What's Next
 
-**Phase 5: Security Guardrails** (optional - most already implemented)
-
-The plan includes additional security features, but most are already in place:
-- ✅ Never log secret values (SecretString usage)
-- ✅ SecretString exposed only at Command::env()
-- ✅ Secret name validation
-- ✅ Permission checks (in vault.rs)
-- ✅ Atomic writes with backup (in vault.rs)
-
-Remaining items from Phase 5 that could be added:
-- Advisory .gitignore check (already implemented in CLI)
-
-**Documentation Updates** (optional):
-- `docs/vault.md` - Getting started guide, CLI reference, security model
-- `README.md` - Quick start with vault example
+All planned phases are complete. Optional enhancements for future consideration:
+- `vel vault edit` command (Phase 2+ feature)
+- Template variable access to secrets (security review needed)
+- Per-automation vaults
+- Secret rotation automation
+- Audit trail for secret access
 
 ## Blockers / Open Questions
 
-None. Phases 1-4 are complete.
+None. All phases (1-6) are complete.
 
 ## References
 
@@ -122,4 +137,5 @@ None. Phases 1-4 are complete.
 - Phase 1 commit: 690d394
 - Phase 2 commit: 016339d
 - Phase 3 commit: fa0b6ed
-- Phase 4 commit: 8ae46cf
+- Phase 4 commit: cb0800e
+- Phase 5-6 commit: f9319c4
