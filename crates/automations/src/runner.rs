@@ -7,6 +7,7 @@ use chrono::Utc;
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use color_eyre::eyre::eyre;
+use secrecy::ExposeSecret;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -744,14 +745,69 @@ impl AutomationRunner {
             .await
             .wrap_err("Failed to resolve prompt content")?;
 
-        let child = Command::new(&self.velor_binary)
-            .arg("once")
+        // Resolve secrets with fail-closed semantics
+        // This will fail immediately if any required secrets are missing
+        let secrets = match velor_vault::resolve_automation_secrets(
+            &automation.required_secrets,
+            &automation.optional_secrets,
+            work_dir,
+        )
+        .await
+        {
+            Ok(secrets) => secrets,
+            Err(velor_vault::VaultError::RequiredSecretMissing { key }) => {
+                // Fail immediately - required secret not available
+                tracing::error!(
+                    automation = %automation.name,
+                    secret = %key,
+                    "Required secret missing, automation will not run"
+                );
+                return Ok(AutomationResult {
+                    status: AutomationRunStatus::Failed,
+                    iterations_completed: 0,
+                    exit_code: None,
+                    output: String::new(),
+                    error: Some(format!("Required secret missing: {}", key)),
+                });
+            }
+            Err(e) => {
+                // Other vault errors (unavailable, decrypt failed, etc.)
+                tracing::error!(
+                    automation = %automation.name,
+                    error = %e,
+                    "Vault error, automation will not run"
+                );
+                return Ok(AutomationResult {
+                    status: AutomationRunStatus::Failed,
+                    iterations_completed: 0,
+                    exit_code: None,
+                    output: String::new(),
+                    error: Some(format!("Vault error: {}", e)),
+                });
+            }
+        };
+
+        // Build command with secrets injected
+        let mut cmd = Command::new(&self.velor_binary);
+        cmd.arg("once")
             .arg("--prompt-text")
             .arg(&prompt_content)
             .current_dir(work_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+
+        // Inject ONLY declared secrets (fail-closed by type)
+        for (key, secret) in &secrets.secrets {
+            cmd.env(key, secret.expose_secret());
+        }
+
+        tracing::debug!(
+            automation = %automation.name,
+            secrets_count = secrets.len(),
+            "Injecting secrets into automation"
+        );
+
+        let child = cmd.spawn()?;
 
         // Wait for the child to complete
         // Note: We don't kill the child mid-execution on cancellation

@@ -60,31 +60,66 @@ pub required_secrets: Vec<String>,  // Must be present for automation to run
 pub optional_secrets: Vec<String>,  // Injected if available, not required
 ```
 
+### Phase 4: Automation Runner Integration - COMPLETED
+
+Modified `execute_velor_file` to inject secrets at execution time:
+
+**Files Modified:**
+- `crates/automations/Cargo.toml` - Added `secrecy` dependency for `ExposeSecret` trait
+- `crates/automations/src/runner.rs` - Integrated vault secrets into subprocess execution
+
+**Integration Points:**
+1. Calls `velor_vault::resolve_automation_secrets()` before spawning subprocess
+2. Injects resolved secrets via `cmd.env(key, secret.expose_secret())`
+3. Handles `VaultError::RequiredSecretMissing` by failing the automation immediately
+4. Handles other vault errors (unavailable, decrypt failed) by failing the automation
+
+**Fail-Closed Semantics:**
+- Required secrets missing → automation fails immediately with clear error message
+- Vault unavailable → automation fails immediately
+- Only declared secrets are injected (no secret leakage)
+
+**Note:** Legacy automations (`execute_velor_legacy`) do NOT use vault secrets since they don't have secret declarations. This is by design - legacy automations are deprecated.
+
 ## Verification
 
 ```bash
 just check
 # All checks pass (no compilation errors, clippy clean, svelte-check passes)
+
+cargo test --package velor-vault --lib
+# 30 tests pass
+
+cargo test --package velor-automations --lib runner::
+# 12 runner tests pass
 ```
 
 ## What's Next
 
-**Phase 4: Automation Runner Integration**
+**Phase 5: Security Guardrails** (optional - most already implemented)
 
-Modify `crates/automations/src/runner.rs` to inject secrets at execution time using `velor_vault::resolve_automation_secrets()`.
+The plan includes additional security features, but most are already in place:
+- ✅ Never log secret values (SecretString usage)
+- ✅ SecretString exposed only at Command::env()
+- ✅ Secret name validation
+- ✅ Permission checks (in vault.rs)
+- ✅ Atomic writes with backup (in vault.rs)
 
-Key integration points:
-1. Call `resolve_automation_secrets(&automation.required_secrets, &automation.optional_secrets, work_dir)` before spawning subprocess
-2. Inject resolved secrets via `cmd.env(key, secret.expose_secret())`
-3. Handle `VaultError::RequiredSecretMissing` by failing the automation immediately
+Remaining items from Phase 5 that could be added:
+- Advisory .gitignore check (already implemented in CLI)
+
+**Documentation Updates** (optional):
+- `docs/vault.md` - Getting started guide, CLI reference, security model
+- `README.md` - Quick start with vault example
 
 ## Blockers / Open Questions
 
-None. Phases 1-3 are complete. Ready for Phase 4.
+None. Phases 1-4 are complete.
 
 ## References
 
 - Plan file: `docs/plans/imperative-riding-corbato.md`
 - Phase 1 commit: 690d394
 - Phase 2 commit: 016339d
-- Phase 3 commit: 8e579d8
+- Phase 3 commit: fa0b6ed
+- Phase 4 commit: 8ae46cf
