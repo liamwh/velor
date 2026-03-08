@@ -4,7 +4,7 @@
 
 ### Phase 1: Core Vault Library (`crates/velor-vault`) - COMPLETED
 
-Created the complete vault library with all components:
+Committed in 690d394. Created the complete vault library with all components:
 
 **Files Created:**
 - `crates/velor-vault/Cargo.toml` - Crate manifest with crypto dependencies
@@ -17,21 +17,34 @@ Created the complete vault library with all components:
 - `crates/velor-vault/src/passphrase.rs` - Argon2id key derivation with `KdfMetadata`
 - `crates/velor-vault/src/vault.rs` - `Vault` struct with CRUD, save, load, rotate, migrate operations
 
-**Dependencies Added to Workspace:**
-- `chacha20poly1305` - AEAD encryption
-- `rand` - Random number generation
-- `sha2` - SHA-256 for project scope IDs
-- `argon2` - Passphrase key derivation
-- `zeroize` - Secure memory zeroing
-- `thiserror` - Error types
-
 **Test Coverage:**
 - 30 unit tests covering all modules
-- Tests for encryption/decryption roundtrip
-- Tests for keyring backend operations
-- Tests for passphrase key derivation
-- Tests for vault CRUD operations
-- Tests for secret name validation
+
+### Phase 2: CLI Integration (`apps/velor-cli/src/vault.rs`) - COMPLETED
+
+Implemented all CLI commands for vault management:
+
+**Files Created/Modified:**
+- `apps/velor-cli/src/vault.rs` - Complete CLI implementation (new file)
+- `apps/velor-cli/Cargo.toml` - Added dependencies (velor-vault, rpassword, atty, secrecy)
+- `apps/velor-cli/src/main.rs` - Added vault subcommand and dispatch
+- `apps/velor-cli/src/automations/launchd.rs` - Fixed clippy warnings (drive-by fix)
+
+**CLI Commands Implemented:**
+- `vel vault init [--global] [--backend keyring|passphrase]` - Initialize a new vault
+- `vel vault set KEY [--prompt] [--from-env VAR] [--global]` - Set a secret
+- `vel vault get KEY [--raw] [--force] [--global]` - Get a secret (masked by default)
+- `vel vault list [--global]` - List all secret keys
+- `vel vault unset KEY [--global]` - Remove a secret
+- `vel vault validate [--global]` - Validate vault access
+- `vel vault rotate-key [--global]` - Rotate master key
+- `vel vault migrate-backend --to keyring|passphrase [--global]` - Migrate backend
+
+**Security Features:**
+- No shell history leakage (stdin or --prompt only for set)
+- TTY safety check for --raw output (requires --force)
+- Advisory .gitignore check for project vaults
+- Masked output by default
 
 ## Verification
 
@@ -40,22 +53,10 @@ cargo nextest run -p velor-vault
 # 30 tests passed
 
 just check
-# All checks pass
+# All checks pass (no clippy warnings)
 ```
 
 ## What's Next
-
-**Phase 2: CLI Integration** (`apps/velor-cli/src/vault.rs`)
-
-Implement the CLI commands for vault management:
-- `vel vault init` - Initialize a new vault
-- `vel vault set` - Set a secret (from stdin, prompt, or env)
-- `vel vault get` - Get a secret (masked by default, --raw for scripting)
-- `vel vault list` - List all secret keys
-- `vel vault unset` - Remove a secret
-- `vel vault validate` - Validate vault access
-- `vel vault rotate-key` - Rotate master key
-- `vel vault migrate-backend` - Migrate between keyring/passphrase
 
 **Phase 3: Automation File Format**
 
@@ -67,9 +68,10 @@ Modify `crates/automations/src/runner.rs` to inject secrets at execution time.
 
 ## Blockers / Open Questions
 
-None. The core library is complete and ready for CLI integration.
+None. Phase 1 and 2 are complete. Ready for Phase 3.
 
 ## References
 
 - Plan file: `docs/plans/imperative-riding-corbato.md`
-- No commits yet (changes are uncommitted)
+- Phase 1 commit: 690d394
+- Phase 2: uncommitted (ready to commit)

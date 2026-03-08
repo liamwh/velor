@@ -16,6 +16,7 @@ mod cancellation;
 mod plan;
 mod projects;
 mod tui;
+mod vault;
 
 // Re-export from velor-core
 use velor_core as core;
@@ -72,6 +73,9 @@ enum Commands {
 
     /// Manage project registry for multi-repo automation discovery
     Project(ProjectArgs),
+
+    /// Manage encrypted secrets vault
+    Vault(vault::VaultArgs),
 }
 
 /// Arguments common to both subcommands
@@ -653,6 +657,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root).await,
         Some(Commands::Automations(args)) => run_automations(args, home_cfg, git_root).await,
         Some(Commands::Project(args)) => run_project(args).await,
+        Some(Commands::Vault(args)) => vault::run(args.command, Some(git_root)).await,
         None => run_interactive_menu(home_cfg, git_root, cwd).await,
     }
 }
