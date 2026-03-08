@@ -14,6 +14,8 @@ color-eyre = { workspace = true }
 dotenvy = { workspace = true }
 ctrlc = { workspace = true }
 crossterm = { workspace = true }
+dirs = { workspace = true }
+fs2 = { workspace = true }
 humantime = { workspace = true }
 ratatui = { workspace = true }
 reqwest = { workspace = true }
@@ -28,6 +30,14 @@ velor-core = { path = "../../crates/velor-core" }
 
 # Automations crate dependency
 velor-automations = { path = "../../crates/automations" }
+
+# Vault crate dependency
+velor-vault = { path = "../../crates/velor-vault" }
+secrecy = { workspace = true }
+
+# Secure password prompts for vault
+rpassword = "7.3"
+atty = "0.2"
 
 # Timezone support (for automations)
 chrono-tz = { workspace = true }
