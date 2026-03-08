@@ -74,4 +74,4 @@ None. Phase 1 and 2 are complete. Ready for Phase 3.
 
 - Plan file: `docs/plans/imperative-riding-corbato.md`
 - Phase 1 commit: 690d394
-- Phase 2: uncommitted (ready to commit)
+- Phase 2 commit: 016339d
