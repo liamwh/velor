@@ -46,32 +46,45 @@ Implemented all CLI commands for vault management:
 - Advisory .gitignore check for project vaults
 - Masked output by default
 
+### Phase 3: Automation File Format - COMPLETED
+
+Added `required_secrets` and `optional_secrets` fields to `AutomationFile` struct:
+
+**Files Modified:**
+- `crates/automations/src/file_config.rs` - Added fields to `AutomationFileRaw` and `AutomationFile`, added `validate_secrets()` method
+- `crates/automations/src/runner.rs` - Fixed test initializations to include new fields
+
+**Fields Added:**
+```rust
+pub required_secrets: Vec<String>,  // Must be present for automation to run
+pub optional_secrets: Vec<String>,  // Injected if available, not required
+```
+
 ## Verification
 
 ```bash
-cargo nextest run -p velor-vault
-# 30 tests passed
-
 just check
-# All checks pass (no clippy warnings)
+# All checks pass (no compilation errors, clippy clean, svelte-check passes)
 ```
 
 ## What's Next
 
-**Phase 3: Automation File Format**
-
-Add `required_secrets` and `optional_secrets` fields to `AutomationFile` struct in `crates/velor-automations/src/file_config.rs`.
-
 **Phase 4: Automation Runner Integration**
 
-Modify `crates/automations/src/runner.rs` to inject secrets at execution time.
+Modify `crates/automations/src/runner.rs` to inject secrets at execution time using `velor_vault::resolve_automation_secrets()`.
+
+Key integration points:
+1. Call `resolve_automation_secrets(&automation.required_secrets, &automation.optional_secrets, work_dir)` before spawning subprocess
+2. Inject resolved secrets via `cmd.env(key, secret.expose_secret())`
+3. Handle `VaultError::RequiredSecretMissing` by failing the automation immediately
 
 ## Blockers / Open Questions
 
-None. Phase 1 and 2 are complete. Ready for Phase 3.
+None. Phases 1-3 are complete. Ready for Phase 4.
 
 ## References
 
 - Plan file: `docs/plans/imperative-riding-corbato.md`
 - Phase 1 commit: 690d394
 - Phase 2 commit: 016339d
+- Phase 3 commit: 8e579d8

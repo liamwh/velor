@@ -746,7 +746,7 @@ impl AutomationRunner {
 
         let child = Command::new(&self.velor_binary)
             .arg("once")
-            .arg("--prompt")
+            .arg("--prompt-text")
             .arg(&prompt_content)
             .current_dir(work_dir)
             .stdout(Stdio::piped())
@@ -821,7 +821,7 @@ impl AutomationRunner {
 
         let child = Command::new(&self.velor_binary)
             .arg("once")
-            .arg("--prompt")
+            .arg("--prompt-text")
             .arg(&automation.prompt)
             .current_dir(work_dir)
             .stdout(Stdio::piped())
@@ -1137,6 +1137,8 @@ mod tests {
             timeout_seconds: Some(60),
             notify_on_success: false,
             notify_on_failure: false,
+            required_secrets: vec![],
+            optional_secrets: vec![],
         };
 
         // setup_worktree should return None since temp_dir is not a git repo
@@ -1233,6 +1235,8 @@ mod tests {
             timeout_seconds: Some(60),
             notify_on_success: false,
             notify_on_failure: false,
+            required_secrets: vec![],
+            optional_secrets: vec![],
         };
 
         // setup_worktree should create a worktree

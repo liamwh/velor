@@ -66,6 +66,18 @@ pub struct AutomationFileRaw {
     /// Send notification on failure.
     #[serde(default = "default_true")]
     pub notify_on_failure: bool,
+    /// Required secrets for this automation.
+    ///
+    /// These secrets must be present in the vault for the automation to run.
+    /// Values are injected as environment variables during execution.
+    #[serde(default)]
+    pub required_secrets: Vec<String>,
+    /// Optional secrets for this automation.
+    ///
+    /// These secrets may or may not be present in the vault.
+    /// Values are injected as environment variables during execution if available.
+    #[serde(default)]
+    pub optional_secrets: Vec<String>,
 }
 
 /// Validated automation (pure config, no provenance).
@@ -101,6 +113,16 @@ pub struct AutomationFile {
     pub notify_on_success: bool,
     /// Send notification on failure.
     pub notify_on_failure: bool,
+    /// Required secrets for this automation.
+    ///
+    /// These secrets must be present in the vault for the automation to run.
+    /// Values are injected as environment variables during execution.
+    pub required_secrets: Vec<String>,
+    /// Optional secrets for this automation.
+    ///
+    /// These secrets may or may not be present in the vault.
+    /// Values are injected as environment variables during execution if available.
+    pub optional_secrets: Vec<String>,
 }
 
 /// Cache entry with provenance metadata.
@@ -317,6 +339,8 @@ impl AutomationFile {
             timeout_seconds: raw.timeout_seconds,
             notify_on_success: raw.notify_on_success,
             notify_on_failure: raw.notify_on_failure,
+            required_secrets: raw.required_secrets,
+            optional_secrets: raw.optional_secrets,
         })
     }
 
@@ -357,6 +381,19 @@ impl AutomationFile {
         let secs = (timeout_secs * 2).max(900);
         chrono::Duration::seconds(secs as i64)
     }
+
+    /// Validate secret declarations at load time.
+    ///
+    /// Checks that all secret names are valid environment variable names
+    /// and that there are no duplicates between required and optional lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any secret name is invalid or duplicated.
+    pub fn validate_secrets(&self) -> Result<()> {
+        velor_vault::validate_secret_declarations(&self.required_secrets, &self.optional_secrets)
+            .map_err(|e| eyre!("Invalid secret declarations: {}", e))
+    }
 }
 
 #[cfg(test)]
@@ -384,6 +421,8 @@ mod dst_tests {
             timeout_seconds: Some(60),
             notify_on_success: false,
             notify_on_failure: false,
+            required_secrets: vec![],
+            optional_secrets: vec![],
         }
     }
 
@@ -483,6 +522,8 @@ mod tests {
             timeout_seconds: Some(60),
             notify_on_success: false,
             notify_on_failure: false,
+            required_secrets: vec![],
+            optional_secrets: vec![],
         }
     }
 
