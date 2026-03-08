@@ -180,7 +180,7 @@ impl TelegramNotifier {
         let url = self
             .api_base_url
             .join(&format!(
-                "bot{}/sendMessage",
+                "/bot{}/sendMessage",
                 self.bot_token.expose_secret()
             ))
             .wrap_err("failed to construct Telegram API URL")?;
@@ -204,11 +204,9 @@ impl TelegramNotifier {
             .post(url.clone())
             .json(&body)
             .send()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to send Telegram notification request to chat {} (API URL: {})",
-                    self.chat_id, url
-                )
+            .map_err(|e| {
+                eyre!("failed to send Telegram notification request to chat {} (API URL: {}): {e:?}",
+                    self.chat_id, url)
             })?;
 
         let status = response.status();
