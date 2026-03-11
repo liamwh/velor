@@ -48,16 +48,44 @@ SHA: (to be added after commit)
 - `Cargo.toml` (workspace): Added `serial_test = "3"`
 - `crates/velor-core/Cargo.toml`: Added `serial_test` to dev-dependencies
 
+### Phase 2: Internal Hidden Subcommand ✅ COMPLETED
+
+**File: `apps/velor-cli/src/main.rs`**
+- Added `Internal(InternalArgs)` to the `Commands` enum with `#[command(hide = true)]`
+- Created `InternalArgs` struct (derives `Args`) with `#[command(subcommand)]` field
+- Created `InternalCommands` enum (derives `Subcommand`) with `CompletePrompts` variant
+- Implemented `run_internal_complete_prompts()` handler with graceful degradation
+- Updated `main()` match statement to handle internal commands
+
+**Key design decisions:**
+- Follows the vault pattern: `InternalArgs` (Args wrapper) → `InternalCommands` (Subcommand enum)
+- Hidden from help: `#[command(hide = true)]` on the `Internal` variant
+- Graceful degradation: returns empty output on failure (not errors)
+- Uses `FileConfig::merge()` to combine home and repo configs
+- Calls `core::prompts::discovery::discover_prompt_names()` from Phase 1
+
+**Command behavior:**
+```bash
+vel internal complete-prompts
+# Outputs one prompt name per line, sorted alphabetically
+# e.g., acp-test, implement-plan, once, test-glob-injection
+# Returns exit code 0 on both success and failure
+```
+
 ## What's Next
 
-### Phase 2: Internal Hidden Subcommand
-**File: `apps/velor-cli/src/main.rs`**
-- Add `Internal(InternalCommands)` to the `Commands` enum (with `#[command(hide = true)]`)
-- Create `InternalCommands` enum with `CompletePrompts` variant
-- Implement `handle_internal_complete_prompts()` handler with graceful degradation
-- Update command matching in `main()` to handle internal commands
+### Phase 3: Custom Zsh Completion
+**File: `apps/velor-cli/src/completion.rs` - NEW FILE**
+- Create new module for shell completion generation
+- Implement custom Zsh completion with dynamic `--prompt` completion
+- Add `Shell` enum and `generate_completion()` function
+- For other shells (Bash, Fish, etc.), use `clap_complete` for static scaffolding
 
-This is the most logical next step because it builds directly on the `discover_prompt_names()` function just implemented.
+### Phase 4: Completion Command
+**File: `apps/velor-cli/src/main.rs`**
+- Add `Completion(CompletionArgs)` to the `Commands` enum
+- Create `CompletionArgs` struct with `--shell` argument
+- Wire up the `completion::generate_completion()` call
 
 ## Remaining Phases
 
@@ -72,14 +100,24 @@ This is the most logical next step because it builds directly on the `discover_p
 - Tests that manipulate `HOME` use `serial_test` to prevent race conditions
 - The function is async and designed for fast execution (< 50ms target) for shell completion performance
 - Error handling uses `thiserror` as per library crate guidelines in `.agents/rules/rust.mdc`
+- The internal command is completely hidden from `vel --help` output
+- Command requires git root discovery; will fail outside git repo (expected behavior)
+- Error logging goes to tracing debug, not stderr, to avoid noisy completion
+- All prompt sources are included: config prompts, home file prompts, repo file prompts
 
 ## Verification Steps Completed
 
 1. ✅ `cargo test -p velor-core --test prompt_discovery` - All 10 tests pass
 2. ✅ `cargo clippy -p velor-core --all-targets` - No warnings
 3. ✅ Dependencies properly added to workspace and crate
+4. ✅ `cargo build -p velor-cli` - Build succeeds
+5. ✅ `just check` - All checks pass
+6. ✅ `vel internal complete-prompts` - Outputs prompt names correctly (acp-test, implement-plan, once, test-glob-injection)
+7. ✅ Graceful degradation works - returns empty output on failure
 
 ## Verification Steps Remaining (for next phase)
 
-1. `velor internal complete-prompts` - Should output newline-delimited prompt names
-2. Test error handling: Ensure the command exits silently (no stderr) on failure
+1. Create `apps/velor-cli/src/completion.rs` module
+2. Add `clap_complete` dependency to `apps/velor-cli/Cargo.toml`
+3. Generate and test Zsh completion script
+4. Install completion in zsh and verify TAB completion works

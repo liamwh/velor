@@ -76,13 +76,34 @@ enum Commands {
 
     /// Manage encrypted secrets vault
     Vault(vault::VaultArgs),
+
+    /// Hidden internal commands for developer tooling
+    #[command(hide = true)]
+    Internal(InternalArgs),
+}
+
+/// Internal command arguments.
+#[derive(Debug, Args)]
+struct InternalArgs {
+    #[command(subcommand)]
+    command: InternalCommands,
+}
+
+/// Internal commands for development tooling and shell completion.
+#[derive(Debug, Subcommand)]
+enum InternalCommands {
+    /// Output available prompt names for shell completion (newline-delimited).
+    ///
+    /// Prints one prompt name per line, sorted alphabetically.
+    /// Outputs nothing on failure (graceful degradation for shell completion).
+    CompletePrompts,
 }
 
 /// Arguments common to both subcommands
 #[derive(Debug, Args)]
 struct CommonArgs {
-    /// Override config path (defaults to {git_root}/.velor/agent-cli.toml).
-    #[arg(long)]
+    /// Override config path (defaults to {git_root}/.velor/velor.toml).
+    #[arg(short, long)]
     config: Option<std::path::PathBuf>,
 
     /// Prompt name from TOML: [prompts.<name>].
@@ -156,7 +177,7 @@ struct AutoArgs {
 #[derive(Debug, Args)]
 struct PlanArgs {
     /// Override config path (defaults to {git_root}/.velor/velor.toml).
-    #[arg(long)]
+    #[arg(short, long)]
     config: Option<std::path::PathBuf>,
 
     /// Specs directory path (relative to git root).
@@ -433,6 +454,50 @@ async fn run_project(args: ProjectArgs) -> color_eyre::eyre::Result<()> {
     projects::run_project(args).await
 }
 
+/// Runs the `internal complete-prompts` subcommand for shell completion.
+///
+/// This handler outputs available prompt names for shell completion.
+/// On failure, it silently exits with no output (graceful degradation).
+#[tracing::instrument(level = "debug", ret, err)]
+async fn run_internal_complete_prompts(
+    home_cfg: FileConfig,
+    git_root: std::path::PathBuf,
+) -> color_eyre::eyre::Result<()> {
+    // Attempt to load config and discover prompts
+    let result: color_eyre::eyre::Result<Vec<String>> = async {
+        // Load git repo config (optional, may not exist)
+        let config_path = FileConfig::default_config_path(&git_root);
+        let repo_cfg = FileConfig::load_if_exists(&config_path)
+            .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
+            .unwrap_or_default();
+
+        // Merge: home config as base, repo config as overlay
+        let file_cfg = FileConfig::merge(home_cfg, repo_cfg);
+
+        core::prompts::discovery::discover_prompt_names(Some(&git_root), &file_cfg)
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("prompt discovery failed: {e}"))
+    }
+    .await;
+
+    // Output: one name per line, or nothing on failure
+    // Shell completion expects quiet degradation
+    match result {
+        Ok(names) => {
+            for name in names {
+                println!("{name}");
+            }
+        }
+        Err(e) => {
+            // Silently exit with no output
+            // Shell completion will simply show no options
+            tracing::debug!("Completion failed: {e}");
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs the `plan` subcommand to generate an implementation plan from spec files.
 ///
 /// # Errors
@@ -658,6 +723,11 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::Automations(args)) => run_automations(args, home_cfg, git_root).await,
         Some(Commands::Project(args)) => run_project(args).await,
         Some(Commands::Vault(args)) => vault::run(args.command, Some(git_root)).await,
+        Some(Commands::Internal(args)) => match args.command {
+            InternalCommands::CompletePrompts => {
+                run_internal_complete_prompts(home_cfg, git_root).await
+            }
+        },
         None => run_interactive_menu(home_cfg, git_root, cwd).await,
     }
 }
