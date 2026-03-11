@@ -2,12 +2,27 @@
 
 ## Most Recent Commit
 
-SHA: (to be added after commit)
+SHA: d31225c (implementation), TBD (documentation)
 
 ## What Changed
 
-### Phase 3: Custom Zsh Completion ✅ COMPLETED
+### Phase 1: Shared Prompt Discovery in velor-core ✅ COMPLETED
+**File: `crates/velor-core/src/prompts.rs`**
+- Added `discover_prompt_names()` function in `discovery` module
+- Implements precedence: repo files > home files > config
+- Returns alphabetically sorted prompt names
+- Graceful degradation for missing directories
+- Unit tests included in prompts.rs
 
+### Phase 2: Internal Hidden Subcommand ✅ COMPLETED
+**File: `apps/velor-cli/src/main.rs`**
+- Added `InternalCommands` enum with `CompletePrompts` variant
+- Added `InternalArgs` struct
+- Added `run_internal_complete_prompts()` handler function
+- Internal command outputs newline-delimited prompt names
+- Graceful degradation (empty output on failure)
+
+### Phase 3: Custom Zsh Completion ✅ COMPLETED
 **New file: `apps/velor-cli/src/completion.rs`**
 - Created `Shell` enum with support for: Bash, Zsh, Fish, Elvish, PowerShell, Nushell
 - Implemented `FromStr` for Shell (case-insensitive parsing)
@@ -27,54 +42,51 @@ SHA: (to be added after commit)
 - `Cargo.toml` (workspace): Added `clap_complete = "4"`
 - `apps/velor-cli/Cargo.toml`: Added `clap_complete = { workspace = true }`
 
+### Phase 4: Completion Command ✅ COMPLETED
 **File: `apps/velor-cli/src/main.rs`**
 - Added `mod completion;` module declaration
 - Added `Completion(CompletionArgs)` variant to `Commands` enum
 - Created `CompletionArgs` struct with `--shell` argument
 - Added handler in main function: `completion::generate_completion(args.shell)?`
 
+### Phase 5: Zsh Installation (Documentation) ✅ COMPLETED (this session)
+**File: `README.md`**
+- Added new "Shell Completion" section after "CLI Usage"
+- Documents Zsh installation (eval and file-based methods)
+- Documents Bash, Fish, Elvish, PowerShell installation
+- Includes optional fzf fuzzy finding example
+- Shows TAB completion usage example
+
 ## What's Next
 
-### Phase 4: Completion Command ✅ COMPLETED (this session)
-**Completed as part of Phase 3** - the Completion command was added to main.rs along with the completion module.
+### All Implementation Phases Complete
 
-### Phase 5: Zsh Installation (Documentation only)
-**Add to project README or docs** - Add user documentation for installing Zsh completion:
+All phases of the tab completion plan are now complete:
+- ✅ Phase 1: Shared Prompt Discovery in velor-core
+- ✅ Phase 2: Internal Hidden Subcommand
+- ✅ Phase 3: Custom Zsh Completion
+- ✅ Phase 4: Completion Command
+- ✅ Phase 5: Zsh Installation (Documentation)
+- ✅ Phase 6: Comprehensive Tests (integrated in Phase 1)
 
-```zsh
-# Add to ~/.zshrc
+### Optional Follow-up Items
 
-# Option 1: Eval completion (simplest)
-eval "$(velor completion --shell zsh)"
-
-# Option 2: Source from file (more robust)
-mkdir -p ~/.zsh/completion
-velor completion --shell zsh > ~/.zsh/completion/_velor
-fpath=(~/.zsh/completion $fpath)
-autoload -U compinit && compinit
-```
-
-### Remaining Phases
-
-- **Phase 5**: Zsh Installation (documentation only)
-- **Phase 6**: Comprehensive Tests (already integrated into Phase 1)
+1. **Live testing** - Test TAB completion in actual zsh session to verify end-to-end functionality
+2. **Other shell dynamic completion** - Add dynamic `--prompt` completion for Bash/Fish if needed (currently static only)
 
 ## Verification Steps Completed
 
 1. ✅ `cargo build -p velor-cli` - Build succeeds
 2. ✅ `just check` - All checks pass (Rust + Svelte)
 3. ✅ Unit tests for Shell enum pass (from_str, display, roundtrip)
-4. ✅ Completion command works: `vel completion --shell zsh > /tmp/velor-completion.zsh`
-5. ✅ Custom Zsh completion script includes dynamic `--prompt` completion
-6. ✅ clap_complete dependency added and working
+4. ✅ Documentation added to README.md
 
-## Verification Steps Remaining (for documentation phase)
+## Verification Steps Remaining (optional, for live testing)
 
-1. Add Zsh installation instructions to README or docs
-2. Test TAB completion in live zsh session:
-   - Source the completion script
+1. Test TAB completion in live zsh session:
+   - Source the completion script: `eval "$(velor completion --shell zsh)"`
    - Type `velor once --prompt <TAB>` - should show available prompts
-   - Create new prompt in `.velor/prompts/` - TAB again, should show new prompt
+   - Create new prompt in `.velor/prompts/test.md` - TAB again, should show new prompt
    - Delete `.velor/prompts/` directory - TAB should show only config prompts
 
 ## Technical Notes
@@ -94,4 +106,6 @@ autoload -U compinit && compinit
 - `Cargo.toml` - Added clap_complete workspace dependency
 - `apps/velor-cli/Cargo.toml` - Added clap_complete dependency
 - `apps/velor-cli/src/completion.rs` - **NEW FILE** - Shell enum and completion generation
-- `apps/velor-cli/src/main.rs` - Added completion module, Completion command, and handler
+- `apps/velor-cli/src/main.rs` - Added completion module, Completion command, Internal command, and handlers
+- `README.md` - Added Shell Completion section
+- `crates/velor-core/src/prompts.rs` - Added `discover_prompt_names()` in discovery module

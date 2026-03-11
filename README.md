@@ -244,6 +244,62 @@ velor init
 velor test-notification
 ```
 
+## Shell Completion
+
+Velor provides shell completion for the `--prompt` argument and all subcommands. The completion is **dynamic** - it reads your current prompts at runtime, so it always stays accurate.
+
+### Zsh (First-class Support)
+
+Zsh has full support with dynamic prompt completion:
+
+```bash
+# Option 1: Eval completion (simplest)
+# Add to ~/.zshrc
+eval "$(velor completion --shell zsh)"
+
+# Option 2: Source from file (more robust)
+# Add to ~/.zshrc
+mkdir -p ~/.zsh/completion
+velor completion --shell zsh > ~/.zsh/completion/_velor
+fpath=(~/.zsh/completion $fpath)
+autoload -U compinit && compinit
+```
+
+After reloading your shell, press `<TAB>` after `--prompt` to see available prompts:
+
+```bash
+velor once --prompt <TAB>
+# Shows: default, refactor, debug, etc.
+```
+
+### Other Shells
+
+For Bash, Fish, Elvish, and PowerShell:
+
+```bash
+# Generate completion script
+velor completion --shell bash > ~/.local/share/bash-completion/completions/velor
+velor completion --shell fish > ~/.config/fish/completions/velor.fish
+velor completion --shell elvish > ~/.elvish/lib/velor.elv
+velor completion --shell powershell > ~/.config/powershell/velor.ps1
+```
+
+### Fuzzy Finding (Optional)
+
+For enhanced prompt selection with fzf, add to your `~/.zshrc`:
+
+```bash
+_velor_fzf_prompt() {
+    local prompt=$(velor internal complete-prompts | fzf --prompt="Select prompt: ")
+    if [[ -n "$prompt" ]]; then
+        LBUFFER+="$prompt"
+        zle reset-prompt
+    fi
+}
+zle -N _velor_fzf_prompt
+bindkey '^g' _velor_fzf_prompt  # Ctrl+G to open fzf selector
+```
+
 ## Development
 
 ```bash
