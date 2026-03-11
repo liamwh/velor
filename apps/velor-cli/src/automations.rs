@@ -292,6 +292,12 @@ pub async fn run_run(
         .wrap_err_with(|| format!("failed to load config at {}", config_path.display()))?
         .unwrap_or_default();
     let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg.clone());
+
+    // Resolve binary to absolute path for launchd compatibility
+    let binary_path = merged_cfg
+        .resolve_binary_path()
+        .wrap_err("Failed to resolve binary path")?;
+
     let auto_cfg = merged_cfg.automations;
 
     // Merge variables with built-ins (home -> repo -> automation -> built-ins)
@@ -316,16 +322,16 @@ pub async fn run_run(
         )
         .await?;
 
-    // Open state database
+    // Open state database with automatic migration from legacy automations.db
     let db_path = git_root.join(&auto_cfg.state_db_path);
-    let store = AutomationStore::open(&db_path).await?;
+    let store = AutomationStore::open_with_migration(&db_path).await?;
 
     // Create runner
     let runner = AutomationRunner::new(
         store.clone(),
         auto_cfg.max_concurrent,
         &git_root,
-        merged_cfg.defaults.binary,
+        binary_path,
         auto_cfg.max_output_bytes,
     );
 
@@ -409,7 +415,7 @@ pub async fn run_status(
         return Ok(());
     }
 
-    let store = AutomationStore::open(&db_path).await?;
+    let store = AutomationStore::open_with_migration(&db_path).await?;
     let limit = 20;
 
     let runs = store.get_runs(name.as_deref(), limit).await?;
@@ -611,6 +617,12 @@ async fn process_project_tick(
 
     // Merge configs: global -> repo
     let merged_cfg = FileConfig::merge(global_cfg.clone(), repo_cfg);
+
+    // Resolve binary to absolute path for launchd compatibility
+    let binary_path = merged_cfg
+        .resolve_binary_path()
+        .wrap_err_with(|| format!("Failed to resolve binary path for project '{}'", id))?;
+
     let auto_cfg = merged_cfg.automations;
 
     let home_dir = get_xdg_config_home();
@@ -634,8 +646,8 @@ async fn process_project_tick(
         return Ok(());
     }
 
-    // Open state database for this project
-    let store = AutomationStore::open(&db_path)
+    // Open state database for this project with automatic migration from legacy automations.db
+    let store = AutomationStore::open_with_migration(&db_path)
         .await
         .wrap_err_with(|| format!("Failed to open state database at {}", db_path.display()))?;
 
@@ -644,7 +656,7 @@ async fn process_project_tick(
         store.clone(),
         auto_cfg.max_concurrent,
         git_root,
-        merged_cfg.defaults.binary,
+        binary_path,
         auto_cfg.max_output_bytes,
     );
 
@@ -688,6 +700,12 @@ pub async fn run_daemon(
         .unwrap_or_default();
 
     let merged_cfg = FileConfig::merge(home_cfg.clone(), repo_cfg);
+
+    // Resolve binary to absolute path for launchd compatibility
+    let binary_path = merged_cfg
+        .resolve_binary_path()
+        .wrap_err("Failed to resolve binary path")?;
+
     let auto_cfg = merged_cfg.automations;
 
     let home_dir = get_xdg_config_home();
@@ -731,15 +749,15 @@ pub async fn run_daemon(
     }
     println!();
 
-    // Open state database
-    let store = AutomationStore::open(&db_path).await?;
+    // Open state database with automatic migration from legacy automations.db
+    let store = AutomationStore::open_with_migration(&db_path).await?;
 
     // Create runner
     let runner = AutomationRunner::new(
         store,
         auto_cfg.max_concurrent,
         &git_root,
-        merged_cfg.defaults.binary,
+        binary_path,
         auto_cfg.max_output_bytes,
     );
 
