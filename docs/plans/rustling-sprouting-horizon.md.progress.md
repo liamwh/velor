@@ -1,44 +1,42 @@
-# Progress Handoff: Database Consolidation - Phase 2 Migration Logic
+# Progress Handoff: Database Consolidation - Phase 3 CLI Commands Use Migration
 
 ## What Changed (Facts Only)
 
-### Implementation Completed: Phase 2 - Add Migration Logic to AutomationStore
+### Implementation Completed: Phase 3 - Update CLI Commands to Use Migration
 
-**File Modified:** `crates/automations/src/store.rs`
+**File Modified:** `apps/velor-cli/src/automations.rs`
 
 **Changes:**
-1. Added `open_with_migration()` method - Opens database with automatic migration from legacy `automations.db`
-2. Added `is_database_empty()` helper - Checks if a database has no automation_runs
-3. Added `migrate_from_legacy()` method - Migrates automation_runs and automation_locks from legacy database
-4. Added `LegacyAutomationRunRow` struct - For reading legacy database rows during migration
-5. Added tracing instrumentation with `info` and `instrument` macros
-6. Added imports: `color_eyre::eyre::WrapErr`, `std::path::Path`, `tracing::{info, instrument}`
+1. Line 327 in `run_run()` - Changed `AutomationStore::open(&db_path)` to `AutomationStore::open_with_migration(&db_path)`
+2. Line 418 in `run_status()` - Changed `AutomationStore::open(&db_path)` to `AutomationStore::open_with_migration(&db_path)`
+3. Line 650 in `process_project_tick()` - Changed `AutomationStore::open(&db_path)` to `AutomationStore::open_with_migration(&db_path)`
+4. Line 753 in `run_daemon()` - Changed `AutomationStore::open(&db_path)` to `AutomationStore::open_with_migration(&db_path)`
+5. Added comments to clarify automatic migration from legacy automations.db
 
-**Tests Added:**
-1. `test_open_with_migration_no_legacy_db` - Verifies opening without legacy database works
-2. `test_open_with_migration_empty_velor_db_with_legacy` - Verifies migration from legacy to empty velor.db
-3. `test_open_with_migration_existing_velor_db_skips_migration` - Verifies migration is skipped when velor.db has data
-4. `test_is_database_empty` - Verifies database empty detection logic
-5. `test_migration_with_locks` - Verifies legacy database is renamed to .bak after migration
+**All checks pass:**
+- `just check` - All fmt, clippy, and svelte-check checks pass
+- `cargo nextest run -p velor-automations` - 130/130 tests pass
+- Store migration tests pass (14/14)
 
-**Migration Behavior:**
-- Checks for `.velor/automations.db` (legacy) in the same directory as target path
-- Migrates only if target doesn't exist OR is empty
-- Copies `automation_runs` and `automation_locks` tables
-- Renames legacy database to `automations.db.bak` after successful migration
-- Cleans up associated WAL files
-
-**All tests pass:** `cargo test -p velor-automations --lib store` - 14 passed, 0 failed
+**Behavior:**
+- All 4 CLI entry points now use `open_with_migration()` instead of `open()`
+- The migration logic (completed in Phase 2) will now be invoked when opening the database
+- Migration triggers if `.velor/automations.db` exists and `.velor/velor.db` doesn't exist or is empty
 
 ## What's Next (The Next Best Task)
 
 **Phase 1: Change Default Database Path in config.rs**
 
-The default `state_db_path` in `crates/velor-core/src/config.rs` (line 249) is still `.velor/automations.db`. This needs to be changed to `.velor/velor.db` to align with the migration logic just implemented.
+The default `state_db_path` still points to `.velor/automations.db` in:
+1. `crates/velor-core/src/config.rs:249`
+2. `crates/automations/src/config.rs:33`
+3. Test assertion `crates/automations/src/config.rs:169`
 
-**Also need to update:** `crates/automations/src/config.rs` (line 33) which has the same default.
+This needs to be changed to `.velor/velor.db` to complete the migration flow:
+- Users with legacy `automations.db` will be migrated to `velor.db` on first access
+- New users will use `velor.db` directly
 
-**Why this is next:** The migration logic is now complete, but the default path still points to the legacy database name. Changing the default will cause the migration to trigger automatically on first use for existing users.
+**Why this is next:** The migration infrastructure is now complete (Phase 2) and wired up (Phase 3). Changing the default path will trigger the migration for existing users while maintaining backward compatibility.
 
 ## Blockers / Open Questions
 
@@ -47,5 +45,6 @@ The default `state_db_path` in `crates/velor-core/src/config.rs` (line 249) is s
 ## References
 
 - **Plan file:** `docs/plans/rustling-sprouting-horizon.md`
-- **Current code:** `crates/automations/src/store.rs`
-- **Tests:** All migration tests passing in store.rs test module
+- **Current code:** `apps/velor-cli/src/automations.rs`
+- **Tests:** All migration tests passing in `crates/automations/src/store.rs`
+- **Previous handoff:** Phase 2 implementation completed in commit `c78ea9f`
