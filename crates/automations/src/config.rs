@@ -30,7 +30,7 @@ impl Default for AutomationsConfig {
     fn default() -> Self {
         Self {
             automations_dir: ".velor/automations.d".to_string(),
-            state_db_path: ".velor/automations.db".to_string(),
+            state_db_path: ".velor/velor.db".to_string(),
             max_concurrent: 3,
             default_timezone: "UTC".to_string(),
             default_timeout_seconds: 3600, // 1 hour
@@ -166,7 +166,7 @@ mod tests {
     fn test_automations_config_default() {
         let config = AutomationsConfig::default();
         assert_eq!(config.automations_dir, ".velor/automations.d");
-        assert_eq!(config.state_db_path, ".velor/automations.db");
+        assert_eq!(config.state_db_path, ".velor/velor.db");
         assert_eq!(config.max_concurrent, 3);
         assert_eq!(config.default_timezone, "UTC");
         assert_eq!(config.default_timeout_seconds, 3600);
