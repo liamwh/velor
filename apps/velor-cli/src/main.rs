@@ -13,6 +13,7 @@ use std::sync::Arc;
 // CLI-specific modules (not in velor-core)
 mod automations;
 mod cancellation;
+mod completion;
 mod plan;
 mod projects;
 mod tui;
@@ -77,6 +78,9 @@ enum Commands {
     /// Manage encrypted secrets vault
     Vault(vault::VaultArgs),
 
+    /// Generate shell completion script
+    Completion(CompletionArgs),
+
     /// Hidden internal commands for developer tooling
     #[command(hide = true)]
     Internal(InternalArgs),
@@ -97,6 +101,16 @@ enum InternalCommands {
     /// Prints one prompt name per line, sorted alphabetically.
     /// Outputs nothing on failure (graceful degradation for shell completion).
     CompletePrompts,
+}
+
+/// Completion command arguments.
+#[derive(Debug, Args)]
+struct CompletionArgs {
+    /// Shell type for completion script.
+    ///
+    /// Supported shells: bash, zsh, fish, elvish, powershell, nushell.
+    #[arg(short, long, value_name = "SHELL")]
+    shell: completion::Shell,
 }
 
 /// Arguments common to both subcommands
@@ -723,6 +737,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::Automations(args)) => run_automations(args, home_cfg, git_root).await,
         Some(Commands::Project(args)) => run_project(args).await,
         Some(Commands::Vault(args)) => vault::run(args.command, Some(git_root)).await,
+        Some(Commands::Completion(args)) => {
+            completion::generate_completion(args.shell)?;
+            Ok(())
+        }
         Some(Commands::Internal(args)) => match args.command {
             InternalCommands::CompletePrompts => {
                 run_internal_complete_prompts(home_cfg, git_root).await
