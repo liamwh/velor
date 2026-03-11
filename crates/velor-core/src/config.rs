@@ -246,7 +246,7 @@ impl Default for AutomationsConfig {
     fn default() -> Self {
         Self {
             automations_dir: ".velor/automations.d".to_string(),
-            state_db_path: ".velor/automations.db".to_string(),
+            state_db_path: ".velor/velor.db".to_string(),
             max_concurrent: 3,
             default_timezone: "UTC".to_string(),
             default_timeout_seconds: 3600, // 1 hour
@@ -622,6 +622,34 @@ impl FileConfig {
         } else {
             agent_cli_toml
         }
+    }
+
+    /// Resolves the configured binary to an absolute path.
+    ///
+    /// For automations, this returns the path to the vel binary itself (using current_exe),
+    /// not the Claude binary that vel uses internally.
+    ///
+    /// This ensures the automations can invoke `vel once` correctly when running under launchd.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the current executable path cannot be determined.
+    #[tracing::instrument(level = "debug", ret, err)]
+    pub fn resolve_binary_path(&self) -> color_eyre::eyre::Result<String> {
+        // For automations, we need the path to the vel binary itself, not the Claude binary
+        // Use current_exe() to get the path to the currently running vel binary
+        let current_exe =
+            std::env::current_exe().wrap_err("Failed to determine current executable path")?;
+
+        // Convert to absolute path string
+        let binary_path = current_exe
+            .canonicalize()
+            .wrap_err_with(|| format!("Failed to canonicalize path: {}", current_exe.display()))?
+            .to_str()
+            .ok_or_else(|| color_eyre::eyre::eyre!("Executable path contains invalid UTF-8"))?
+            .to_string();
+
+        Ok(binary_path)
     }
 }
 
