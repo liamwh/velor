@@ -16,7 +16,9 @@ use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, eyre};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 use tokio::fs;
 use tokio::sync::Mutex;
 
@@ -349,6 +351,170 @@ pub fn split_frontmatter(content: &str) -> (String, String) {
 
     // No closing delimiter found, treat entire content as markdown
     (String::new(), content.to_string())
+}
+
+/// Prompt name discovery for shell completion.
+///
+/// This module provides functionality for discovering available prompt names
+/// from all sources (config, home files, and repo files) for use in shell
+/// completion.
+pub mod discovery {
+    use super::*;
+    use crate::config::FileConfig;
+
+    /// Return all prompt names visible from the current execution context.
+    ///
+    /// Includes config-defined prompts and file-based prompts from supported scopes.
+    /// Returned names are sorted alphabetically. Duplicate names are resolved by
+    /// precedence: repo files > home files > config.
+    ///
+    /// # Performance
+    ///
+    /// This function is called during shell completion, so it must be:
+    /// - Fast (< 50ms typically)
+    /// - Side-effect free (no writes, no network calls)
+    /// - Robust to missing directories or malformed files
+    ///
+    /// # Arguments
+    ///
+    /// * `git_root` - Optional git repository root path for repo-level prompts.
+    /// * `cfg` - Configuration file containing prompt definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptDiscoveryError`] if:
+    /// - A directory exists but cannot be read (permissions, etc.)
+    /// - A file entry cannot be read (IO error)
+    ///
+    /// Missing directories are not considered errors and are silently skipped.
+    #[tracing::instrument(level = "debug", ret, err, skip(cfg))]
+    pub async fn discover_prompt_names(
+        git_root: Option<&Path>,
+        cfg: &FileConfig,
+    ) -> Result<Vec<String>, PromptDiscoveryError> {
+        let mut prompts = BTreeMap::<String, PromptSource>::new();
+
+        // Layer 3: Config prompts (lowest precedence)
+        for name in cfg.prompts.keys() {
+            prompts.insert(name.clone(), PromptSource::Config);
+        }
+
+        // Layer 2: Home file prompts
+        if let Some(home) = dirs::home_dir() {
+            let home_prompts = home.join(".velor/prompts");
+            match scan_prompt_dir(&home_prompts).await {
+                Ok(names) => {
+                    for name in names {
+                        prompts.insert(name, PromptSource::HomeFile);
+                    }
+                }
+                Err(PromptDiscoveryError::NotFound) => {
+                    // Directory missing is expected; skip silently
+                }
+                Err(e) => {
+                    // Log but continue; other sources may still be available
+                    tracing::debug!("Failed to scan home prompts: {e}");
+                }
+            }
+        }
+
+        // Layer 1: Repo file prompts (highest precedence)
+        if let Some(root) = git_root {
+            let repo_prompts = root.join(".velor/prompts");
+            match scan_prompt_dir(&repo_prompts).await {
+                Ok(names) => {
+                    for name in names {
+                        prompts.insert(name, PromptSource::RepoFile);
+                    }
+                }
+                Err(PromptDiscoveryError::NotFound) => {
+                    // Directory missing is expected; skip silently
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to scan repo prompts: {e}");
+                }
+            }
+        }
+
+        // Extract just the names, sorted alphabetically by BTreeMap
+        Ok(prompts.into_keys().collect())
+    }
+
+    /// Scan a directory for `.md` prompt files, returning names without extension.
+    ///
+    /// Returns [`PromptDiscoveryError::NotFound`] if the directory does not exist.
+    /// Returns an empty `Vec` if the directory exists but contains no `.md` files.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - Path to the prompts directory to scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptDiscoveryError::NotFound`] if the directory does not exist.
+    /// Returns [`PromptDiscoveryError::Io`] for other IO errors.
+    #[tracing::instrument(level = "debug", ret, err, fields(dir = %dir.display()))]
+    async fn scan_prompt_dir(dir: &Path) -> Result<Vec<String>, PromptDiscoveryError> {
+        let mut names = Vec::new();
+
+        let mut entries = match fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(PromptDiscoveryError::NotFound);
+            }
+            Err(e) => return Err(PromptDiscoveryError::Io(e)),
+        };
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(PromptDiscoveryError::Io)?
+        {
+            let path = entry.path();
+
+            // Only process regular files with .md extension (case-insensitive)
+            if path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                names.push(stem.to_string());
+            }
+            // Skip non-.md files, directories, symlinks, etc.
+        }
+
+        Ok(names)
+    }
+
+    /// Source tracking for prompt name resolution.
+    ///
+    /// This enum is private to the discovery module and is used internally
+    /// to track where each prompt name originated for precedence handling.
+    #[derive(Debug, Clone, Copy)]
+    enum PromptSource {
+        /// Prompt from config file `[prompts.<name>]` section.
+        Config,
+        /// Prompt from home directory `.velor/prompts/*.md`.
+        HomeFile,
+        /// Prompt from repository `.velor/prompts/*.md`.
+        RepoFile,
+    }
+
+    /// Errors that can occur during prompt discovery.
+    #[derive(Debug, Error)]
+    pub enum PromptDiscoveryError {
+        /// The prompts directory was not found.
+        ///
+        /// This is expected when prompts directories don't exist yet and
+        /// is handled gracefully during shell completion.
+        #[error("Directory not found")]
+        NotFound,
+
+        /// An IO error occurred while reading prompts.
+        #[error("IO error: {0}")]
+        Io(#[from] std::io::Error),
+    }
 }
 
 #[cfg(test)]

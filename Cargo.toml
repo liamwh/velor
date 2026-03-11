@@ -57,6 +57,7 @@ sha2 = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 thiserror = "2.0"
+serial_test = "3"
 
 # Tauri dependencies
 tauri = { version = "2", features = ["tray-icon"] }
