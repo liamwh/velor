@@ -205,8 +205,11 @@ impl TelegramNotifier {
             .json(&body)
             .send()
             .map_err(|e| {
-                eyre!("failed to send Telegram notification request to chat {} (API URL: {}): {e:?}",
-                    self.chat_id, url)
+                eyre!(
+                    "failed to send Telegram notification request to chat {} (API URL: {}): {e:?}",
+                    self.chat_id,
+                    url
+                )
             })?;
 
         let status = response.status();
@@ -330,7 +333,7 @@ pub fn format_telegram_message(
     // Add output preview if available
     if let Some(preview) = &payload.output_preview {
         let preview = strip_ansi_escapes::strip_str(preview);
-        let preview = truncate_str(&preview, output_preview_chars as usize);
+        let preview = take_suffix(&preview, output_preview_chars as usize);
         if !preview.is_empty() {
             message.push_str("\n\nPreview:\n");
             message.push_str(preview);
@@ -392,7 +395,7 @@ pub fn format_macos_message(payload: &NotificationPayload, output_preview_chars:
 
     if let Some(preview) = &payload.output_preview {
         let preview = strip_ansi_escapes::strip_str(preview);
-        let preview = truncate_str(&preview, output_preview_chars as usize);
+        let preview = take_suffix(&preview, output_preview_chars as usize);
         if !preview.is_empty() {
             message.push_str("\n\n");
             message.push_str(preview);
@@ -422,6 +425,21 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Takes the last `max_len` characters from a string, respecting character boundaries.
+#[must_use]
+fn take_suffix(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        return s;
+    }
+
+    // Find the smallest valid char boundary at (len - max_len)
+    let mut start = s.len() - max_len;
+    while !s.is_char_boundary(start) && start < s.len() {
+        start += 1;
+    }
+    &s[start..]
 }
 
 /// Builds notifiers from configuration.
@@ -473,7 +491,7 @@ pub const fn should_notify(status: RunStatus, config: &NotificationsConfig) -> b
         RunStatus::Completed => config.notify_on_success,
         RunStatus::MaxIterationsReached => config.notify_on_max_iterations,
         RunStatus::Failed => config.notify_on_failure,
-        RunStatus::Cancelled => config.notify_on_failure,
+        RunStatus::Cancelled => false,
     }
 }
 
@@ -533,6 +551,25 @@ mod tests {
         // ANSI codes should be stripped
         assert!(!message.contains("\x1b["));
         assert!(!message.contains("[32m"));
+    }
+
+    #[test]
+    fn test_format_telegram_message_shows_end_of_output() {
+        let mut payload = test_payload(RunStatus::Completed);
+        // Create a long output with a distinct end marker
+        payload.output_preview = Some(format!("START_MARKER{}END_MARKER", "x".repeat(1000)));
+        let message = format_telegram_message(&payload, 500, None);
+
+        // The message should contain the END_MARKER (from the end of the output)
+        assert!(
+            message.contains("END_MARKER"),
+            "Message should show end of output: {message}"
+        );
+        // The message should NOT contain START_MARKER (from the beginning)
+        assert!(
+            !message.contains("START_MARKER"),
+            "Should not show beginning: {message}"
+        );
     }
 
     #[test]
@@ -598,6 +635,38 @@ mod tests {
     }
 
     #[test]
+    fn test_take_suffix_no_truncation_needed() {
+        let s = "Hello, world!";
+        assert_eq!(take_suffix(s, 100), s);
+    }
+
+    #[test]
+    fn test_take_suffix_exact_length() {
+        let s = "Hello, world!";
+        assert_eq!(take_suffix(s, 13), s);
+    }
+
+    #[test]
+    fn test_take_suffix_shorter() {
+        let s = "Hello, world!";
+        assert_eq!(take_suffix(s, 5), "orld!");
+    }
+
+    #[test]
+    fn test_take_suffix_respects_char_boundary() {
+        // "héllo" has a multi-byte character
+        let s = "héllo";
+        let suffix = take_suffix(s, 2);
+        assert_eq!(suffix, "lo"); // Should not cut in the middle of "é"
+    }
+
+    #[test]
+    fn test_take_suffix_returns_end_of_string() {
+        let s = "The quick brown fox jumps over the lazy dog";
+        assert_eq!(take_suffix(s, 10), "e lazy dog");
+    }
+
+    #[test]
     fn test_format_message_clamped_to_4096() {
         let mut payload = test_payload(RunStatus::Completed);
         // Create a very long output preview
@@ -637,6 +706,20 @@ mod tests {
         assert!(should_notify(RunStatus::Completed, &config));
         assert!(should_notify(RunStatus::MaxIterationsReached, &config));
         assert!(should_notify(RunStatus::Failed, &config));
+    }
+
+    #[test]
+    fn test_should_notify_cancelled_never_notifies() {
+        // Even with all notifications enabled, Cancelled should never notify
+        let config = NotificationsConfig {
+            enabled: true,
+            notify_on_success: true,
+            notify_on_max_iterations: true,
+            notify_on_failure: true,
+            ..Default::default()
+        };
+
+        assert!(!should_notify(RunStatus::Cancelled, &config));
     }
 
     #[test]
@@ -777,6 +860,14 @@ mod proptest_tests {
             // Result should always be valid UTF-8
             assert!(truncated.is_char_boundary(truncated.len()));
             assert!(truncated.len() <= max_len || max_len == 0);
+        }
+
+        #[test]
+        fn test_take_suffix_always_valid_utf8(s in ".*", max_len in 0usize..1000) {
+            let suffix = take_suffix(&s, max_len);
+            // Result should always be valid UTF-8
+            assert!(suffix.is_char_boundary(suffix.len()));
+            assert!(suffix.len() <= max_len || max_len == 0 || s.len() <= max_len);
         }
 
         #[test]
