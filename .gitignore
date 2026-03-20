@@ -17,9 +17,28 @@ Cargo.lock
 # Velor-specific working directory
 .velor/*.md.progress.md
 
+# Velor installation backups
+.velor-backups/
+
+# Velor runtime databases
+.velor/*.db
+.velor/*.db-shm
+.velor/*.db-wal
+.velor/*.db.bak
+.velor/automations/
+.velor/prompts/
+
+# Temporary backup directories
+*backup
+
+# Temporary test files
+test_*.rs
+
 # ACP testing (node modules and test files)
 node_modules/
 bun.lock
 package.json
 test_acp.js
 .velor/velor-acp-test.toml
+
+.env

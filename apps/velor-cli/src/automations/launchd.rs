@@ -1,6 +1,8 @@
 //! launchd service management for macOS.
 
 use color_eyre::eyre::WrapErr;
+use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -49,6 +51,116 @@ fn get_uid() -> color_eyre::eyre::Result<String> {
         .to_string())
 }
 
+/// Loads environment variables from global and project .env files.
+///
+/// Reads from:
+/// 1. `~/.config/velor/.env` (global environment)
+/// 2. `~/.config/velor/launchd-env` (legacy format, still supported)
+///
+/// .env files use KEY=value format, one per line. Lines starting with # are comments.
+/// Empty lines are ignored.
+///
+/// # Returns
+///
+/// A HashMap of environment variable names to values.
+fn load_env_file() -> HashMap<String, String> {
+    let mut env_vars = HashMap::new();
+
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return env_vars,
+    };
+
+    // Load from global .env file
+    let global_env = home.join(".config").join("velor").join(".env");
+    if global_env.exists()
+        && let Ok(content) = fs::read_to_string(&global_env)
+    {
+        parse_env_file(&content, &mut env_vars);
+    }
+
+    // Load from legacy launchd-env file (for backwards compatibility)
+    let legacy_env = home.join(".config").join("velor").join("launchd-env");
+    if legacy_env.exists()
+        && let Ok(content) = fs::read_to_string(&legacy_env)
+    {
+        parse_env_file(&content, &mut env_vars);
+    }
+
+    env_vars
+}
+
+/// Parses a .env file content into the provided HashMap.
+fn parse_env_file(content: &str, env_vars: &mut HashMap<String, String>) {
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Parse KEY=VALUE format
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_string();
+            let value = value.trim().to_string();
+            if !key.is_empty() {
+                env_vars.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Generates the EnvironmentVariables dict XML for the launchd plist.
+fn generate_env_dict() -> String {
+    let mut env_vars = load_env_file();
+
+    // Always include PATH with reasonable defaults
+    let default_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    env_vars
+        .entry("PATH".to_string())
+        .or_insert_with(|| default_path.to_string());
+
+    // Add ~/bin to PATH if it's not already there
+    if let Ok(home) = std::env::var("HOME") {
+        let home_bin = format!("{}/bin", home);
+        let current_path = env_vars
+            .get("PATH")
+            .cloned()
+            .unwrap_or_else(|| default_path.to_string());
+        if !current_path.contains(&home_bin) {
+            let new_path = format!("{}:{}", home_bin, current_path);
+            env_vars.insert("PATH".to_string(), new_path);
+        }
+    }
+
+    let mut xml = String::from("<key>EnvironmentVariables</key>\n<dict>\n");
+    for (key, value) in &env_vars {
+        xml.push_str(&format!(
+            "    <key>{}</key>\n    <string>{}</string>\n",
+            escape_xml_key(key),
+            escape_xml_value(value)
+        ));
+    }
+    xml.push_str("</dict>\n");
+
+    xml
+}
+
+/// Escapes special XML characters in plist keys.
+fn escape_xml_key(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Escapes special XML characters in plist string values.
+fn escape_xml_value(s: &str) -> String {
+    escape_xml_key(s) // Same escaping for both
+}
+
 /// Installs the launchd service.
 ///
 /// # Errors
@@ -69,6 +181,7 @@ pub async fn run_install(interval: Option<u64>) -> color_eyre::eyre::Result<()> 
         .wrap_err_with(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
     let interval_sec = interval.unwrap_or(60);
+    let env_dict = generate_env_dict();
     let plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -92,18 +205,15 @@ pub async fn run_install(interval: Option<u64>) -> color_eyre::eyre::Result<()> 
     <string>{}/automations.log</string>
     <key>StandardErrorPath</key>
     <string>{}/automations.error.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
+{}
 </dict>
 </plist>
 "#,
         bin_path.display(),
         interval_sec,
         log_dir.display(),
-        log_dir.display()
+        log_dir.display(),
+        env_dict
     );
 
     // Idempotent: try bootout first (ignore failure)
@@ -116,6 +226,13 @@ pub async fn run_install(interval: Option<u64>) -> color_eyre::eyre::Result<()> 
     tokio::fs::write(&plist, plist_content)
         .await
         .wrap_err_with(|| format!("Failed to write plist: {}", plist.display()))?;
+
+    // Codesign the binary to ensure it can be executed from PATH on macOS
+    // This fixes the "killed" issue that occurs with some release builds
+    let _ = Command::new("codesign")
+        .args(["--force", "--deep", "-s", "-"])
+        .arg(&bin_path)
+        .output();
 
     // Bootstrap
     let output = Command::new("launchctl")
@@ -213,14 +330,15 @@ pub async fn run_status() -> color_eyre::eyre::Result<()> {
         println!("   Plist: {}", plist.display());
         println!("   Logs: {}", log_path.display());
 
+        if log_path.exists()
+            && let Ok(metadata) = std::fs::metadata(&log_path)
+            && let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.elapsed()
+        {
+            println!("   Last log: {}s ago", duration.as_secs());
+        }
+
         if log_path.exists() {
-            if let Ok(metadata) = std::fs::metadata(&log_path) {
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(duration) = modified.elapsed() {
-                        println!("   Last log: {}s ago", duration.as_secs());
-                    }
-                }
-            }
             println!();
             println!("Recent logs:");
 
