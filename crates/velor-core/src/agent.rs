@@ -15,6 +15,18 @@ use std::thread;
 /// Maximum length for command display before truncating
 const MAX_COMMAND_DISPLAY_LEN: usize = 60;
 
+/// Truncates a string to approximately `max_bytes` bytes.
+///
+/// Uses `floor_char_boundary` to avoid cutting through multi-byte UTF-8 sequences.
+/// The actual result may be slightly shorter than `max_bytes` to ensure valid UTF-8.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let safe_idx = s.floor_char_boundary(max_bytes);
+    &s[..safe_idx]
+}
+
 /// Stream event types from Claude's stream-json output.
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -112,7 +124,7 @@ fn format_tool_args(name: &str, input: &serde_json::Value) -> ToolCall {
         "Bash" => {
             let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if command.len() > MAX_COMMAND_DISPLAY_LEN {
-                format!("{}...", &command[..MAX_COMMAND_DISPLAY_LEN])
+                format!("{}...", truncate_str(command, MAX_COMMAND_DISPLAY_LEN))
             } else {
                 command.to_string()
             }
@@ -153,7 +165,7 @@ fn format_tool_args(name: &str, input: &serde_json::Value) -> ToolCall {
                 input.to_string()
             };
             if input_str.len() > MAX_COMMAND_DISPLAY_LEN {
-                format!("{}...", &input_str[..MAX_COMMAND_DISPLAY_LEN])
+                format!("{}...", truncate_str(&input_str, MAX_COMMAND_DISPLAY_LEN))
             } else {
                 input_str
             }
@@ -341,7 +353,11 @@ pub fn run_claude(
 
     // Log prompt preview for debugging
     let prompt_preview = if prompt.len() > 200 {
-        format!("{}... ({} chars total)", &prompt[..200], prompt.len())
+        format!(
+            "{}... ({} chars total)",
+            truncate_str(prompt, 200),
+            prompt.len()
+        )
     } else {
         format!("{} ({} chars)", prompt, prompt.len())
     };
@@ -437,7 +453,7 @@ pub fn run_claude(
     if !status.success() {
         // Trim stderr for cleaner error messages, but include up to 500 chars
         let stderr_summary = if stderr.len() > 500 {
-            format!("{}...", &stderr[..500])
+            format!("{}...", truncate_str(&stderr, 500))
         } else {
             stderr.clone()
         };
@@ -453,7 +469,11 @@ pub fn run_claude(
         let stdout_preview = if stdout.is_empty() {
             "<no output>".to_string()
         } else if stdout.len() > 200 {
-            format!("{}... ({} chars total)", &stdout[..200], stdout.len())
+            format!(
+                "{}... ({} chars total)",
+                truncate_str(&stdout, 200),
+                stdout.len()
+            )
         } else {
             stdout.clone()
         };
@@ -1073,5 +1093,88 @@ mod tests {
             tool_call.format_display().starts_with("🔧 Bash: "),
             "display should have emoji prefix"
         );
+    }
+
+    #[test]
+    fn integration_original_crash_scenario() {
+        // Tests the exact command that caused the original panic:
+        // "byte index 60 is not a char boundary; it is inside '✔' (bytes 58..61)"
+        let grep_command = "just check 2>&1 | grep -E \"(✓|✅|Error|error|FAIL|fail|✔|warning.*error)\" | tail -30";
+
+        // This should not panic when displaying the command
+        let input = serde_json::json!({"command": grep_command});
+        let tool_call = format_tool_args("Bash", &input);
+
+        assert_eq!(tool_call.name, "Bash");
+        // The command is longer than MAX_COMMAND_DISPLAY_LEN (60)
+        assert!(tool_call.args_display.len() <= super::MAX_COMMAND_DISPLAY_LEN + 3);
+        assert!(tool_call.args_display.ends_with("..."));
+
+        // The displayed string should be valid UTF-8 (not cut through a multi-byte char)
+        assert!(tool_call.args_display.is_char_boundary(tool_call.args_display.len()));
+
+        // Verify the display format works
+        let display = tool_call.format_display();
+        assert!(display.starts_with("🔧 Bash: "));
+    }
+
+    // ===== Tests for UTF-8 safe truncation =====
+
+    #[test]
+    fn truncate_str_handles_multi_byte_chars() {
+        // "✔" is 3 bytes, "🌍" is 4 bytes
+        let s = "Hello ✔ World 🌍 Test";
+
+        // Truncate to ~12 bytes (should include the ✔ fully)
+        let truncated = super::truncate_str(s, 12);
+        // Result should be "Hello ✔ Wor" (12 bytes, ending at char boundary)
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.len() <= 12);
+        assert!(
+            !truncated.contains("World"),
+            "should truncate before 'World'"
+        );
+
+        // No truncation when under limit
+        assert_eq!(super::truncate_str(s, 1000), s);
+
+        // Edge case: truncate in middle of multi-byte char
+        // Byte 7 is in the middle of "✔" (bytes 6-8)
+        let result = super::truncate_str(s, 7);
+        assert_eq!(result, "Hello ", "should stop at the boundary before ✔");
+
+        // The original failing case: grep command with emoji
+        let grep_cmd = "just check 2>&1 | grep -E \"(✓|✅|Error|error|FAIL|fail|✔|warning.*error)\" | tail -30";
+        let result = super::truncate_str(grep_cmd, 60);
+        // Should not panic and should be valid UTF-8
+        assert!(result.is_char_boundary(result.len()));
+        assert!(result.len() <= 60);
+    }
+
+    #[test]
+    fn truncate_str_empty_string() {
+        assert_eq!(super::truncate_str("", 100), "");
+    }
+
+    #[test]
+    fn truncate_str_shorter_than_limit() {
+        let s = "Short";
+        assert_eq!(super::truncate_str(s, 100), s);
+    }
+
+    #[test]
+    fn truncate_str_exactly_at_limit() {
+        let s = "abc";
+        assert_eq!(super::truncate_str(s, 3), s);
+    }
+
+    #[test]
+    fn truncate_str_various_emoji() {
+        let s = "Test 😀 🎉 🔥 ❤️";
+        // Truncate somewhere in the middle
+        let result = super::truncate_str(s, 10);
+        assert!(result.is_char_boundary(result.len()));
+        // Should be valid UTF-8
+        assert!(result.chars().count() < s.chars().count());
     }
 }

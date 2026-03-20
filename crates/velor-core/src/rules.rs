@@ -20,6 +20,18 @@ const MAX_RULE_FILE_SIZE: usize = 100 * 1024;
 /// Maximum number of rules to prevent overwhelming the agent.
 const MAX_TOTAL_RULES: usize = 50;
 
+/// Truncates a string to approximately `max_bytes` bytes.
+///
+/// Uses `floor_char_boundary` to avoid cutting through multi-byte UTF-8 sequences.
+/// The actual result may be slightly shorter than `max_bytes` to ensure valid UTF-8.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let safe_idx = s.floor_char_boundary(max_bytes);
+    &s[..safe_idx]
+}
+
 /// A single rule loaded from a `.mdc` file.
 ///
 /// Rules contain both metadata (from YAML frontmatter) and content
@@ -931,7 +943,7 @@ pub fn build_intelligent_selection_prompt(rules: &[Rule], task_preview: &str) ->
 
     // Cap task preview to prevent abuse
     let task_preview_capped = if task_preview.len() > 500 {
-        format!("{}...", &task_preview[..500])
+        format!("{}...", truncate_str(task_preview, 500))
     } else {
         task_preview.to_string()
     };
@@ -969,7 +981,7 @@ pub fn parse_intelligent_selection_response(
     // Cap output to prevent abuse
     let output_capped = if output.len() > 4096 {
         tracing::warn!("Intelligent selection output exceeded 4096 bytes, truncating");
-        &output[..4096]
+        truncate_str(output, 4096)
     } else {
         output
     };

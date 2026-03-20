@@ -1541,6 +1541,7 @@ async fn run_auto_loop(
     let mut current_iteration = 1u32;
     let mut history = ConversationHistory::new();
     let mut final_output = String::new();
+    let mut previous_iteration_completed = false;
 
     // Create persistent RulesState across iterations for glob-based rule tracking
     let rules_state = Arc::new(Mutex::new(RulesState::new()));
@@ -1696,14 +1697,23 @@ async fn run_auto_loop(
         history.clear();
 
         if iteration_output.contains(complete_token) {
-            println!("✅ PRD complete, exiting.");
-            return Ok(AutoLoopResult {
-                status: RunStatus::Completed,
-                iterations_completed: current_iteration,
-                max_iterations: iterations,
-                duration: start_time.elapsed(),
-                output: final_output,
-            });
+            if previous_iteration_completed {
+                println!("✅ Completion token seen in consecutive iterations, exiting.");
+                return Ok(AutoLoopResult {
+                    status: RunStatus::Completed,
+                    iterations_completed: current_iteration,
+                    max_iterations: iterations,
+                    duration: start_time.elapsed(),
+                    output: final_output,
+                });
+            } else {
+                println!(
+                    "⏳ Completion token found - one more consecutive iteration needed to stop."
+                );
+                previous_iteration_completed = true;
+            }
+        } else {
+            previous_iteration_completed = false;
         }
 
         // Check if graceful shutdown was requested - stop after current iteration

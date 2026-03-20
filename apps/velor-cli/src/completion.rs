@@ -13,6 +13,10 @@ use clap::Command;
 use color_eyre::eyre::Result;
 use std::io::Write;
 
+/// The binary name for the vel CLI.
+/// This must match the `name` field in `[[bin]]` in Cargo.toml.
+const BINARY_NAME: &str = "vel";
+
 /// Shell types supported for completion generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shell {
@@ -90,7 +94,7 @@ pub fn generate_completion(shell: Shell) -> Result<()> {
         }
         _ => {
             // For other shells, use clap_complete to generate static completion
-            let mut cmd = Command::new("velor");
+            let mut cmd = Command::new(BINARY_NAME);
             // We need to build the CLI struct from main.rs
             // But since we don't have access to it here, we'll need to pass it
             // For now, use a placeholder approach
@@ -115,19 +119,19 @@ pub fn generate_completion(shell: Shell) -> Result<()> {
 fn generate_clap_completion(shell: Shell, cmd: &mut Command, buf: &mut Vec<u8>) -> Result<()> {
     match shell {
         Shell::Bash => {
-            clap_complete::generate(clap_complete::shells::Bash, cmd, "velor", buf);
+            clap_complete::generate(clap_complete::shells::Bash, cmd, BINARY_NAME, buf);
             Ok(())
         }
         Shell::Fish => {
-            clap_complete::generate(clap_complete::shells::Fish, cmd, "velor", buf);
+            clap_complete::generate(clap_complete::shells::Fish, cmd, BINARY_NAME, buf);
             Ok(())
         }
         Shell::Elvish => {
-            clap_complete::generate(clap_complete::shells::Elvish, cmd, "velor", buf);
+            clap_complete::generate(clap_complete::shells::Elvish, cmd, BINARY_NAME, buf);
             Ok(())
         }
         Shell::PowerShell => {
-            clap_complete::generate(clap_complete::shells::PowerShell, cmd, "velor", buf);
+            clap_complete::generate(clap_complete::shells::PowerShell, cmd, BINARY_NAME, buf);
             Ok(())
         }
         Shell::Nushell => {
@@ -158,24 +162,25 @@ fn generate_clap_completion(shell: Shell, cmd: &mut Command, buf: &mut Vec<u8>) 
 ///
 /// The completion script:
 /// - Is syntactically valid Zsh
-/// - Uses `#compdef velor` directive
-/// - Defines `_velor_prompts()` helper function that calls `velor internal complete-prompts`
+/// - Uses `#compdef {binary}` directive matching the BINARY_NAME constant
+/// - Uses a `prompt_list` case to call `{binary} internal complete-prompts` for prompt completion
 /// - Gracefully degrades if the internal command fails (stderr redirected to /dev/null)
 fn print_zsh_completion() {
-    print!(
-        r#"#compdef velor
+    let template = r#"#compdef {BIN_NAME}
 
-# Velor completion function for Zsh
-# Provides dynamic completion for --prompt argument via velor internal complete-prompts
+# {BIN_NAME} completion function for Zsh
+# Provides dynamic completion for --prompt argument via {BIN_NAME} internal complete-prompts
 
-_velor() {{
+_{BIN_NAME}() {{
+    local state
     local -a commands
     commands=(
         'once:Run a single agent iteration'
         'auto:Run agent in auto mode with retries'
-        'init:Initialize velor configuration'
+        'init:Initialize vel configuration'
         'plan:Execute a plan from a markdown file'
         'test-notification:Test notification configuration'
+        'completion:Generate shell completion script'
         'automations:Manage automations'
         'project:Project-specific commands'
         'vault:Vault and secret management'
@@ -184,7 +189,7 @@ _velor() {{
     local -a common_args
     common_args=(
         '(--config -c)'{{--config,-c}}'[Override config path]:path:_files'
-        '(--prompt --prompt-text)--prompt[Prompt name from config]:prompt:_velor_prompts'
+        '--prompt+[Prompt name from config]:prompt:->prompt_list'
         '(--prompt --prompt-text)--prompt-text[Inline template string]:template:'
         '(-p --pin)'{{-p,--pin}}'[Context identifier]'
         '(-v --vars-file)'{{-v,--vars-file}}'[Variables file]:path:_files'
@@ -257,17 +262,22 @@ _velor() {{
             _describe 'command' commands
             ;;
     esac
-}}
 
-_velor_prompts() {{
-    local -a prompt_names
-    # Call velor to get available prompts at runtime
-    # stderr redirected to suppress any error messages during completion
-    prompt_names=("${{(@f)$(velor internal complete-prompts 2>/dev/null)}}")
-    _describe 'prompt' prompt_names
+    # Handle states from ->state arguments
+    case $state in
+        prompt_list)
+            local -a prompt_names
+            prompt_names=("${(@f)$({BIN_NAME} internal complete-prompts 2>/dev/null)}")
+            _describe 'prompt' prompt_names
+            ;;
+    esac
 }}
-"#
-    );
+"#;
+    let script = template
+        .replace("{BIN_NAME}", BINARY_NAME)
+        .replace("{{", "{")
+        .replace("}}", "}");
+    print!("{}", script);
 }
 
 #[cfg(test)]

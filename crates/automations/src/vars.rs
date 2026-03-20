@@ -77,7 +77,10 @@ pub fn merge_automation_vars(
     // Apply built-ins (they override everything - prevents user breaking templates)
     merged.insert("git_root".to_string(), git_root.display().to_string());
     merged.insert("cwd".to_string(), cwd.display().to_string());
-    merged.insert("now".to_string(), chrono::Utc::now().to_rfc3339());
+    let now = chrono::Utc::now().to_rfc3339();
+    merged.insert("now".to_string(), now.clone());
+    merged.insert("timestamp".to_string(), now); // Alias for now
+    merged.insert("iteration".to_string(), "0".to_string()); // Current iteration (0 for single-run)
 
     // Try to get repo name from git_root
     if let Some(repo_name) = git_root.file_name()

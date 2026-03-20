@@ -18,6 +18,18 @@ use crate::config::{AcpConfig, PermissionMode};
 use crate::rules::normalize_file_path_if_safe;
 use tokio::sync::Mutex;
 
+/// Truncates a string to approximately `max_bytes` bytes.
+///
+/// Uses `floor_char_boundary` to avoid cutting through multi-byte UTF-8 sequences.
+/// The actual result may be slightly shorter than `max_bytes` to ensure valid UTF-8.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let safe_idx = s.floor_char_boundary(max_bytes);
+    &s[..safe_idx]
+}
+
 /// Result of running a single turn via ACP.
 #[derive(Debug)]
 pub struct AcpTurnResult {
@@ -476,7 +488,11 @@ impl AcpSession {
     ) -> color_eyre::eyre::Result<AcpTurnResult> {
         // Log prompt preview for debugging
         let prompt_preview = if prompt.len() > 200 {
-            format!("{}... ({} chars total)", &prompt[..200], prompt.len())
+            format!(
+                "{}... ({} chars total)",
+                truncate_str(prompt, 200),
+                prompt.len()
+            )
         } else {
             format!("{} ({} chars)", prompt, prompt.len())
         };
@@ -691,7 +707,11 @@ pub async fn run_acp(
 
             // Log prompt preview for debugging
             let prompt_preview = if prompt.len() > 200 {
-                format!("{}... ({} chars total)", &prompt[..200], prompt.len())
+                format!(
+                    "{}... ({} chars total)",
+                    truncate_str(prompt, 200),
+                    prompt.len()
+                )
             } else {
                 format!("{} ({} chars)", prompt, prompt.len())
             };
