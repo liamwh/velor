@@ -1111,7 +1111,11 @@ mod tests {
         assert!(tool_call.args_display.ends_with("..."));
 
         // The displayed string should be valid UTF-8 (not cut through a multi-byte char)
-        assert!(tool_call.args_display.is_char_boundary(tool_call.args_display.len()));
+        assert!(
+            tool_call
+                .args_display
+                .is_char_boundary(tool_call.args_display.len())
+        );
 
         // Verify the display format works
         let display = tool_call.format_display();
