@@ -1,6 +1,10 @@
 # Progress: Add `--append` CLI Flag for Prompt Augmentation
 
-## Current Status: IMPLEMENTATION COMPLETE
+## Current Status: COMPLETE
+
+## Commit SHA
+
+- **1032fbd** - feat(cli): add --append flag for prompt augmentation
 
 ## What Changed
 
