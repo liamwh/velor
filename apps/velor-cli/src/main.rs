@@ -155,6 +155,10 @@ struct CommonArgs {
     /// Print the final rendered prompt and exit (no Claude call).
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
+
+    /// Append additional instructions to the final rendered prompt.
+    #[arg(long)]
+    append: Option<String>,
 }
 
 /// Arguments for the `once` subcommand
@@ -779,6 +783,7 @@ async fn run_interactive_menu(
                         binary: None,
                         set_vars: vec![],
                         dry_run: false,
+                        append: None,
                     },
                 },
                 home_cfg,
@@ -803,6 +808,7 @@ async fn run_interactive_menu(
                         binary: None,
                         set_vars: vec![],
                         dry_run: false,
+                        append: None,
                     },
                     iterations: None,
                     max_retries: None,
@@ -849,6 +855,32 @@ enum RunMode {
     Once,
     /// Run multiple iterations until complete or max iterations reached.
     Auto,
+}
+
+/// Finalises a rendered prompt with optional extra user instructions.
+///
+/// # Arguments
+///
+/// * `prompt` - The base rendered prompt (possibly with rules already injected)
+/// * `append_text` - Optional user text to append as a new section
+///
+/// # Returns
+///
+/// The original prompt if append_text is None/empty/whitespace,
+/// otherwise the prompt with a new "Additional instructions" section appended.
+///
+/// # Behaviour
+///
+/// - Trims surrounding whitespace from append_text
+/// - Ignores empty-after-trim values (treats as None)
+/// - Preserves internal newlines in multi-line input
+/// - Adds a clear section header "## ADDITIONAL INSTRUCTIONS" for legibility in --dry-run
+fn finalize_prompt(prompt: &str, append_text: Option<&str>) -> String {
+    let Some(text) = append_text.map(str::trim).filter(|s| !s.is_empty()) else {
+        return prompt.to_owned();
+    };
+
+    format!("{prompt}\n\n## ADDITIONAL INSTRUCTIONS\n\n{text}")
 }
 
 /// Runs the `once` subcommand.
@@ -962,8 +994,11 @@ async fn run_once(
         rendered.clone()
     };
 
+    // Finalise prompt with user instructions (--append)
+    let final_prompt = finalize_prompt(&prompt_with_rules, common.append.as_deref());
+
     if common.dry_run {
-        println!("{prompt_with_rules}");
+        println!("{final_prompt}");
         return Ok(());
     }
 
@@ -976,13 +1011,7 @@ async fn run_once(
 
     // Run the agent (no callback for streaming output in this mode)
     runner
-        .run(
-            &binary,
-            &permission_mode,
-            &prompt_with_rules,
-            &prompt_name,
-            &cwd,
-        )
+        .run(&binary, &permission_mode, &final_prompt, &prompt_name, &cwd)
         .await?;
     Ok(())
 }
@@ -1176,6 +1205,7 @@ async fn run_auto(
         &git_root,
         &file_cfg.defaults.acp,
         &file_cfg.rules,
+        common.append.as_deref(),
     )
     .await;
 
@@ -1373,6 +1403,7 @@ async fn run_auto_iteration_with_session(
     config: &core::config::RulesConfig,
     iteration: u32,
     intelligent_rules: Option<&[core::rules::Rule]>,
+    append: Option<&str>,
 ) -> color_eyre::eyre::Result<String> {
     let mut injections = 0u32;
     let max = config.max_mid_iteration_injections;
@@ -1394,7 +1425,12 @@ async fn run_auto_iteration_with_session(
     };
 
     // TURN A: Initial prompt with always-apply rules
-    let prompt_with_rules = inject_rules(prompt, &initial_rules.rules);
+    let base_prompt = inject_rules(prompt, &initial_rules.rules);
+
+    // Finalise with user instructions (--append)
+    // Applied every iteration, including initial prompt
+    let prompt_with_rules = finalize_prompt(&base_prompt, append);
+
     tracing::debug!(
         "Iteration {}: sending initial prompt with {} rules",
         iteration,
@@ -1536,6 +1572,7 @@ async fn run_auto_loop(
     git_root: &std::path::Path,
     acp_config: &core::config::AcpConfig,
     rules_config: &core::config::RulesConfig,
+    append: Option<&str>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1604,6 +1641,7 @@ async fn run_auto_loop(
                 rules_config,
                 current_iteration,
                 cwd,
+                append,
             )
             .await
             {
@@ -1633,7 +1671,11 @@ async fn run_auto_loop(
                 rendered_prompt.clone()
             };
 
-            println!("📋 Prompt:\n{prompt_with_rules}");
+            // Finalise prompt with user instructions (--append)
+            // Applied every iteration to ensure instructions persist
+            let final_prompt = finalize_prompt(&prompt_with_rules, append);
+
+            println!("📋 Prompt:\n{final_prompt}");
             println!("────────────────────────────────────────");
 
             // Execute with retry logic
@@ -1641,7 +1683,7 @@ async fn run_auto_loop(
                 runner,
                 binary,
                 permission_mode,
-                &prompt_with_rules,
+                &final_prompt,
                 prompt_name,
                 current_iteration,
                 retry_config,
@@ -1772,6 +1814,7 @@ async fn run_auto_iteration_acp(
     config: &core::config::RulesConfig,
     iteration: u32,
     cwd: &Path,
+    append: Option<&str>,
 ) -> color_eyre::eyre::Result<String> {
     // Step 1: Intelligent rule selection (if enabled)
     let intelligent_rules = if config.intelligent_selection && !rules_set.intelligent.is_empty() {
@@ -1824,6 +1867,7 @@ async fn run_auto_iteration_acp(
         config,
         iteration,
         intelligent_rules.as_deref(),
+        append,
     )
     .await?;
 
@@ -2246,5 +2290,51 @@ mod var_override_proptests {
                 prop_assert!(overrides.contains(&(key.clone(), value.clone())));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod finalize_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn test_finalize_prompt_none_returns_original() {
+        let base = "Hello world";
+        assert_eq!(finalize_prompt(base, None), base);
+    }
+
+    #[test]
+    fn test_finalize_prompt_empty_returns_original() {
+        let base = "Hello world";
+        assert_eq!(finalize_prompt(base, Some("")), base);
+        assert_eq!(finalize_prompt(base, Some("   ")), base);
+        assert_eq!(finalize_prompt(base, Some("\n\n\t")), base);
+    }
+
+    #[test]
+    fn test_finalize_prompt_single_line() {
+        let base = "Base prompt";
+        let result = finalize_prompt(base, Some("extra instruction"));
+        assert!(result.contains("Base prompt"));
+        assert!(result.contains("## ADDITIONAL INSTRUCTIONS"));
+        assert!(result.contains("extra instruction"));
+    }
+
+    #[test]
+    fn test_finalize_prompt_multiline() {
+        let base = "Base prompt";
+        let append = "first line\nsecond line\nthird line";
+        let result = finalize_prompt(base, Some(append));
+        assert!(result.contains("first line"));
+        assert!(result.contains("second line"));
+        assert!(result.contains("third line"));
+    }
+
+    #[test]
+    fn test_finalize_prompt_preserves_internal_newlines() {
+        let base = "Base prompt";
+        let append = "line1\n\nline2";
+        let result = finalize_prompt(base, Some(append));
+        assert!(result.contains("line1\n\nline2"));
     }
 }
