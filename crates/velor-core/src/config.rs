@@ -61,7 +61,7 @@ impl Default for PlanConfig {
     fn default() -> Self {
         Self {
             specs_dir: "specs".to_string(),
-            plan_max_iterations: 10,
+            plan_max_iterations: 1000,
             openai_api_key_env: "OPENAI_API_KEY".to_string(),
             openai_model: "gpt-4o".to_string(),
             openai_base_url: None,
@@ -1050,7 +1050,7 @@ mod tests {
     fn test_plan_config_default() {
         let config = PlanConfig::default();
         assert_eq!(config.specs_dir, "specs");
-        assert_eq!(config.plan_max_iterations, 10);
+        assert_eq!(config.plan_max_iterations, 1000);
         assert_eq!(config.openai_api_key_env, "OPENAI_API_KEY");
         assert_eq!(config.openai_model, "gpt-4o");
         assert!(config.openai_base_url.is_none());
