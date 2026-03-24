@@ -1734,7 +1734,15 @@ async fn run_auto_loop(
 
         // Success - clear history and continue
         if !history.is_empty() {
-            println!("✅ Crash recovery successful for iteration {current_iteration}");
+            let failure_reasons = history.get_failure_reasons();
+            if failure_reasons.is_empty() {
+                println!("✅ Crash recovery successful for iteration {current_iteration}");
+            } else {
+                println!(
+                    "✅ Crash recovery successful for iteration {current_iteration} (previous failure: {})",
+                    failure_reasons.join(", ")
+                );
+            }
         }
         history.clear();
 

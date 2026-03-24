@@ -100,6 +100,24 @@ impl ConversationHistory {
     pub fn last_iteration(&self) -> Option<u32> {
         self.entries.last().map(|e| e.iteration)
     }
+
+    /// Returns the failure reasons from all entries, if any.
+    /// Extracts the error message from entries with `<FAILED: ...>` output format.
+    pub fn get_failure_reasons(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let output = &entry.output;
+                if let Some(start) = output.find("<FAILED: ") {
+                    let rest = &output[start + 9..];
+                    if let Some(end) = rest.find('>') {
+                        return Some(rest[..end].to_string());
+                    }
+                }
+                None
+            })
+            .collect()
+    }
 }
 
 /// Error type distinguishing between retryable and permanent failures.
@@ -227,6 +245,39 @@ mod tests {
         history.clear();
         assert!(history.is_empty());
         assert!(history.last_iteration().is_none());
+    }
+
+    #[test]
+    fn test_get_failure_reasons_empty() {
+        let history = ConversationHistory::new();
+        assert!(history.get_failure_reasons().is_empty());
+    }
+
+    #[test]
+    fn test_get_failure_reasons_no_failures() {
+        let mut history = ConversationHistory::new();
+        history.add(1, "prompt", "normal output");
+        assert!(history.get_failure_reasons().is_empty());
+    }
+
+    #[test]
+    fn test_get_failure_reasons_single() {
+        let mut history = ConversationHistory::new();
+        history.add(1, "prompt", "<FAILED: network timeout>");
+        let reasons = history.get_failure_reasons();
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0], "network timeout");
+    }
+
+    #[test]
+    fn test_get_failure_reasons_multiple() {
+        let mut history = ConversationHistory::new();
+        history.add(1, "prompt", "<FAILED: error one>");
+        history.add(2, "prompt", "<FAILED: error two>");
+        let reasons = history.get_failure_reasons();
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons[0], "error one");
+        assert_eq!(reasons[1], "error two");
     }
 
     #[test]
