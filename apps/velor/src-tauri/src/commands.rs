@@ -8,15 +8,18 @@
 //! - Notification: Notification testing
 //! - System: System utilities
 
+use color_eyre::eyre::WrapErr;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 use tracing::{error, info, instrument, warn};
 
 use velor_automations::{Automation, CatchUpPolicy, load_automations};
 use velor_core::{
-    ExecutionConfig, ExecutionEvent, ExecutionId, ExecutionMetrics, ExecutionRecord, FileConfig,
-    build_notifiers,
+    AgentEvent, AgentRunner, ExecutionActivity, ExecutionActivityKind, ExecutionConfig,
+    ExecutionEvent, ExecutionId, ExecutionMetrics, ExecutionRecord, ExecutionState, FileConfig,
+    PromptDef, build_notifiers, render_template,
 };
 
 use crate::state::AppState;
@@ -65,6 +68,64 @@ pub struct ExecutionStatusResponse {
     pub events: Vec<velor_core::ExecutionEvent>,
     /// The metrics.
     pub metrics: ExecutionMetrics,
+    /// Execution start timestamp.
+    pub started_at: String,
+    /// Execution completion timestamp (terminal states only).
+    pub completed_at: Option<String>,
+    /// Final error message if any.
+    pub error: Option<String>,
+    /// Optional user-assigned session name.
+    pub name: Option<String>,
+    /// Whether the session is pinned.
+    pub pinned: bool,
+    /// Project path associated with this execution.
+    pub project_path: Option<String>,
+}
+
+/// Request payload for starting an execution.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StartExecutionRequest {
+    /// Execution configuration.
+    pub config: UiExecutionConfig,
+}
+
+/// Frontend/API execution config shape.
+///
+/// This API model is intentionally decoupled from `velor_core::ExecutionConfig`
+/// so the backend can apply config defaults and evolve independently.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UiExecutionConfig {
+    /// Name of the prompt template.
+    pub prompt_name: String,
+    /// Template variables from the UI.
+    #[serde(default)]
+    pub vars: BTreeMap<String, serde_json::Value>,
+    /// Optional max iterations override.
+    pub max_iterations: Option<u32>,
+    /// Optional max retries override (reserved for retry loop integration).
+    #[allow(dead_code)]
+    pub max_retries: Option<u32>,
+    /// Optional completion token override.
+    pub complete_token: Option<String>,
+    /// Optional provider binary override.
+    pub binary: Option<String>,
+    /// Optional permission mode override.
+    pub permission_mode: Option<String>,
+    /// Optional execution working directory.
+    pub cwd: Option<String>,
+    /// Optional rules enabled override.
+    pub rules_enabled: Option<bool>,
+    /// Optional rules directory override.
+    pub rules_dir: Option<String>,
+}
+
+/// Response payload for start execution.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StartExecutionResponse {
+    /// Execution ID.
+    pub execution_id: String,
+    /// Initial state.
+    pub state: String,
 }
 
 /// Automation detail response.
@@ -177,7 +238,105 @@ fn event_timestamp(event: &ExecutionEvent) -> chrono::DateTime<chrono::Utc> {
         | ExecutionEvent::OutputChunk { timestamp, .. }
         | ExecutionEvent::Error { timestamp, .. }
         | ExecutionEvent::IterationCompleted { timestamp, .. }
-        | ExecutionEvent::MetricsUpdated { timestamp, .. } => *timestamp,
+        | ExecutionEvent::MetricsUpdated { timestamp, .. }
+        | ExecutionEvent::Activity { timestamp, .. } => *timestamp,
+    }
+}
+
+/// Converts a UI variable value into the string representation expected by templates.
+fn ui_var_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => value.to_string(),
+    }
+}
+
+/// Resolves the effective execution binary from merged defaults + request override.
+fn resolve_execution_binary(merged: &FileConfig, requested: Option<String>) -> String {
+    if let Some(binary) = requested
+        && !binary.trim().is_empty()
+    {
+        return binary;
+    }
+
+    let defaults_binary = merged.defaults.binary.clone();
+    if merged.defaults.provider == velor_core::AgentProvider::Codex
+        && defaults_binary == "claude-glm"
+    {
+        "codex".to_string()
+    } else {
+        defaults_binary
+    }
+}
+
+/// Builds a core execution config from the API request and merged defaults.
+fn build_execution_config(
+    merged: &FileConfig,
+    request: UiExecutionConfig,
+    default_cwd: &str,
+) -> ExecutionConfig {
+    let template_vars = request
+        .vars
+        .into_iter()
+        .map(|(k, v)| (k, ui_var_to_string(&v)))
+        .collect::<BTreeMap<_, _>>();
+
+    let binary = resolve_execution_binary(merged, request.binary);
+    let permission_mode = request
+        .permission_mode
+        .or_else(|| merged.defaults.permission_mode.clone())
+        .unwrap_or_else(|| "acceptEdits".to_string());
+    let complete_token = request
+        .complete_token
+        .or_else(|| merged.defaults.complete_token.clone())
+        .unwrap_or_else(|| "<promise>COMPLETE</promise>".to_string());
+    let max_iterations = request
+        .max_iterations
+        .or(merged.defaults.iterations)
+        .unwrap_or(50);
+    let cwd = request
+        .cwd
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| default_cwd.to_string());
+    let rules_enabled = request.rules_enabled.unwrap_or(merged.rules.enabled);
+    let rules_dir = request
+        .rules_dir
+        .unwrap_or_else(|| merged.rules.directory.clone());
+
+    ExecutionConfig::new(request.prompt_name)
+        .with_template_vars(template_vars)
+        .with_max_iterations(max_iterations)
+        .with_complete_token(complete_token)
+        .with_binary(binary)
+        .with_permission_mode(permission_mode)
+        .with_cwd(cwd)
+        .with_rules(rules_enabled, rules_dir)
+}
+
+/// Converts an execution record into an API response model.
+fn to_execution_status_response(
+    record: &ExecutionRecord,
+    is_active: bool,
+    is_cancelled: bool,
+) -> ExecutionStatusResponse {
+    ExecutionStatusResponse {
+        id: record.id.to_string(),
+        state: format!("{:?}", record.state),
+        prompt_name: record.config.prompt_name.clone(),
+        iteration: record.metrics.iteration,
+        is_active,
+        is_cancelled,
+        events: record.events.clone(),
+        metrics: record.metrics.clone(),
+        started_at: record.started_at.to_rfc3339(),
+        completed_at: record.ended_at.map(|t| t.to_rfc3339()),
+        error: record.error.clone(),
+        name: record.name.clone(),
+        pinned: record.pinned,
+        project_path: record.project_path.clone(),
     }
 }
 
@@ -302,39 +461,389 @@ pub async fn save_config(
 // ============================================================================
 
 /// Starts a new agent execution.
-///
-/// # Arguments
-///
-/// * `prompt_name` - The name of the prompt template to use.
-/// * `vars` - Optional variables to override/add to the template.
-/// * `max_iterations` - Optional maximum iterations override.
-///
-/// Returns the execution ID.
 #[tauri::command]
-#[instrument(skip(state), level = "debug")]
+#[instrument(skip(state, request), level = "debug")]
 pub async fn start_execution(
+    app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
-    prompt_name: String,
-    vars: Option<std::collections::BTreeMap<String, String>>,
-    max_iterations: Option<u32>,
-) -> CommandResult<String> {
-    let mut config = ExecutionConfig::new(prompt_name);
-
-    if let Some(v) = vars {
-        config.template_vars.extend(v);
-    }
-
-    if let Some(max_iter) = max_iterations {
-        config.max_iterations = max_iter;
-    }
+    request: StartExecutionRequest,
+) -> CommandResult<StartExecutionResponse> {
+    let merged = state.merged_config().await;
+    let default_cwd = state
+        .git_root()
+        .await
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| ".".to_string());
+    let config = build_execution_config(&merged, request.config, &default_cwd);
 
     let id = state
-        .start_execution(config)
+        .start_execution(config.clone())
         .await
         .map_err(|e| format!("Failed to start execution: {}", e))?;
 
+    let project_path = state
+        .git_root()
+        .await
+        .map(|p| p.to_string_lossy().to_string());
+
+    let initial = state
+        .update_execution_record(&id, |record| {
+            record.project_path = project_path.clone();
+            record.set_state(ExecutionState::Pending);
+        })
+        .await
+        .map_err(|e| format!("Failed to initialize execution record: {}", e))?
+        .ok_or_else(|| "Execution not found immediately after creation".to_string())?;
+
+    let payload = ExecutionEventPayload {
+        execution: initial.clone(),
+    };
+    let _ = app.emit("velor://execution_started", payload);
+
+    let state_arc = Arc::clone(state.inner());
+    let app_clone = app.clone();
+    let id_clone = id.clone();
+    let id_for_task = id.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        match runtime {
+            Ok(rt) => {
+                if let Err(e) = rt.block_on(run_execution_task(app_clone, state_arc, id_clone)) {
+                    error!(execution_id = %id_for_task, error = %e, "Execution task crashed");
+                }
+            }
+            Err(e) => {
+                error!(
+                    execution_id = %id_for_task,
+                    error = %e,
+                    "Failed to create execution runtime"
+                );
+            }
+        }
+    });
+
     info!(id = %id, "Execution started");
-    Ok(id.to_string())
+    Ok(StartExecutionResponse {
+        execution_id: id.to_string(),
+        state: "pending".to_string(),
+    })
+}
+
+/// Event payload for execution lifecycle updates.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExecutionEventPayload {
+    execution: ExecutionRecord,
+}
+
+/// Background worker for running one execution and streaming updates.
+async fn run_execution_task(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    execution_id: ExecutionId,
+) -> CommandResult<()> {
+    let Some(record) = state.get_execution_record(&execution_id).await else {
+        return Err(format!(
+            "Execution {} disappeared before task start",
+            execution_id
+        ));
+    };
+
+    state
+        .update_execution_record(&execution_id, |r| r.set_state(ExecutionState::Rendering))
+        .await
+        .map_err(|e| format!("Failed to set Rendering state: {e}"))?;
+    emit_execution_update(&app, "velor://execution_updated", &state, &execution_id).await;
+
+    let merged = state.merged_config().await;
+    let git_root = state.git_root().await;
+    let template = resolve_prompt_template_for_gui(&merged, &record.config, git_root.as_deref())
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to resolve prompt '{}': {e}",
+                record.config.prompt_name
+            )
+        })?;
+
+    let mut vars = merged.vars.clone();
+    for (key, value) in &record.config.template_vars {
+        vars.insert(key.clone(), value.clone());
+    }
+    vars.insert("iteration".to_string(), "1".to_string());
+    vars.insert("cwd".to_string(), record.config.cwd.clone());
+
+    let rendered_prompt = render_template(&template, &vars)
+        .map_err(|e| format!("Failed to render execution prompt: {e}"))?;
+
+    state
+        .update_execution_record(&execution_id, |r| r.set_state(ExecutionState::Running))
+        .await
+        .map_err(|e| format!("Failed to set Running state: {e}"))?;
+    emit_execution_update(&app, "velor://execution_updated", &state, &execution_id).await;
+
+    let mut binary = record.config.binary.clone();
+    if merged.defaults.provider == velor_core::AgentProvider::Codex && binary == "claude-glm" {
+        binary = "codex".to_string();
+    }
+
+    let runner = AgentRunner::from_config(
+        merged.defaults.provider,
+        merged.defaults.protocol,
+        merged.defaults.acp.clone(),
+        merged.defaults.codex.clone(),
+    );
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let state_for_events = Arc::clone(&state);
+    let app_for_events = app.clone();
+    let event_execution_id = execution_id.clone();
+    let provider_name = if merged.defaults.provider == velor_core::AgentProvider::Codex {
+        "codex"
+    } else {
+        "claude"
+    }
+    .to_string();
+
+    let event_task = tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            if let Err(err) = apply_agent_event(
+                &state_for_events,
+                &event_execution_id,
+                provider_name.as_str(),
+                event,
+            )
+            .await
+            {
+                error!(
+                    execution_id = %event_execution_id,
+                    error = %err,
+                    "Failed to apply agent event"
+                );
+                continue;
+            }
+            emit_execution_update(
+                &app_for_events,
+                "velor://execution_updated",
+                &state_for_events,
+                &event_execution_id,
+            )
+            .await;
+        }
+    });
+
+    let event_tx_for_runner = event_tx.clone();
+    let run_result = runner
+        .run_with_events(
+            &binary,
+            &record.config.permission_mode,
+            &rendered_prompt,
+            &record.config.prompt_name,
+            Path::new(&record.config.cwd),
+            &[],
+            move |event| {
+                let _ = event_tx_for_runner.send(event);
+            },
+        )
+        .await;
+
+    drop(event_tx);
+    if let Err(e) = event_task.await {
+        error!(
+            execution_id = %execution_id,
+            error = %e,
+            "Execution event task join error"
+        );
+    }
+
+    let was_cancelled = state
+        .get_execution(&execution_id)
+        .await
+        .map(|e| e.is_cancelled())
+        .unwrap_or(false);
+
+    match run_result {
+        Ok(result) => {
+            if was_cancelled {
+                state
+                    .update_execution_record(&execution_id, |r| {
+                        r.set_state(ExecutionState::Cancelled);
+                    })
+                    .await
+                    .map_err(|e| format!("Failed to set Cancelled state: {e}"))?;
+                emit_execution_update(&app, "velor://execution_failed", &state, &execution_id)
+                    .await;
+            } else {
+                state
+                    .update_execution_record(&execution_id, |r| {
+                        if r.output.is_empty() {
+                            r.append_output(&result.stdout);
+                        }
+                        r.set_state(ExecutionState::Completed);
+                    })
+                    .await
+                    .map_err(|e| format!("Failed to set Completed state: {e}"))?;
+                emit_execution_update(&app, "velor://execution_completed", &state, &execution_id)
+                    .await;
+            }
+        }
+        Err(err) => {
+            state
+                .update_execution_record(&execution_id, |r| {
+                    r.record_error(err.to_string(), false);
+                    r.set_state(ExecutionState::Failed);
+                })
+                .await
+                .map_err(|e| format!("Failed to set Failed state: {e}"))?;
+            emit_execution_update(&app, "velor://execution_failed", &state, &execution_id).await;
+        }
+    }
+
+    state
+        .finish_execution(&execution_id)
+        .await
+        .map_err(|e| format!("Failed to finalize execution: {e}"))?;
+
+    Ok(())
+}
+
+/// Resolves the prompt template for GUI execution.
+async fn resolve_prompt_template_for_gui(
+    merged: &FileConfig,
+    config: &ExecutionConfig,
+    git_root: Option<&Path>,
+) -> color_eyre::eyre::Result<String> {
+    if merged.prompts_config.enabled {
+        let home_dir = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .wrap_err("failed to determine home directory")?;
+        let home_velor_dir = std::path::PathBuf::from(home_dir).join(".velor");
+        let repo_velor_dir = git_root.map(|g| g.join(".velor"));
+        let prompt_cache = velor_core::prompts::PromptCache::new(home_velor_dir, repo_velor_dir);
+
+        if let Ok(prompt) = prompt_cache.get_by_name(&config.prompt_name).await {
+            return Ok(prompt.content);
+        }
+    }
+
+    let prompt_def = merged
+        .prompts
+        .get(&config.prompt_name)
+        .ok_or_else(|| color_eyre::eyre::eyre!("prompt '{}' not found", config.prompt_name))?;
+
+    let template = match prompt_def {
+        PromptDef::Inline(s) => s.clone(),
+        PromptDef::Table { template, .. } => template.clone(),
+        PromptDef::File { path, .. } => {
+            let Some(root) = git_root else {
+                return Err(color_eyre::eyre::eyre!(
+                    "cannot resolve file prompt '{}' without git root",
+                    path
+                ));
+            };
+            let full = root
+                .join(".velor")
+                .join(&merged.prompts_config.directory)
+                .join(path);
+            tokio::fs::read_to_string(&full)
+                .await
+                .wrap_err_with(|| format!("failed to read prompt file {}", full.display()))?
+        }
+    };
+
+    Ok(template)
+}
+
+/// Applies a streamed provider event to an execution record.
+async fn apply_agent_event(
+    state: &Arc<AppState>,
+    execution_id: &ExecutionId,
+    provider: &str,
+    event: AgentEvent,
+) -> CommandResult<()> {
+    state
+        .update_execution_record(execution_id, |record| match event {
+            AgentEvent::Status { message } => record.record_activity(ExecutionActivity {
+                provider: provider.to_string(),
+                kind: ExecutionActivityKind::Status,
+                summary: message,
+                detail: None,
+                success: None,
+            }),
+            AgentEvent::TextDelta { text } => record.append_output(&text),
+            AgentEvent::ToolCall { tool, detail } => record.record_activity(ExecutionActivity {
+                provider: provider.to_string(),
+                kind: ExecutionActivityKind::ToolCall,
+                summary: tool,
+                detail: Some(detail),
+                success: None,
+            }),
+            AgentEvent::ToolResult {
+                tool,
+                detail,
+                success,
+            } => record.record_activity(ExecutionActivity {
+                provider: provider.to_string(),
+                kind: ExecutionActivityKind::ToolResult,
+                summary: tool,
+                detail: Some(detail),
+                success,
+            }),
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                let mut metrics = record.metrics.clone();
+                let total = input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0);
+                if total > 0 {
+                    metrics.total_tokens = Some(total);
+                    record.update_metrics(metrics);
+                }
+                record.record_activity(ExecutionActivity {
+                    provider: provider.to_string(),
+                    kind: ExecutionActivityKind::Usage,
+                    summary: "token usage".to_string(),
+                    detail: Some(format!(
+                        "input={}, output={}",
+                        input_tokens.unwrap_or(0),
+                        output_tokens.unwrap_or(0)
+                    )),
+                    success: None,
+                });
+            }
+            AgentEvent::Error { message } => {
+                record.record_error(message.clone(), false);
+                record.record_activity(ExecutionActivity {
+                    provider: provider.to_string(),
+                    kind: ExecutionActivityKind::Provider,
+                    summary: "provider error".to_string(),
+                    detail: Some(message),
+                    success: Some(false),
+                });
+            }
+        })
+        .await
+        .map_err(|e| format!("Failed to apply event: {e}"))?;
+    Ok(())
+}
+
+/// Emits one execution update event by name if the record is still active.
+async fn emit_execution_update(
+    app: &tauri::AppHandle,
+    event_name: &str,
+    state: &Arc<AppState>,
+    execution_id: &ExecutionId,
+) {
+    if let Some(record) = state.get_execution_record(execution_id).await {
+        let _ = app.emit(event_name, ExecutionEventPayload { execution: record });
+    }
 }
 
 /// Cancels a running execution.
@@ -377,31 +886,17 @@ pub async fn get_execution_status(
 
     // Try active executions first
     if let Some(active) = state.get_execution(&execution_id).await {
-        return Ok(Some(ExecutionStatusResponse {
-            id: active.record.id.to_string(),
-            state: format!("{:?}", active.record.state),
-            prompt_name: active.record.config.prompt_name.clone(),
-            iteration: active.record.metrics.iteration,
-            is_active: true,
-            is_cancelled: active.is_cancelled(),
-            events: active.record.events.clone(),
-            metrics: active.record.metrics.clone(),
-        }));
+        return Ok(Some(to_execution_status_response(
+            &active.record,
+            true,
+            active.is_cancelled(),
+        )));
     }
 
     // Check history
     let history = state.execution_history().await;
     if let Some(record) = history.iter().find(|r| r.id.to_string() == id) {
-        return Ok(Some(ExecutionStatusResponse {
-            id: record.id.to_string(),
-            state: format!("{:?}", record.state),
-            prompt_name: record.config.prompt_name.clone(),
-            iteration: record.metrics.iteration,
-            is_active: false,
-            is_cancelled: false,
-            events: record.events.clone(),
-            metrics: record.metrics.clone(),
-        }));
+        return Ok(Some(to_execution_status_response(record, false, false)));
     }
 
     Ok(None)
@@ -423,28 +918,14 @@ pub async fn get_execution_history(
 
     let mut all: Vec<ExecutionStatusResponse> = active
         .into_iter()
-        .map(|a| ExecutionStatusResponse {
-            id: a.record.id.to_string(),
-            state: format!("{:?}", a.record.state),
-            prompt_name: a.record.config.prompt_name.clone(),
-            iteration: a.record.metrics.iteration,
-            is_active: true,
-            is_cancelled: a.is_cancelled(),
-            events: a.record.events.clone(),
-            metrics: a.record.metrics.clone(),
-        })
+        .map(|a| to_execution_status_response(&a.record, true, a.is_cancelled()))
         .collect();
 
-    all.extend(history.into_iter().map(|r| ExecutionStatusResponse {
-        id: r.id.to_string(),
-        state: format!("{:?}", r.state),
-        prompt_name: r.config.prompt_name.clone(),
-        iteration: r.metrics.iteration,
-        is_active: false,
-        is_cancelled: false,
-        events: r.events.clone(),
-        metrics: r.metrics.clone(),
-    }));
+    all.extend(
+        history
+            .into_iter()
+            .map(|r| to_execution_status_response(&r, false, false)),
+    );
 
     // Sort by event timestamp (most recent first) and apply limit
     all.sort_by(|a, b| {
@@ -1595,6 +2076,12 @@ mod tests {
             is_cancelled: false,
             events: vec![],
             metrics: ExecutionMetrics::default(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+            error: None,
+            name: None,
+            pinned: false,
+            project_path: None,
         };
 
         let json = serde_json::to_string(&response);
@@ -1602,6 +2089,86 @@ mod tests {
             json.is_ok(),
             "ExecutionStatusResponse should serialize to JSON"
         );
+    }
+
+    #[test]
+    fn test_build_execution_config_uses_merged_defaults() {
+        let mut merged = FileConfig::default();
+        merged.defaults.provider = velor_core::AgentProvider::Codex;
+        merged.defaults.binary = "claude-glm".to_string();
+        merged.defaults.permission_mode = Some("allow".to_string());
+        merged.defaults.complete_token = Some("<DONE>".to_string());
+        merged.defaults.iterations = Some(17);
+        merged.rules.enabled = true;
+        merged.rules.directory = ".agents/rules".to_string();
+
+        let mut vars = BTreeMap::new();
+        vars.insert("text".to_string(), serde_json::json!("hello"));
+        vars.insert("num".to_string(), serde_json::json!(42));
+        vars.insert("flag".to_string(), serde_json::json!(true));
+        vars.insert("obj".to_string(), serde_json::json!({"k":"v"}));
+
+        let request = UiExecutionConfig {
+            prompt_name: "build".to_string(),
+            vars,
+            max_iterations: None,
+            max_retries: None,
+            complete_token: None,
+            binary: None,
+            permission_mode: None,
+            cwd: None,
+            rules_enabled: None,
+            rules_dir: None,
+        };
+
+        let config = build_execution_config(&merged, request, "/tmp/work");
+
+        assert_eq!(config.prompt_name, "build");
+        assert_eq!(config.binary, "codex");
+        assert_eq!(config.permission_mode, "allow");
+        assert_eq!(config.complete_token, "<DONE>");
+        assert_eq!(config.max_iterations, 17);
+        assert_eq!(config.cwd, "/tmp/work");
+        assert!(config.rules_enabled);
+        assert_eq!(config.rules_dir, ".agents/rules");
+        assert_eq!(config.template_vars.get("text"), Some(&"hello".to_string()));
+        assert_eq!(config.template_vars.get("num"), Some(&"42".to_string()));
+        assert_eq!(config.template_vars.get("flag"), Some(&"true".to_string()));
+        assert_eq!(
+            config.template_vars.get("obj"),
+            Some(&"{\"k\":\"v\"}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_execution_config_respects_request_overrides() {
+        let mut merged = FileConfig::default();
+        merged.defaults.binary = "claude-glm".to_string();
+        merged.defaults.permission_mode = Some("acceptEdits".to_string());
+        merged.defaults.complete_token = Some("<DEFAULT>".to_string());
+
+        let request = UiExecutionConfig {
+            prompt_name: "override".to_string(),
+            vars: BTreeMap::new(),
+            max_iterations: Some(3),
+            max_retries: Some(2),
+            complete_token: Some("<LOCAL>".to_string()),
+            binary: Some("custom-agent".to_string()),
+            permission_mode: Some("manual".to_string()),
+            cwd: Some("/tmp/custom".to_string()),
+            rules_enabled: Some(false),
+            rules_dir: Some(".rules/custom".to_string()),
+        };
+
+        let config = build_execution_config(&merged, request, "/tmp/work");
+
+        assert_eq!(config.binary, "custom-agent");
+        assert_eq!(config.permission_mode, "manual");
+        assert_eq!(config.complete_token, "<LOCAL>");
+        assert_eq!(config.max_iterations, 3);
+        assert_eq!(config.cwd, "/tmp/custom");
+        assert!(!config.rules_enabled);
+        assert_eq!(config.rules_dir, ".rules/custom");
     }
 
     #[test]

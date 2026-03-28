@@ -18,22 +18,22 @@
 
 		// Listen for execution events
 		await EVENT_SERVICE.onExecutionStarted(({ execution }) => {
-			executionStore.updateCurrent(execution);
+			executionStore.loadStatus(execution.id);
 		});
 
 		await EVENT_SERVICE.onExecutionUpdated(({ execution }) => {
-			executionStore.updateCurrent(execution);
+			executionStore.loadStatus(execution.id);
 		});
 
 		await EVENT_SERVICE.onExecutionCompleted(({ execution }) => {
-			executionStore.updateCurrent(execution);
+			executionStore.loadStatus(execution.id);
 			// Reload history to include this execution
 			executionStore.loadHistory(20);
 			sessionsStore.refresh(20);
 		});
 
 		await EVENT_SERVICE.onExecutionFailed(({ execution }) => {
-			executionStore.updateCurrent(execution);
+			executionStore.loadStatus(execution.id);
 			executionStore.loadHistory(20);
 			sessionsStore.refresh(20);
 		});

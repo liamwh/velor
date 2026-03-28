@@ -135,6 +135,44 @@ pub enum ExecutionEvent {
         /// Timestamp of the update.
         timestamp: DateTime<Utc>,
     },
+    /// Provider activity update (status/tool/progress/usage).
+    Activity {
+        /// Structured activity payload.
+        activity: ExecutionActivity,
+        /// Timestamp of the activity.
+        timestamp: DateTime<Utc>,
+    },
+}
+
+/// Provider activity payload for rich execution streaming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionActivity {
+    /// Provider identifier (e.g. `claude`, `codex`).
+    pub provider: String,
+    /// Activity kind.
+    pub kind: ExecutionActivityKind,
+    /// Short human-readable summary.
+    pub summary: String,
+    /// Optional structured detail string.
+    pub detail: Option<String>,
+    /// Optional success value for result-like activities.
+    pub success: Option<bool>,
+}
+
+/// Activity kind for provider updates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionActivityKind {
+    /// Lifecycle/status update.
+    Status,
+    /// Tool/action started.
+    ToolCall,
+    /// Tool/action finished.
+    ToolResult,
+    /// Usage or accounting update.
+    Usage,
+    /// Provider-specific generic update.
+    Provider,
 }
 
 /// Metrics for an execution.
@@ -373,6 +411,15 @@ impl ExecutionRecord {
             timestamp,
         });
         self.metrics = metrics;
+    }
+
+    /// Records a provider activity event.
+    pub fn record_activity(&mut self, activity: ExecutionActivity) {
+        let timestamp = Utc::now();
+        self.events.push(ExecutionEvent::Activity {
+            activity,
+            timestamp,
+        });
     }
 
     /// Returns the duration of the execution so far.

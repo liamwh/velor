@@ -36,14 +36,15 @@ pub mod rules;
 pub mod template;
 
 // Re-export commonly used types for convenience
-pub use agent::{AgentRunner, ClaudeRunResult};
+pub use agent::{AgentEvent, AgentRunner, ClaudeRunResult};
 pub use config::{
-    AcpConfig, AutomationsConfig, ConversationDbConfig, Defaults, FileConfig, MacOSConfig,
-    NotificationsConfig, PermissionMode, PlanConfig, PromptDef, PromptsConfig, Protocol,
-    TelegramConfig, TelegramParseMode,
+    AcpConfig, AgentProvider, AutomationsConfig, CodexConfig, ConversationDbConfig, Defaults,
+    FileConfig, MacOSConfig, NotificationsConfig, PermissionMode, PlanConfig, PromptDef,
+    PromptsConfig, Protocol, TelegramConfig, TelegramParseMode,
 };
 pub use execution::{
-    ExecutionConfig, ExecutionEvent, ExecutionId, ExecutionMetrics, ExecutionRecord, ExecutionState,
+    ExecutionActivity, ExecutionActivityKind, ExecutionConfig, ExecutionEvent, ExecutionId,
+    ExecutionMetrics, ExecutionRecord, ExecutionState,
 };
 pub use notification::{
     MacOSNotifier, NotificationPayload, Notifier, RunStatus, TelegramNotifier, build_notifiers,

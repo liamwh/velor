@@ -977,6 +977,10 @@ impl UnifiedStore {
                 serde_json::to_string(&metrics)?,
                 *timestamp,
             ),
+            ExecutionEvent::Activity {
+                activity,
+                timestamp,
+            } => ("Activity", serde_json::to_string(&activity)?, *timestamp),
         };
 
         sqlx::query(
@@ -1096,6 +1100,14 @@ impl UnifiedStore {
                 let metrics: ExecutionMetrics = serde_json::from_str(&row.event_data)
                     .wrap_err("Failed to deserialize ExecutionMetrics")?;
                 ExecutionEvent::MetricsUpdated { metrics, timestamp }
+            }
+            "Activity" => {
+                let activity: velor_core::ExecutionActivity = serde_json::from_str(&row.event_data)
+                    .wrap_err("Failed to deserialize ExecutionActivity")?;
+                ExecutionEvent::Activity {
+                    activity,
+                    timestamp,
+                }
             }
             _ => {
                 return Err(color_eyre::eyre::eyre!(

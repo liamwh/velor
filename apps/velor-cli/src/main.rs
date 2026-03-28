@@ -1,6 +1,6 @@
 //! Velor Agent CLI (velor)
 //!
-//! A command-line interface for running autonomous agents with Claude AI.
+//! A command-line interface for running autonomous coding agents.
 //! Supports template-based prompts, variable substitution, and iterative execution.
 
 use chrono::Utc;
@@ -16,6 +16,7 @@ mod cancellation;
 mod completion;
 mod plan;
 mod projects;
+mod serve;
 mod tui;
 mod vault;
 
@@ -27,9 +28,10 @@ use cancellation::CancellationHandler;
 use automations::AutomationsArgs;
 use plan::{PlanRunConfig, run_plan_generation};
 use projects::ProjectArgs;
+use serve::ServeArgs;
 
 use core::{
-    agent::{AgentRunner, require_claude_on_path},
+    agent::{AgentRunner, require_agent_on_path},
     config::FileConfig,
     notification::{
         NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify,
@@ -44,7 +46,7 @@ use core::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// Velor Agent CLI - Run autonomous agents with Claude AI.
+/// Velor Agent CLI - Run autonomous coding agents.
 #[derive(Debug, Parser)]
 #[command(name = "velor", version, about)]
 struct Cli {
@@ -54,7 +56,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run a single Claude invocation
+    /// Run a single agent invocation
     Once(OnceArgs),
 
     /// Run multiple iterations until complete or max iterations reached
@@ -68,6 +70,9 @@ enum Commands {
 
     /// Send a test notification to verify notification configuration
     TestNotification,
+
+    /// Run Telegram listener and execute incoming Codex requests
+    Serve(ServeArgs),
 
     /// Manage and run scheduled automations
     Automations(AutomationsArgs),
@@ -128,7 +133,7 @@ struct CommonArgs {
     #[arg(long)]
     prompt_text: Option<String>,
 
-    /// Permission mode passed to Claude (e.g. acceptEdits).
+    /// Permission mode passed to the provider when supported (e.g. acceptEdits).
     #[arg(long)]
     permission_mode: Option<String>,
 
@@ -148,11 +153,11 @@ struct CommonArgs {
     #[arg(long = "set", value_parser = parse_kv, action = ArgAction::Append)]
     set_vars: Vec<(String, String)>,
 
-    /// Override the Claude binary to use (e.g. "claude" or "claude-glm")
+    /// Override the agent binary to use (e.g. "claude", "claude-glm", or "codex")
     #[arg(short, long, visible_alias = "bin", global = true)]
     pub binary: Option<String>,
 
-    /// Print the final rendered prompt and exit (no Claude call).
+    /// Print the final rendered prompt and exit (no agent call).
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
 
@@ -257,6 +262,11 @@ const KNOWN_FLAGS: &[&str] = &[
     "openai-base-url",
     "binary",
     "bin",
+    "cwd",
+    "poll-timeout-secs",
+    "poll-limit",
+    "include-backlog",
+    "trigger-prefix",
 ];
 
 /// Checks if a string is a valid variable name (lowercase, underscores).
@@ -314,6 +324,9 @@ const DEFAULT_VELOR_TOML: &str = r#"# Velor Agent CLI Configuration
 # Customise the values below to suit your project's needs.
 
 [defaults]
+# Agent provider: "claude" or "codex"
+provider = "claude"
+
 # Default permission mode for Claude (accepts edit suggestions automatically)
 permission_mode = "acceptEdits"
 
@@ -331,6 +344,13 @@ prompt = "once"
 
 # Completion token that signals plan completion
 complete_token = "<promise>COMPLETE</promise>"
+
+# Codex-specific defaults (used when provider = "codex")
+[defaults.codex]
+full_auto = true
+sandbox = "workspace-write"
+skip_git_repo_check = false
+progress_cursor = false
 
 # Global variables available to all prompt templates
 [vars]
@@ -738,6 +758,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Some(Commands::Init) => run_init(git_root).await,
         Some(Commands::Plan(args)) => run_plan(args, home_cfg, git_root).await,
         Some(Commands::TestNotification) => run_test_notification(home_cfg, git_root).await,
+        Some(Commands::Serve(args)) => serve::run_serve(args, home_cfg, git_root, cwd).await,
         Some(Commands::Automations(args)) => run_automations(args, home_cfg, git_root).await,
         Some(Commands::Project(args)) => run_project(args).await,
         Some(Commands::Vault(args)) => vault::run(args.command, Some(git_root)).await,
@@ -883,6 +904,22 @@ fn finalize_prompt(prompt: &str, append_text: Option<&str>) -> String {
     format!("{prompt}\n\n## ADDITIONAL INSTRUCTIONS\n\n{text}")
 }
 
+/// Resolves the effective agent binary for the selected provider.
+///
+/// If Codex is selected and the binary was not explicitly overridden, this
+/// falls back to `codex` instead of the Claude default binary.
+fn resolve_agent_binary(common: &CommonArgs, defaults: &core::config::Defaults) -> String {
+    if let Some(binary) = common.binary.clone() {
+        return binary;
+    }
+
+    if defaults.provider == core::config::AgentProvider::Codex && defaults.binary == "claude-glm" {
+        return "codex".to_string();
+    }
+
+    defaults.binary.clone()
+}
+
 /// Runs the `once` subcommand.
 #[tracing::instrument(level = "debug", ret, err, fields(git_root = %git_root.display(), cwd = %cwd.display()))]
 async fn run_once(
@@ -912,10 +949,7 @@ async fn run_once(
         .clone()
         .or_else(|| file_cfg.defaults.permission_mode.clone())
         .unwrap_or_else(|| "acceptEdits".to_string());
-    let binary = common
-        .binary
-        .clone()
-        .unwrap_or_else(|| file_cfg.defaults.binary.clone());
+    let binary = resolve_agent_binary(&common, &file_cfg.defaults);
 
     let prd_path = common
         .prd_path
@@ -1002,12 +1036,17 @@ async fn run_once(
         return Ok(());
     }
 
-    require_claude_on_path(&binary)?;
+    require_agent_on_path(&binary)?;
 
-    println!("Running Claude with prompt '{prompt_name}'...");
+    println!("Running {} with prompt '{prompt_name}'...", binary);
 
     // Create agent runner based on configured protocol
-    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, file_cfg.defaults.acp);
+    let runner = AgentRunner::from_config(
+        file_cfg.defaults.provider,
+        file_cfg.defaults.protocol,
+        file_cfg.defaults.acp.clone(),
+        file_cfg.defaults.codex.clone(),
+    );
 
     // Run the agent (no callback for streaming output in this mode)
     runner
@@ -1045,10 +1084,7 @@ async fn run_auto(
         .clone()
         .or_else(|| file_cfg.defaults.permission_mode.clone())
         .unwrap_or_else(|| "acceptEdits".to_string());
-    let binary = common
-        .binary
-        .clone()
-        .unwrap_or_else(|| file_cfg.defaults.binary.clone());
+    let binary = resolve_agent_binary(&common, &file_cfg.defaults);
 
     let prd_path = common
         .prd_path
@@ -1115,7 +1151,7 @@ async fn run_auto(
         return Ok(());
     }
 
-    require_claude_on_path(&binary)?;
+    require_agent_on_path(&binary)?;
 
     // Load retry configuration
     let max_retries = args
@@ -1147,7 +1183,12 @@ async fn run_auto(
     let acp_config = file_cfg.defaults.acp.clone();
 
     // Create agent runner based on configured protocol
-    let runner = AgentRunner::from_config(file_cfg.defaults.protocol, acp_config.clone());
+    let runner = AgentRunner::from_config(
+        file_cfg.defaults.provider,
+        file_cfg.defaults.protocol,
+        acp_config.clone(),
+        file_cfg.defaults.codex.clone(),
+    );
     tracing::info!("Runner created: {:?}", runner);
 
     // Load rules if enabled for auto mode

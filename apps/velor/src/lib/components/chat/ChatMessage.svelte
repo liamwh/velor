@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { ExecutionEvent } from '$lib/types';
 	import { ExecutionEventType } from '$lib/types';
-	import { Check, AlertCircle, Loader2, Copy } from 'lucide-svelte';
+	import { Check, AlertCircle, Loader2, Copy, Wrench } from 'lucide-svelte';
 
 	interface Props {
 		event: ExecutionEvent;
@@ -18,6 +18,8 @@
 				? 'error'
 				: event.event_type === ExecutionEventType.StateChanged
 					? 'status'
+					: event.event_type === ExecutionEventType.Activity
+						? 'activity'
 					: 'info'
 	);
 
@@ -126,6 +128,25 @@
 					<span class="text-xs text-muted-foreground">Retry: {event.metrics.retries}</span>
 					<span class="text-xs text-muted-foreground">{event.metrics.output_chars} chars</span>
 					<span class="text-xs text-muted-foreground">{(event.metrics.duration_ms / 1000).toFixed(1)}s</span>
+				</div>
+			{/if}
+			<div class="flex items-center justify-between mt-2 gap-4">
+				<span class="text-xs text-muted-foreground">{formattedTime()}</span>
+			</div>
+		</div>
+	</div>
+{:else if messageType === 'activity'}
+	<div class="flex gap-3 py-2 px-4 rounded-lg bg-blue-950/30 border border-blue-900/30">
+		<div class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center mt-0.5 bg-blue-900/40 text-blue-300">
+			<Wrench size={14} />
+		</div>
+		<div class="flex-1 min-w-0">
+			<div class="text-sm text-blue-100">
+				{event.activity?.summary || event.message || 'Provider activity'}
+			</div>
+			{#if event.activity?.detail}
+				<div class="text-xs text-blue-200/80 mt-1 whitespace-pre-wrap break-words font-mono">
+					{event.activity.detail}
 				</div>
 			{/if}
 			<div class="flex items-center justify-between mt-2 gap-4">
