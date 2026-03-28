@@ -140,7 +140,8 @@
 		const setupListeners = async () => {
 			await EVENT_SERVICE.onExecutionUpdated(({ execution }) => {
 				if (executionId && execution.id === executionId) {
-					isStreaming = execution.state === 'running' || execution.state === 'rendering';
+					const state = execution.state?.toLowerCase();
+					isStreaming = state === 'running' || state === 'rendering';
 					scrollToBottom();
 				}
 			});

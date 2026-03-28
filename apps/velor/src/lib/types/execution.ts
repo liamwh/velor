@@ -24,7 +24,19 @@ export enum ExecutionEventType {
 	OutputChunk = "output_chunk",
 	Error = "error",
 	IterationCompleted = "iteration_completed",
-	MetricsUpdated = "metrics_updated"
+	MetricsUpdated = "metrics_updated",
+	Activity = "activity"
+}
+
+/**
+ * Structured provider activity item.
+ */
+export interface ExecutionActivity {
+	provider: string;
+	kind: "status" | "tool_call" | "tool_result" | "usage" | "provider";
+	summary: string;
+	detail?: string;
+	success?: boolean;
 }
 
 /**
@@ -50,6 +62,10 @@ export interface ExecutionEvent {
 	iteration?: number;
 	/** Execution metrics (for metrics_updated events) */
 	metrics?: ExecutionMetrics;
+	/** Provider activity payload (for activity events) */
+	activity?: ExecutionActivity;
+	/** Generic message payload */
+	message?: string;
 }
 
 /**
@@ -109,7 +125,7 @@ export interface ExecutionRecord {
 	/** Whether this session is pinned in the sidebar */
 	pinned: boolean;
 	/** Git root path at time of session creation */
-	project_path: string;
+	project_path?: string;
 }
 
 /**

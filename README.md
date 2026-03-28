@@ -1,15 +1,17 @@
 # Velor Agent CLI
 
-Velor is a Rust-based command-line tool for running autonomous AI agents with Claude AI. It uses template-based prompts with variable substitution and supports iterative execution with crash recovery.
+Velor is a Rust-based toolchain for running autonomous coding agents (Claude and Codex) with template-based prompts, iterative execution, and crash recovery.
 
 ## Features
 
 - **Template-based prompts** - Use MiniJinja templates with variable substitution
 - **Iterative execution** - Run agents until completion with automatic retry logic
 - **Crash recovery** - Preserve conversation context across failures
-- **Multiple protocols** - Support for both subprocess spawning and ACP (Agent Client Protocol)
+- **Provider abstraction** - Switch between Claude and Codex with clean provider-level config
+- **Multiple protocols** - Support for Claude subprocess and ACP (Agent Client Protocol)
 - **Configuration management** - TOML-based config with home and project-level overrides
 - **Notifications** - Telegram and macOS notification support
+- **Telegram control plane** - `vel serve` long-polling runtime for Telegram text/photo -> Codex execution
 
 ## Installation
 
@@ -71,7 +73,10 @@ Configuration is loaded from multiple sources (highest precedence first):
 
 ```toml
 [defaults]
-# Claude binary to invoke
+# Agent provider: "claude" or "codex"
+provider = "claude"
+
+# Provider binary to invoke
 binary = "claude-glm"
 
 # Permission mode for Claude Code
@@ -79,6 +84,12 @@ permission_mode = "acceptEdits"
 
 # Protocol to use: "subprocess" or "acp"
 protocol = "subprocess"
+
+[defaults.codex]
+full_auto = true
+sandbox = "workspace-write"
+skip_git_repo_check = false
+progress_cursor = false
 
 [vars]
 # Default variables available in templates
@@ -151,6 +162,18 @@ The Velor ACP client implements the following agent methods:
 - **Notifications** - `session/notification` for streaming output
 
 Terminal subsystem and write operations are not implemented in the MVP.
+
+## Codex + Telegram Server
+
+Velor includes a first-class server mode in the main CLI binary:
+
+```bash
+vel serve --cwd /path/to/repo
+```
+
+For full architecture, security, setup, and operational guidance, see:
+
+- [`docs/codex-telegram-server.md`](docs/codex-telegram-server.md)
 
 ## Templates
 

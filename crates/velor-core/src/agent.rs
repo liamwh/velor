@@ -1,14 +1,14 @@
 //! Agent runner interface and configuration.
 //!
 //! This module provides types and traits for running AI agents with
-//! different communication protocols (subprocess vs ACP).
+//! different providers and communication protocols.
 
 use crate::acp;
-use crate::config::{AcpConfig, Protocol};
+use crate::config::{AcpConfig, AgentProvider, CodexConfig, Protocol};
 use color_eyre::eyre::WrapErr;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -180,35 +180,142 @@ fn format_tool_args(name: &str, input: &serde_json::Value) -> ToolCall {
 
 /// Result of running a Claude command.
 #[derive(Debug)]
-pub struct ClaudeRunResult {
-    /// The standard output from Claude.
+pub struct AgentRunResult {
+    /// The standard output from the provider.
     pub stdout: String,
 }
 
-/// Agent runner that supports both subprocess and ACP protocols.
-///
-/// This enum provides a unified interface for running AI agents using either
-/// the traditional subprocess spawning method or the ACP protocol.
+/// Backward-compatible alias for legacy callsites.
+pub type ClaudeRunResult = AgentRunResult;
+
+/// Structured streaming events emitted by provider runners.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// Lifecycle or status update from the provider.
+    Status {
+        /// Human-readable status text.
+        message: String,
+    },
+    /// Incremental assistant text output.
+    TextDelta {
+        /// Text delta payload.
+        text: String,
+    },
+    /// Tool/action execution started.
+    ToolCall {
+        /// Tool/action name.
+        tool: String,
+        /// Provider-formatted summary of the invocation.
+        detail: String,
+    },
+    /// Tool/action execution completed.
+    ToolResult {
+        /// Tool/action name.
+        tool: String,
+        /// Provider-formatted result summary.
+        detail: String,
+        /// Whether the tool execution succeeded if known.
+        success: Option<bool>,
+    },
+    /// Token usage update if available.
+    Usage {
+        /// Input token count.
+        input_tokens: Option<u64>,
+        /// Output token count.
+        output_tokens: Option<u64>,
+        /// Cached input token count.
+        cached_input_tokens: Option<u64>,
+    },
+    /// Error event emitted by provider stream.
+    Error {
+        /// Error detail.
+        message: String,
+    },
+}
+
+/// Event type emitted by `codex exec --json`.
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+enum CodexEvent {
+    /// Thread started.
+    #[serde(rename = "thread.started")]
+    ThreadStarted { thread_id: String },
+    /// Turn started.
+    #[serde(rename = "turn.started")]
+    TurnStarted,
+    /// Item started.
+    #[serde(rename = "item.started")]
+    ItemStarted { item: CodexItem },
+    /// Item completed.
+    #[serde(rename = "item.completed")]
+    ItemCompleted { item: CodexItem },
+    /// Turn completed with usage.
+    #[serde(rename = "turn.completed")]
+    TurnCompleted { usage: Option<CodexUsage> },
+    /// Stream-level error event.
+    #[serde(rename = "error")]
+    Error {
+        message: Option<String>,
+        error: Option<String>,
+    },
+    /// Unknown/unhandled codex stream event.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Item payload for Codex events.
+#[derive(Deserialize, Debug)]
+struct CodexItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    text: Option<String>,
+    command: Option<String>,
+    aggregated_output: Option<String>,
+    exit_code: Option<i32>,
+}
+
+/// Usage payload for Codex events.
+#[derive(Deserialize, Debug)]
+struct CodexUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+}
+
+/// Agent runner abstraction across supported providers.
 #[derive(Debug, Clone)]
 pub enum AgentRunner {
-    /// Spawn subprocess with stdin/stdout (original behavior).
-    Subprocess,
-    /// ACP (Agent Client Protocol) via stdio.
-    Acp(AcpConfig),
+    /// Claude subprocess with stream-json.
+    ClaudeSubprocess,
+    /// Claude ACP (Agent Client Protocol) via stdio.
+    ClaudeAcp(AcpConfig),
+    /// Codex CLI via `codex exec --json`.
+    Codex(CodexConfig),
 }
 
 impl AgentRunner {
-    /// Creates a new `AgentRunner` from the protocol configuration.
+    /// Creates a new runner from provider + protocol configuration.
     ///
     /// # Arguments
     ///
+    /// * `provider` - Provider implementation selector
     /// * `protocol` - The communication protocol to use
-    /// * `acp_config` - ACP configuration (only used when protocol is Acp)
+    /// * `acp_config` - ACP configuration (only used for Claude ACP)
+    /// * `codex_config` - Codex configuration (only used for Codex provider)
     #[must_use]
-    pub fn from_config(protocol: Protocol, acp_config: AcpConfig) -> Self {
-        match protocol {
-            Protocol::Subprocess => Self::Subprocess,
-            Protocol::Acp => Self::Acp(acp_config),
+    pub fn from_config(
+        provider: AgentProvider,
+        protocol: Protocol,
+        acp_config: AcpConfig,
+        codex_config: CodexConfig,
+    ) -> Self {
+        match provider {
+            AgentProvider::Codex => Self::Codex(codex_config),
+            AgentProvider::Claude => match protocol {
+                Protocol::Subprocess => Self::ClaudeSubprocess,
+                Protocol::Acp => Self::ClaudeAcp(acp_config),
+            },
         }
     }
 
@@ -216,14 +323,21 @@ impl AgentRunner {
     #[must_use]
     #[allow(dead_code)]
     pub const fn is_acp(&self) -> bool {
-        matches!(self, Self::Acp(_))
+        matches!(self, Self::ClaudeAcp(_))
     }
 
     /// Returns `true` if this is a subprocess runner.
     #[must_use]
     #[allow(dead_code)]
     pub const fn is_subprocess(&self) -> bool {
-        matches!(self, Self::Subprocess)
+        matches!(self, Self::ClaudeSubprocess)
+    }
+
+    /// Returns `true` if this is a Codex runner.
+    #[must_use]
+    #[allow(dead_code)]
+    pub const fn is_codex(&self) -> bool {
+        matches!(self, Self::Codex(_))
     }
 
     /// Runs the agent with the given parameters.
@@ -253,7 +367,7 @@ impl AgentRunner {
         cwd: &Path,
     ) -> color_eyre::eyre::Result<ClaudeRunResult> {
         match self {
-            Self::Subprocess => {
+            Self::ClaudeSubprocess => {
                 // Wrap sync subprocess call in spawn_blocking to avoid blocking async runtime
                 let binary = binary.to_string();
                 let permission_mode = permission_mode.to_string();
@@ -266,7 +380,7 @@ impl AgentRunner {
                 .await
                 .wrap_err("subprocess task failed")?
             }
-            Self::Acp(config) => {
+            Self::ClaudeAcp(config) => {
                 // ACP mode is natively async
                 tracing::info!("AgentRunner::run: entering ACP mode with binary {}", binary);
                 let acp_result = acp::run_acp(binary, prompt, prompt_name, config, cwd).await?;
@@ -277,17 +391,124 @@ impl AgentRunner {
                     stdout: acp_result.stdout,
                 })
             }
+            Self::Codex(config) => {
+                let binary = binary.to_string();
+                let prompt = prompt.to_string();
+                let prompt_name = prompt_name.to_string();
+                let config = config.clone();
+                let cwd = cwd.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    run_codex(&binary, &prompt, &prompt_name, &cwd, &config, &[])
+                })
+                .await
+                .wrap_err("codex task failed")?
+            }
+        }
+    }
+
+    /// Runs the agent and emits structured events as they arrive.
+    ///
+    /// This method is intended for integrations (GUI/server) that need rich
+    /// streaming updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if provider execution fails.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(level = "debug", skip(on_event, images), fields(binary = %binary, prompt_name = %prompt_name, runner = ?self), ret, err)]
+    pub async fn run_with_events<F>(
+        &self,
+        binary: &str,
+        permission_mode: &str,
+        prompt: &str,
+        prompt_name: &str,
+        cwd: &Path,
+        images: &[PathBuf],
+        mut on_event: F,
+    ) -> color_eyre::eyre::Result<AgentRunResult>
+    where
+        F: FnMut(AgentEvent) + Send,
+    {
+        match self {
+            Self::Codex(config) => {
+                let binary = binary.to_string();
+                let prompt = prompt.to_string();
+                let prompt_name = prompt_name.to_string();
+                let cwd = cwd.to_path_buf();
+                let images = images.to_vec();
+                let config = config.clone();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+
+                let mut task = Box::pin(tokio::task::spawn_blocking(move || {
+                    run_codex_with_events(
+                        &binary,
+                        &prompt,
+                        &prompt_name,
+                        &cwd,
+                        &config,
+                        &images,
+                        |event| {
+                            let _ = tx.send(event);
+                        },
+                    )
+                }));
+
+                loop {
+                    tokio::select! {
+                        maybe_event = rx.recv() => {
+                            if let Some(event) = maybe_event {
+                                on_event(event);
+                            }
+                        }
+                        result = &mut task => {
+                            let result = result.wrap_err("codex task failed")??;
+                            while let Some(event) = rx.recv().await {
+                                on_event(event);
+                            }
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+            Self::ClaudeSubprocess => {
+                on_event(AgentEvent::Status {
+                    message: "running claude subprocess".to_string(),
+                });
+                let result = self
+                    .run(binary, permission_mode, prompt, prompt_name, cwd)
+                    .await?;
+                if !result.stdout.is_empty() {
+                    on_event(AgentEvent::TextDelta {
+                        text: result.stdout.clone(),
+                    });
+                }
+                Ok(result)
+            }
+            Self::ClaudeAcp(config) => {
+                on_event(AgentEvent::Status {
+                    message: "running claude via acp".to_string(),
+                });
+                let acp_result = acp::run_acp(binary, prompt, prompt_name, config, cwd).await?;
+                if !acp_result.stdout.is_empty() {
+                    on_event(AgentEvent::TextDelta {
+                        text: acp_result.stdout.clone(),
+                    });
+                }
+                Ok(AgentRunResult {
+                    stdout: acp_result.stdout,
+                })
+            }
         }
     }
 }
 
-/// Verifies that the Claude CLI is available on PATH.
+/// Verifies that the configured agent binary is available on PATH.
 ///
 /// # Errors
 ///
-/// Returns an error if Claude is not found or cannot be executed.
+/// Returns an error if the binary is not found or cannot be executed.
 #[tracing::instrument(level = "debug", ret)]
-pub fn require_claude_on_path(binary: &str) -> color_eyre::eyre::Result<()> {
+pub fn require_agent_on_path(binary: &str) -> color_eyre::eyre::Result<()> {
     let output = Command::new(binary).arg("--version").output();
 
     match &output {
@@ -308,6 +529,16 @@ pub fn require_claude_on_path(binary: &str) -> color_eyre::eyre::Result<()> {
             "{binary} not found on PATH (or not runnable): {e}\n\nHINT: Ensure {binary} is installed and accessible. Try:\n  1. Run 'which {binary}' to check if it's on PATH\n  2. Check your config file for the 'binary' setting\n  3. Set the correct binary via: --binary <name>"
         )),
     }
+}
+
+/// Legacy compatibility wrapper.
+///
+/// # Errors
+///
+/// Returns an error if the binary is not found or cannot be executed.
+#[tracing::instrument(level = "debug", ret)]
+pub fn require_claude_on_path(binary: &str) -> color_eyre::eyre::Result<()> {
+    require_agent_on_path(binary)
 }
 
 /// Runs Claude with the given permission mode and prompt.
@@ -522,6 +753,285 @@ pub fn run_claude(
     Ok(ClaudeRunResult { stdout })
 }
 
+/// Runs Codex in non-interactive JSON streaming mode and prints rich updates.
+///
+/// # Errors
+///
+/// Returns an error if Codex cannot be executed or exits non-zero.
+#[tracing::instrument(level = "debug", fields(prompt_name = %prompt_name, cwd = %cwd.display()), ret, err)]
+pub fn run_codex(
+    binary: &str,
+    prompt: &str,
+    prompt_name: &str,
+    cwd: &Path,
+    config: &CodexConfig,
+    images: &[PathBuf],
+) -> color_eyre::eyre::Result<AgentRunResult> {
+    let mut out = std::io::stdout();
+    run_codex_with_events(
+        binary,
+        prompt,
+        prompt_name,
+        cwd,
+        config,
+        images,
+        |event| match event {
+            AgentEvent::TextDelta { text } => {
+                let _ = out.write_all(text.as_bytes());
+                let _ = out.flush();
+            }
+            AgentEvent::ToolCall { detail, .. } => {
+                let _ = writeln!(out, "🔧 {}", detail);
+                let _ = out.flush();
+            }
+            AgentEvent::ToolResult {
+                detail, success, ..
+            } => {
+                let prefix = if success == Some(false) {
+                    "⚠️"
+                } else {
+                    "✅"
+                };
+                let _ = writeln!(out, "{prefix} {}", detail);
+                let _ = out.flush();
+            }
+            AgentEvent::Status { message } => {
+                let _ = writeln!(out, "ℹ️ {}", message);
+                let _ = out.flush();
+            }
+            AgentEvent::Error { message } => {
+                let _ = writeln!(out, "❌ {}", message);
+                let _ = out.flush();
+            }
+            AgentEvent::Usage { .. } => {}
+        },
+    )
+}
+
+/// Runs Codex and emits structured stream events through a callback.
+///
+/// # Errors
+///
+/// Returns an error if Codex cannot be executed or exits non-zero.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", skip(on_event, images), fields(prompt_name = %prompt_name, cwd = %cwd.display()), ret, err)]
+fn run_codex_with_events<F>(
+    binary: &str,
+    prompt: &str,
+    prompt_name: &str,
+    cwd: &Path,
+    config: &CodexConfig,
+    images: &[PathBuf],
+    mut on_event: F,
+) -> color_eyre::eyre::Result<AgentRunResult>
+where
+    F: FnMut(AgentEvent),
+{
+    on_event(AgentEvent::Status {
+        message: format!("invoking {binary} (prompt: '{prompt_name}')"),
+    });
+
+    let mut cmd = Command::new(binary);
+    cmd.arg("exec")
+        .arg("--json")
+        .arg("-C")
+        .arg(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if config.full_auto {
+        cmd.arg("--full-auto");
+    }
+    if !config.sandbox.trim().is_empty() {
+        cmd.arg("--sandbox").arg(config.sandbox.trim());
+    }
+    if config.skip_git_repo_check {
+        cmd.arg("--skip-git-repo-check");
+    }
+    if config.progress_cursor {
+        cmd.arg("--progress-cursor");
+    }
+    if let Some(model) = config.model.as_ref().filter(|m| !m.trim().is_empty()) {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(profile) = config.profile.as_ref().filter(|p| !p.trim().is_empty()) {
+        cmd.arg("--profile").arg(profile);
+    }
+    for image in images {
+        cmd.arg("--image").arg(image);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| color_eyre::eyre::eyre!("failed to execute {binary}: {e}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| color_eyre::eyre::eyre!("failed to open {binary} stdin"))?;
+    stdin.write_all(prompt.as_bytes())?;
+    if !prompt.ends_with('\n') {
+        stdin.write_all(b"\n")?;
+    }
+    drop(stdin);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| color_eyre::eyre::eyre!("failed to capture {binary} stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| color_eyre::eyre::eyre!("failed to capture {binary} stderr"))?;
+
+    let stdout_handle = thread::spawn(
+        move || -> color_eyre::eyre::Result<(String, Vec<AgentEvent>)> {
+            let mut collected = String::new();
+            let mut events = Vec::new();
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+
+            loop {
+                let n = reader.read_line(&mut line)?;
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty() {
+                    process_codex_stream_line(trimmed, &mut collected, &mut events);
+                }
+                line.clear();
+            }
+            Ok((collected, events))
+        },
+    );
+
+    let stderr_handle = thread::spawn(move || -> color_eyre::eyre::Result<String> {
+        let mut collected = String::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = stderr.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = std::str::from_utf8(&buf[..n])
+                .unwrap_or("<binary data>")
+                .to_string();
+            collected.push_str(&chunk);
+        }
+        Ok(collected)
+    });
+
+    let status = child.wait()?;
+    let (stdout, events) = stdout_handle
+        .join()
+        .map_err(|_| color_eyre::eyre::eyre!("stdout reader thread panicked"))??;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| color_eyre::eyre::eyre!("stderr reader thread panicked"))??;
+
+    for event in events {
+        on_event(event);
+    }
+
+    if !status.success() {
+        let stderr_summary = if stderr.len() > 500 {
+            format!("{}...", truncate_str(&stderr, 500))
+        } else {
+            stderr.clone()
+        };
+        return Err(color_eyre::eyre::eyre!(
+            "{binary} exited with non-zero status: {status}\n  stderr: {}",
+            stderr_summary.trim()
+        ));
+    }
+
+    Ok(AgentRunResult { stdout })
+}
+
+/// Parses one Codex JSONL event line and updates collected output/events.
+fn process_codex_stream_line(line: &str, collected: &mut String, events: &mut Vec<AgentEvent>) {
+    let Ok(event) = serde_json::from_str::<CodexEvent>(line) else {
+        return;
+    };
+
+    match event {
+        CodexEvent::ThreadStarted { thread_id } => events.push(AgentEvent::Status {
+            message: format!("thread started: {thread_id}"),
+        }),
+        CodexEvent::TurnStarted => events.push(AgentEvent::Status {
+            message: "turn started".to_string(),
+        }),
+        CodexEvent::ItemStarted { item } => {
+            if item.item_type == "command_execution" {
+                let detail = item
+                    .command
+                    .as_deref()
+                    .map(|cmd| {
+                        if cmd.len() > MAX_COMMAND_DISPLAY_LEN {
+                            format!("{}...", truncate_str(cmd, MAX_COMMAND_DISPLAY_LEN))
+                        } else {
+                            cmd.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "command execution".to_string());
+                events.push(AgentEvent::ToolCall {
+                    tool: "command_execution".to_string(),
+                    detail,
+                });
+            }
+        }
+        CodexEvent::ItemCompleted { item } => {
+            if item.item_type == "agent_message" {
+                if let Some(text) = item.text {
+                    collected.push_str(&text);
+                    events.push(AgentEvent::TextDelta { text });
+                }
+            } else if item.item_type == "command_execution" {
+                let command = item
+                    .command
+                    .unwrap_or_else(|| "command execution".to_string());
+                let output_preview = item
+                    .aggregated_output
+                    .as_deref()
+                    .map(|s| truncate_str(s, MAX_COMMAND_DISPLAY_LEN).to_string())
+                    .unwrap_or_default();
+                let detail = if output_preview.is_empty() {
+                    command
+                } else {
+                    format!("{command} => {output_preview}")
+                };
+                let success = item.exit_code.map(|code| code == 0);
+                events.push(AgentEvent::ToolResult {
+                    tool: "command_execution".to_string(),
+                    detail,
+                    success,
+                });
+            }
+        }
+        CodexEvent::TurnCompleted { usage } => {
+            if let Some(usage) = usage {
+                events.push(AgentEvent::Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                });
+            }
+            events.push(AgentEvent::Status {
+                message: "turn completed".to_string(),
+            });
+        }
+        CodexEvent::Error { message, error } => {
+            let msg = message
+                .or(error)
+                .unwrap_or_else(|| "codex stream error".to_string());
+            events.push(AgentEvent::Error { message: msg });
+        }
+        CodexEvent::Unknown => {}
+    }
+}
+
 /// Processes a single line of stream-json output, extracting text and tool calls.
 ///
 /// Returns a tuple of (optional text chunk, optional tool call display).
@@ -621,7 +1131,7 @@ mod tests {
         AgentRunner, ToolCall, concat_text_items, extract_text_chunk, format_tool_args,
         process_stream_line,
     };
-    use crate::config::{AcpConfig, PermissionMode, Protocol};
+    use crate::config::{AcpConfig, AgentProvider, CodexConfig, PermissionMode, Protocol};
 
     #[test]
     fn extract_text_from_delta() {
@@ -659,7 +1169,12 @@ mod tests {
     #[test]
     fn test_agent_runner_from_config_subprocess() {
         let acp_config = AcpConfig::default();
-        let runner = AgentRunner::from_config(Protocol::Subprocess, acp_config);
+        let runner = AgentRunner::from_config(
+            AgentProvider::Claude,
+            Protocol::Subprocess,
+            acp_config,
+            CodexConfig::default(),
+        );
 
         assert!(runner.is_subprocess(), "expected subprocess runner");
         assert!(!runner.is_acp(), "expected non-acp runner");
@@ -672,7 +1187,12 @@ mod tests {
             permission_mode: PermissionMode::Deny,
             persist_adapter: false,
         };
-        let runner = AgentRunner::from_config(Protocol::Acp, acp_config);
+        let runner = AgentRunner::from_config(
+            AgentProvider::Claude,
+            Protocol::Acp,
+            acp_config,
+            CodexConfig::default(),
+        );
 
         assert!(runner.is_acp(), "expected acp runner");
         assert!(!runner.is_subprocess(), "expected non-subprocess runner");
@@ -680,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_agent_runner_is_acp() {
-        let runner = AgentRunner::Acp(AcpConfig::default());
+        let runner = AgentRunner::ClaudeAcp(AcpConfig::default());
         assert!(runner.is_acp(), "Acp variant should return true for is_acp");
         assert!(
             !runner.is_subprocess(),
@@ -690,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_agent_runner_is_subprocess() {
-        let runner = AgentRunner::Subprocess;
+        let runner = AgentRunner::ClaudeSubprocess;
         assert!(
             runner.is_subprocess(),
             "Subprocess variant should return true for is_subprocess"
@@ -704,18 +1224,23 @@ mod tests {
     #[test]
     fn test_agent_runner_clone() {
         let acp_config = AcpConfig::default();
-        let runner = AgentRunner::from_config(Protocol::Acp, acp_config);
+        let runner = AgentRunner::from_config(
+            AgentProvider::Claude,
+            Protocol::Acp,
+            acp_config,
+            CodexConfig::default(),
+        );
         let _cloned = runner.clone();
         // Just verifying that Clone is implemented
     }
 
     #[test]
     fn test_agent_runner_debug() {
-        let runner = AgentRunner::Subprocess;
+        let runner = AgentRunner::ClaudeSubprocess;
         let debug_str = format!("{:?}", runner);
         assert!(
-            debug_str.contains("Subprocess"),
-            "Debug output should contain Subprocess"
+            debug_str.contains("ClaudeSubprocess"),
+            "Debug output should contain ClaudeSubprocess"
         );
     }
 

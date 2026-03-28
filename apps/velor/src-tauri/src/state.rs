@@ -228,6 +228,41 @@ impl AppState {
         executions.get(id.as_str()).cloned()
     }
 
+    /// Returns a snapshot of an active execution record by ID.
+    #[instrument(skip(self), level = "trace", ret)]
+    pub async fn get_execution_record(&self, id: &ExecutionId) -> Option<ExecutionRecord> {
+        let executions = self.active_executions.read().await;
+        executions.get(id.as_str()).map(|e| e.record.clone())
+    }
+
+    /// Mutates an active execution record and persists it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persistence fails.
+    #[instrument(skip(self, mutator), level = "debug")]
+    pub async fn update_execution_record<F>(
+        &self,
+        id: &ExecutionId,
+        mutator: F,
+    ) -> Result<Option<ExecutionRecord>>
+    where
+        F: FnOnce(&mut ExecutionRecord),
+    {
+        let snapshot = {
+            let mut executions = self.active_executions.write().await;
+            let Some(execution) = executions.get_mut(id.as_str()) else {
+                return Ok(None);
+            };
+
+            mutator(&mut execution.record);
+            execution.record.clone()
+        };
+
+        self.persist_session(&snapshot).await?;
+        Ok(Some(snapshot))
+    }
+
     /// Returns all active executions.
     #[instrument(skip(self), level = "trace", ret)]
     pub async fn active_executions(&self) -> Vec<ActiveExecution> {

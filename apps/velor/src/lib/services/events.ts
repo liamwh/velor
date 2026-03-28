@@ -4,13 +4,16 @@
  */
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ExecutionRecord, Automation } from "$lib/types";
+import type { Automation } from "$lib/types";
 
 /**
  * Execution event payload
  */
 export interface ExecutionEventPayload {
-	execution: ExecutionRecord;
+	execution: {
+		id: string;
+		state?: string;
+	};
 }
 
 /**

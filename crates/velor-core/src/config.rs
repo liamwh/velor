@@ -280,6 +280,17 @@ pub enum Protocol {
     Acp,
 }
 
+/// Coding agent provider implementation.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProvider {
+    /// Anthropic Claude via subprocess or ACP.
+    #[default]
+    Claude,
+    /// OpenAI Codex CLI via JSON event stream.
+    Codex,
+}
+
 /// Permission handling mode for ACP.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -313,6 +324,42 @@ impl Default for AcpConfig {
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             permission_mode: PermissionMode::Allow,
             persist_adapter: true,
+        }
+    }
+}
+
+/// Configuration for Codex execution mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodexConfig {
+    /// Run Codex in full-auto mode.
+    pub full_auto: bool,
+
+    /// Sandbox mode (`read-only`, `workspace-write`, `danger-full-access`).
+    pub sandbox: String,
+
+    /// Skip git repository checks.
+    pub skip_git_repo_check: bool,
+
+    /// Optional Codex model override.
+    pub model: Option<String>,
+
+    /// Optional Codex profile.
+    pub profile: Option<String>,
+
+    /// Force progress cursor updates in exec mode.
+    pub progress_cursor: bool,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            full_auto: true,
+            sandbox: "workspace-write".to_string(),
+            skip_git_repo_check: false,
+            model: None,
+            profile: None,
+            progress_cursor: false,
         }
     }
 }
@@ -360,6 +407,10 @@ pub struct FileConfig {
 /// Default values that can be overridden by CLI arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Defaults {
+    /// Agent provider implementation.
+    #[serde(default)]
+    pub provider: AgentProvider,
+
     /// Communication protocol for agent interaction.
     #[serde(default)]
     pub protocol: Protocol,
@@ -401,6 +452,10 @@ pub struct Defaults {
     /// ACP-specific configuration (only used when protocol = "acp").
     #[serde(default)]
     pub acp: AcpConfig,
+
+    /// Codex-specific configuration (only used when provider = "codex").
+    #[serde(default)]
+    pub codex: CodexConfig,
 }
 
 /// Default value for the binary field.
@@ -489,6 +544,8 @@ impl Defaults {
     #[tracing::instrument(level = "debug", ret)]
     pub fn merge(self, overlay: Self) -> Self {
         Self {
+            // Provider selection always comes from overlay.
+            provider: overlay.provider,
             // For protocol, overlay takes precedence (Subprocess is default)
             protocol: overlay.protocol,
             permission_mode: overlay.permission_mode.or(self.permission_mode),
@@ -503,6 +560,8 @@ impl Defaults {
             absolute_timeout_ms: overlay.absolute_timeout_ms,
             // For acp, overlay takes precedence
             acp: overlay.acp,
+            // For codex, overlay takes precedence
+            codex: overlay.codex,
         }
     }
 }

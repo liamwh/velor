@@ -57,7 +57,7 @@ lint-typescript:
 # Install velor CLI to ~/bin (backs up existing binary with timestamp)
 install:
     @echo "📦 Building velor CLI binary..."
-    cargo build --release -p velor-cli -q
+    cargo build --release -p velor-cli -q --target-dir target
     @echo "📥 Installing to ~/bin..."
     @mkdir -p ~/bin
     @mkdir -p ~/bin/.velor-backups
@@ -143,6 +143,18 @@ verify-launchd-binary:
     @~/bin/vel once --help 2>&1 | grep -q "prompt-text" && echo "  ✅ Yes" || echo "  ❌ No"
     @echo "Code signature:"
     @codesign -dv ~/bin/vel 2>&1 | grep -E "Identifier|Format" || echo "  (not signed)"
+
+# Ensure vel serve is running now and at startup (macOS launchd, idempotent)
+serve-ensure-running: install
+    @scripts/vel-serve-launchd.sh ensure "{{justfile_directory()}}"
+
+# Stop and remove the vel serve startup service
+serve-stop:
+    @scripts/vel-serve-launchd.sh stop "{{justfile_directory()}}"
+
+# Check vel serve launchd status
+serve-status:
+    @scripts/vel-serve-launchd.sh status "{{justfile_directory()}}"
 
 # List all justfile recipes
 default:
