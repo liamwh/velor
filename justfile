@@ -1,6 +1,10 @@
 # Velor Agent CLI - justfile commands
 # Run 'just' to see all available commands
 
+# Show available commands
+default:
+    @just --list --justfile {{ justfile() }}
+
 # Build the velor binary in debug mode
 build:
     cargo build
@@ -146,16 +150,12 @@ verify-launchd-binary:
 
 # Ensure vel serve is running now and at startup (macOS launchd, idempotent)
 serve-ensure-running: install
-    @scripts/vel-serve-launchd.sh ensure "{{justfile_directory()}}"
+    @scripts/vel-serve-launchd.sh ensure "{{ justfile_directory() }}"
 
 # Stop and remove the vel serve startup service
 serve-stop:
-    @scripts/vel-serve-launchd.sh stop "{{justfile_directory()}}"
+    @scripts/vel-serve-launchd.sh stop "{{ justfile_directory() }}"
 
 # Check vel serve launchd status
 serve-status:
-    @scripts/vel-serve-launchd.sh status "{{justfile_directory()}}"
-
-# List all justfile recipes
-default:
-    @just --list
+    @scripts/vel-serve-launchd.sh status "{{ justfile_directory() }}"

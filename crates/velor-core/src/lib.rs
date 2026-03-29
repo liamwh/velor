@@ -38,9 +38,9 @@ pub mod template;
 // Re-export commonly used types for convenience
 pub use agent::{AgentEvent, AgentRunner, ClaudeRunResult};
 pub use config::{
-    AcpConfig, AgentProvider, AutomationsConfig, CodexConfig, ConversationDbConfig, Defaults,
-    FileConfig, MacOSConfig, NotificationsConfig, PermissionMode, PlanConfig, PromptDef,
-    PromptsConfig, Protocol, TelegramConfig, TelegramParseMode,
+    AcpConfig, AgentProvider, AutomationsConfig, CodexConfig, CodexReasoningEffort,
+    ConversationDbConfig, Defaults, FileConfig, MacOSConfig, NotificationsConfig, PermissionMode,
+    PlanConfig, PromptDef, PromptsConfig, Protocol, TelegramConfig, TelegramParseMode,
 };
 pub use execution::{
     ExecutionActivity, ExecutionActivityKind, ExecutionConfig, ExecutionEvent, ExecutionId,

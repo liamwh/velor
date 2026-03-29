@@ -71,7 +71,7 @@ enum Commands {
     /// Send a test notification to verify notification configuration
     TestNotification,
 
-    /// Run Telegram listener and execute incoming Codex requests
+    /// Run Telegram listener and execute incoming runner-profile requests
     Serve(ServeArgs),
 
     /// Manage and run scheduled automations
@@ -351,6 +351,8 @@ full_auto = true
 sandbox = "workspace-write"
 skip_git_repo_check = false
 progress_cursor = false
+# Optional: low|medium|high|xhigh
+# model_reasoning_effort = "high"
 
 # Global variables available to all prompt templates
 [vars]

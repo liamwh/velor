@@ -329,6 +329,33 @@ impl Default for AcpConfig {
 }
 
 /// Configuration for Codex execution mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexReasoningEffort {
+    /// Lower-latency, lower-depth reasoning.
+    Low,
+    /// Balanced reasoning.
+    Medium,
+    /// High reasoning depth.
+    High,
+    /// Extra-high reasoning depth.
+    Xhigh,
+}
+
+impl CodexReasoningEffort {
+    /// Returns the effort value expected by Codex CLI config override parsing.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+}
+
+/// Configuration for Codex execution mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodexConfig {
@@ -344,6 +371,9 @@ pub struct CodexConfig {
     /// Optional Codex model override.
     pub model: Option<String>,
 
+    /// Optional Codex reasoning effort override.
+    pub model_reasoning_effort: Option<CodexReasoningEffort>,
+
     /// Optional Codex profile.
     pub profile: Option<String>,
 
@@ -358,6 +388,7 @@ impl Default for CodexConfig {
             sandbox: "workspace-write".to_string(),
             skip_git_repo_check: false,
             model: None,
+            model_reasoning_effort: None,
             profile: None,
             progress_cursor: false,
         }
