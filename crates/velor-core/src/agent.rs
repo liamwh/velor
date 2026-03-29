@@ -855,6 +855,10 @@ where
     if let Some(model) = config.model.as_ref().filter(|m| !m.trim().is_empty()) {
         cmd.arg("--model").arg(model);
     }
+    if let Some(effort) = config.model_reasoning_effort {
+        cmd.arg("-c")
+            .arg(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
+    }
     if let Some(profile) = config.profile.as_ref().filter(|p| !p.trim().is_empty()) {
         cmd.arg("--profile").arg(profile);
     }

@@ -11,7 +11,7 @@ Velor is a Rust-based toolchain for running autonomous coding agents (Claude and
 - **Multiple protocols** - Support for Claude subprocess and ACP (Agent Client Protocol)
 - **Configuration management** - TOML-based config with home and project-level overrides
 - **Notifications** - Telegram and macOS notification support
-- **Telegram control plane** - `vel serve` long-polling runtime for Telegram text/photo -> Codex execution
+- **Telegram control plane** - `vel serve` long-polling runtime for Telegram text/photo -> configurable runner profiles
 
 ## Installation
 
@@ -163,13 +163,16 @@ The Velor ACP client implements the following agent methods:
 
 Terminal subsystem and write operations are not implemented in the MVP.
 
-## Codex + Telegram Server
+## Telegram Runner Server
 
 Velor includes a first-class server mode in the main CLI binary:
 
 ```bash
-vel serve --cwd /path/to/repo
+vel serve
 ```
+
+By default, Telegram-triggered runner executions use `~/git` as the working directory. Use `--cwd` to override.
+Replying to a bot run message in Telegram continues the same underlying runner session (native resume).
 
 For full architecture, security, setup, and operational guidance, see:
 

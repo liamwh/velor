@@ -8,6 +8,7 @@ DOMAIN="gui/$(id -u)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 RUNNER_SCRIPT="$REPO_DIR/.velor/bin/vel-serve-launchd.sh"
 LOG_DIR="$REPO_DIR/.velor/logs"
+AGENT_CWD="${VEL_SERVE_AGENT_CWD:-$HOME/git}"
 CODEX_BIN="$(command -v codex || true)"
 CODEX_DIR=""
 
@@ -28,13 +29,14 @@ write_runner_script() {
 #!/bin/sh
 set -eu
 REPO_DIR="$REPO_DIR"
+AGENT_CWD="$AGENT_CWD"
 export PATH="$HOME/bin:$CODEX_DIR:/opt/zerobrew/prefix/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ -f "\$REPO_DIR/.env" ]; then
   set -a
   . "\$REPO_DIR/.env"
   set +a
 fi
-exec "\$HOME/bin/vel" serve --cwd "\$REPO_DIR"
+exec "\$HOME/bin/vel" serve --config "\$REPO_DIR/.velor/velor.toml" --cwd "\$AGENT_CWD"
 EOF
   chmod 755 "$RUNNER_SCRIPT"
 }
@@ -81,14 +83,23 @@ ensure_codex() {
   fi
 }
 
+ensure_agent_cwd() {
+  if [ ! -d "$AGENT_CWD" ]; then
+    echo "Configured agent cwd does not exist: $AGENT_CWD" >&2
+    echo "Create it or set VEL_SERVE_AGENT_CWD to a valid directory." >&2
+    exit 1
+  fi
+}
+
 ensure_service() {
   ensure_binary
   ensure_codex
+  ensure_agent_cwd
   write_runner_script
   write_plist
   launchctl bootout "$DOMAIN" "$PLIST" >/dev/null 2>&1 || true
-  launchctl bootstrap "$DOMAIN" "$PLIST"
   launchctl enable "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap "$DOMAIN" "$PLIST"
   launchctl kickstart -k "$DOMAIN/$LABEL"
   echo "vel serve is ensured running and configured for startup."
   echo "Logs: $LOG_DIR/vel-serve.stdout.log and $LOG_DIR/vel-serve.stderr.log"

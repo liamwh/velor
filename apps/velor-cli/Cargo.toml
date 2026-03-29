@@ -23,6 +23,7 @@ reqwest = { workspace = true }
 infer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 teloxide = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

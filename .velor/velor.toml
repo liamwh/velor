@@ -137,3 +137,120 @@ sound = "default"
 enabled = true
 bot_token_env = "TELEGRAM_BOT_TOKEN"
 chat_id = "-1003873464939"  # e.g., "-1001234567890"
+
+# Server runtime configuration (`vel serve`)
+[serve]
+enabled = true
+poll_timeout_secs = 10
+poll_limit = 50
+include_backlog = false
+max_requests_per_minute = 20
+max_concurrent_tasks = 2
+default_timeout_secs = 1800
+media_dir = ".velor/telegram-media"
+
+[serve.streaming]
+enabled = true
+edit_throttle_secs = 1
+max_message_chars = 3600
+flush_on_milestones = true
+
+[serve.telegram]
+# Optional additional allowlist entries (chat_id from notifications.telegram is always included).
+allowed_chat_ids = []
+# Optional user-level allowlist. Empty means "any user within allowed chats".
+allowed_user_ids = []
+allow_channel_posts = true
+
+[serve.attachments]
+enabled = true
+allow_photos = true
+allow_documents = true
+max_download_bytes = 20971520
+keep_files = false
+allowed_document_mime_prefixes = ["image/", "text/", "application/pdf", "application/json", "application/xml"]
+
+[serve.session_resume]
+enabled = true
+store_path = ".velor/telegram-session-bindings.json"
+max_bindings = 10000
+
+[serve.routing]
+require_prefix = true
+default_runner = "codex-gpt-5-4"
+
+[serve.routing.prefixes]
+"opus:" = "claude-opus-4-6"
+"sonnet:" = "claude-sonnet-4-6"
+"5.3-codex:" = "codex-gpt-5-3-codex"
+"5.3:" = "codex-gpt-5-3-codex"
+"5.4:" = "codex-gpt-5-4"
+"glm5.1:" = "glm-5-1"
+"5.1:" = "glm-5-1"
+"codex:" = "codex-gpt-5-4"
+
+[serve.runners."claude-opus-4-6"]
+description = "Claude Opus 4.6"
+kind = "claude"
+binary = "claude"
+model = "claude-opus-4-6"
+permission_mode = "acceptEdits"
+timeout_secs = 1800
+supports_attachments = false
+supports_streaming = true
+supports_session_resume = true
+
+[serve.runners."claude-sonnet-4-6"]
+description = "Claude Sonnet 4.6"
+kind = "claude"
+binary = "claude"
+model = "claude-sonnet-4-6"
+permission_mode = "acceptEdits"
+timeout_secs = 1800
+supports_attachments = false
+supports_streaming = true
+supports_session_resume = true
+
+[serve.runners."codex-gpt-5-3-codex"]
+description = "Codex GPT-5.3 Codex"
+kind = "codex"
+binary = "codex"
+model = "gpt-5.3-codex"
+permission_mode = "acceptEdits"
+timeout_secs = 1800
+supports_attachments = true
+supports_streaming = true
+supports_session_resume = true
+[serve.runners."codex-gpt-5-3-codex".codex]
+full_auto = true
+sandbox = "workspace-write"
+skip_git_repo_check = false
+progress_cursor = false
+reasoning_effort = "xhigh"
+
+[serve.runners."codex-gpt-5-4"]
+description = "Codex GPT-5.4"
+kind = "codex"
+binary = "codex"
+model = "gpt-5.4"
+permission_mode = "acceptEdits"
+timeout_secs = 1800
+supports_attachments = true
+supports_streaming = true
+supports_session_resume = true
+[serve.runners."codex-gpt-5-4".codex]
+full_auto = true
+sandbox = "workspace-write"
+skip_git_repo_check = false
+progress_cursor = false
+
+[serve.runners."glm-5-1"]
+description = "GLM 5.1 via /Users/liam/bin/glm5.1"
+kind = "claude"
+binary = "/Users/liam/bin/glm5.1"
+model = "glm-5.1"
+permission_mode = "acceptEdits"
+timeout_secs = 1800
+supports_attachments = false
+supports_streaming = true
+supports_session_resume = true
