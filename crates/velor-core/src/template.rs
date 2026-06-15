@@ -4,6 +4,7 @@
 //! the MiniJinja templating engine, with support for variable substitution.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
 /// Renders a template string using the provided variables.
@@ -163,7 +164,95 @@ pub fn merge_vars(
         out.insert(k.clone(), v.clone());
     }
 
-    out
+    expand_vars_recursively(&out)
+}
+
+fn expand_vars_recursively(vars: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut resolved = BTreeMap::new();
+
+    for key in vars.keys() {
+        let value = resolve_var_value(key, vars, &mut resolved, &mut BTreeSet::new());
+        resolved.insert(key.clone(), value);
+    }
+
+    resolved
+}
+
+fn resolve_var_value(
+    key: &str,
+    vars: &BTreeMap<String, String>,
+    resolved: &mut BTreeMap<String, String>,
+    visiting: &mut BTreeSet<String>,
+) -> String {
+    if let Some(value) = resolved.get(key) {
+        return value.clone();
+    }
+
+    let Some(template) = vars.get(key) else {
+        return format!("{{{{{key}}}}}");
+    };
+
+    if !visiting.insert(key.to_string()) {
+        return template.clone();
+    }
+
+    let result = match render_template_with_resolver(template, vars, resolved, visiting) {
+        Ok(rendered) => rendered,
+        Err(_) => template.clone(),
+    };
+
+    visiting.remove(key);
+    resolved.insert(key.to_string(), result.clone());
+    result
+}
+
+fn render_template_with_resolver(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    resolved: &mut BTreeMap<String, String>,
+    visiting: &mut BTreeSet<String>,
+) -> color_eyre::eyre::Result<String> {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find("{{") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+
+        let Some(end_offset) = after_start.find("}}") else {
+            output.push_str(&rest[start..]);
+            return Ok(output);
+        };
+
+        let raw_expr = &after_start[..end_offset];
+        let expr = raw_expr.trim();
+
+        if is_plain_identifier(expr) {
+            output.push_str(&resolve_var_value(expr, vars, resolved, visiting));
+        } else {
+            output.push_str("{{");
+            output.push_str(raw_expr);
+            output.push_str("}}");
+        }
+
+        rest = &after_start[end_offset + 2..];
+    }
+
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn is_plain_identifier(expr: &str) -> bool {
+    let mut chars = expr.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -224,6 +313,62 @@ mod tests {
 
         let result = merge_vars(&base, &overrides, &runtime);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_merge_vars_expands_nested_references() {
+        let mut base = BTreeMap::new();
+        base.insert("target_dir".to_string(), "target/vel".to_string());
+        base.insert(
+            "check_cmd".to_string(),
+            "CARGO_TARGET_DIR={{target_dir}} just check".to_string(),
+        );
+
+        let result = merge_vars(&base, &[], &[]);
+
+        assert_eq!(
+            result.get("check_cmd"),
+            Some(&"CARGO_TARGET_DIR=target/vel just check".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_vars_expands_multi_level_references() {
+        let mut base = BTreeMap::new();
+        base.insert("suffix".to_string(), "vel".to_string());
+        base.insert("target_dir".to_string(), "target/{{suffix}}".to_string());
+        base.insert(
+            "check_cmd".to_string(),
+            "CARGO_TARGET_DIR={{target_dir}} just check".to_string(),
+        );
+
+        let result = merge_vars(&base, &[], &[]);
+
+        assert_eq!(
+            result.get("check_cmd"),
+            Some(&"CARGO_TARGET_DIR=target/vel just check".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_vars_preserves_cycles_without_hanging() {
+        let mut base = BTreeMap::new();
+        base.insert("a".to_string(), "{{b}}".to_string());
+        base.insert("b".to_string(), "{{a}}".to_string());
+
+        let result = merge_vars(&base, &[], &[]);
+
+        let a = result.get("a").expect("a should exist");
+        let b = result.get("b").expect("b should exist");
+
+        assert!(
+            a == "{{a}}" || a == "{{b}}",
+            "cyclic a should remain an unresolved placeholder"
+        );
+        assert!(
+            b == "{{a}}" || b == "{{b}}",
+            "cyclic b should remain an unresolved placeholder"
+        );
     }
 
     #[test]
