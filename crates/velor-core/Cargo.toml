@@ -30,6 +30,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 # Rules system dependencies
 globset = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 
 # Prompt discovery dependencies
