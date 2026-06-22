@@ -23,7 +23,7 @@ persist_adapter = true
 progress_path = ".velor/progress.md"
 
 # Default iterations for auto-mode
-iterations = 50
+iterations = 1000
 
 # Default prompt name
 prompt = "once"
@@ -155,6 +155,15 @@ edit_throttle_secs = 1
 max_message_chars = 3600
 flush_on_milestones = true
 
+[serve.presentation]
+default_verbosity = "compact"
+max_changed_files = 5
+max_section_chars = 500
+include_debug_footer_on_success = false
+include_follow_up_hints = true
+path_truncation = "left"
+raw_log_dir = ".velor/serve-run-logs"
+
 [serve.telegram]
 # Optional additional allowlist entries (chat_id from notifications.telegram is always included).
 allowed_chat_ids = []
@@ -223,8 +232,8 @@ supports_streaming = true
 supports_session_resume = true
 [serve.runners."codex-gpt-5-3-codex".codex]
 full_auto = true
-sandbox = "workspace-write"
-skip_git_repo_check = false
+sandbox = "danger-full-access"
+skip_git_repo_check = true
 progress_cursor = false
 reasoning_effort = "xhigh"
 
@@ -240,8 +249,8 @@ supports_streaming = true
 supports_session_resume = true
 [serve.runners."codex-gpt-5-4".codex]
 full_auto = true
-sandbox = "workspace-write"
-skip_git_repo_check = false
+sandbox = "danger-full-access"
+skip_git_repo_check = true
 progress_cursor = false
 
 [serve.runners."glm-5-1"]

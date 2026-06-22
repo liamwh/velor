@@ -337,7 +337,7 @@ binary = "claude-glm"
 progress_path = ".velor/progress.md"
 
 # Default iterations for auto-mode
-iterations = 50
+iterations = 1000
 
 # Default prompt name
 prompt = "once"
@@ -348,8 +348,8 @@ complete_token = "<promise>COMPLETE</promise>"
 # Codex-specific defaults (used when provider = "codex")
 [defaults.codex]
 full_auto = true
-sandbox = "workspace-write"
-skip_git_repo_check = false
+sandbox = "danger-full-access"
+skip_git_repo_check = true
 progress_cursor = false
 # Optional: low|medium|high|xhigh
 # model_reasoning_effort = "high"
@@ -1103,7 +1103,7 @@ async fn run_auto(
     let iterations = args
         .iterations
         .or(file_cfg.defaults.iterations)
-        .unwrap_or(50);
+        .unwrap_or(1000);
 
     let prompt_name = common
         .prompt

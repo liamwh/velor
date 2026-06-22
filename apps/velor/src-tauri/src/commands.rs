@@ -296,7 +296,7 @@ fn build_execution_config(
     let max_iterations = request
         .max_iterations
         .or(merged.defaults.iterations)
-        .unwrap_or(50);
+        .unwrap_or(1000);
     let cwd = request
         .cwd
         .filter(|s| !s.trim().is_empty())

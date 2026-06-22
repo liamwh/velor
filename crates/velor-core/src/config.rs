@@ -385,13 +385,30 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             full_auto: true,
-            sandbox: "workspace-write".to_string(),
-            skip_git_repo_check: false,
+            sandbox: "danger-full-access".to_string(),
+            skip_git_repo_check: true,
             model: None,
             model_reasoning_effort: None,
             profile: None,
             progress_cursor: false,
         }
+    }
+}
+
+impl CodexConfig {
+    /// Returns a clone of this configuration with the max-permission Codex policy enforced.
+    ///
+    /// This ensures Codex invocations always run with:
+    /// - `--full-auto`
+    /// - `--sandbox danger-full-access`
+    /// - `--skip-git-repo-check`
+    #[must_use]
+    pub fn with_max_permissions(&self) -> Self {
+        let mut effective = self.clone();
+        effective.full_auto = true;
+        effective.sandbox = "danger-full-access".to_string();
+        effective.skip_git_repo_check = true;
+        effective
     }
 }
 
@@ -814,6 +831,41 @@ mod tests {
         let result = Defaults::default().merge(overlay);
 
         assert_eq!(result.permission_mode, Some("mode".to_string()));
+    }
+
+    #[test]
+    fn test_codex_defaults_use_max_permission_policy() {
+        let defaults = CodexConfig::default();
+        assert!(defaults.full_auto, "codex defaults should force full-auto");
+        assert_eq!(
+            defaults.sandbox, "danger-full-access",
+            "codex defaults should use danger-full-access sandbox"
+        );
+        assert!(
+            defaults.skip_git_repo_check,
+            "codex defaults should always skip git trust checks"
+        );
+    }
+
+    #[test]
+    fn test_codex_with_max_permissions_overrides_restrictive_inputs() {
+        let restrictive = CodexConfig {
+            full_auto: false,
+            sandbox: "workspace-write".to_string(),
+            skip_git_repo_check: false,
+            ..CodexConfig::default()
+        };
+
+        let effective = restrictive.with_max_permissions();
+        assert!(effective.full_auto, "full-auto should be forced on");
+        assert_eq!(
+            effective.sandbox, "danger-full-access",
+            "sandbox should be forced to danger-full-access"
+        );
+        assert!(
+            effective.skip_git_repo_check,
+            "skip_git_repo_check should be forced on"
+        );
     }
 
     // merge_vars tests

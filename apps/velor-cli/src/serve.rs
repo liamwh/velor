@@ -12,7 +12,7 @@ use clap::{ArgAction, Args};
 use color_eyre::eyre::{WrapErr, eyre};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,6 +34,7 @@ use teloxide::{ApiError, RequestError};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::task::AbortHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
@@ -92,6 +93,7 @@ struct ServeConfigRaw {
     progress_update_interval_secs: Option<u64>,
     media_dir: Option<PathBuf>,
     streaming: ServeStreamingRaw,
+    presentation: ServePresentationRaw,
     telegram: ServeTelegramRaw,
     attachments: ServeAttachmentPolicyRaw,
     session_resume: ServeSessionResumeRaw,
@@ -130,6 +132,7 @@ impl ServeConfigRaw {
         }
 
         self.streaming.merge_from(overlay.streaming);
+        self.presentation.merge_from(overlay.presentation);
         self.telegram.merge_from(overlay.telegram);
         self.attachments.merge_from(overlay.attachments);
         self.session_resume.merge_from(overlay.session_resume);
@@ -176,6 +179,45 @@ struct ServeStreamingRaw {
     edit_throttle_secs: Option<u64>,
     max_message_chars: Option<usize>,
     flush_on_milestones: Option<bool>,
+}
+
+/// Raw result-presentation policy under `[serve.presentation]`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct ServePresentationRaw {
+    default_verbosity: Option<TelegramResultVerbosity>,
+    max_changed_files: Option<usize>,
+    max_section_chars: Option<usize>,
+    include_debug_footer_on_success: Option<bool>,
+    include_follow_up_hints: Option<bool>,
+    path_truncation: Option<TelegramPathTruncation>,
+    raw_log_dir: Option<PathBuf>,
+}
+
+impl ServePresentationRaw {
+    fn merge_from(&mut self, overlay: Self) {
+        if overlay.default_verbosity.is_some() {
+            self.default_verbosity = overlay.default_verbosity;
+        }
+        if overlay.max_changed_files.is_some() {
+            self.max_changed_files = overlay.max_changed_files;
+        }
+        if overlay.max_section_chars.is_some() {
+            self.max_section_chars = overlay.max_section_chars;
+        }
+        if overlay.include_debug_footer_on_success.is_some() {
+            self.include_debug_footer_on_success = overlay.include_debug_footer_on_success;
+        }
+        if overlay.include_follow_up_hints.is_some() {
+            self.include_follow_up_hints = overlay.include_follow_up_hints;
+        }
+        if overlay.path_truncation.is_some() {
+            self.path_truncation = overlay.path_truncation;
+        }
+        if overlay.raw_log_dir.is_some() {
+            self.raw_log_dir = overlay.raw_log_dir;
+        }
+    }
 }
 
 impl ServeStreamingRaw {
@@ -389,6 +431,7 @@ struct ServeResolvedConfig {
     max_requests_per_minute: u32,
     max_concurrent_tasks: usize,
     streaming: TelegramStreamingConfig,
+    presentation: TelegramPresentationConfig,
     media_dir: PathBuf,
     attachment_policy: ServeAttachmentPolicy,
     session_resume: SessionResumeConfig,
@@ -403,6 +446,36 @@ struct TelegramStreamingConfig {
     edit_throttle: Duration,
     max_message_chars: usize,
     flush_on_milestones: bool,
+}
+
+/// Telegram terminal-result presentation policy.
+#[derive(Debug, Clone)]
+struct TelegramPresentationConfig {
+    default_verbosity: TelegramResultVerbosity,
+    max_changed_files: usize,
+    max_section_chars: usize,
+    include_debug_footer_on_success: bool,
+    include_follow_up_hints: bool,
+    path_truncation: TelegramPathTruncation,
+    raw_log_dir: PathBuf,
+}
+
+/// Terminal result verbosity tiers for Telegram output.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TelegramResultVerbosity {
+    Compact,
+    Standard,
+    Verbose,
+    Raw,
+}
+
+/// Strategy for truncating long file paths in Telegram summaries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TelegramPathTruncation {
+    Left,
+    Middle,
 }
 
 /// Resolved attachment policy.
@@ -482,6 +555,7 @@ struct ServeContext {
     concurrency: Arc<Semaphore>,
     session_store: Arc<Mutex<SessionResumeStore>>,
     session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    active_runs: Arc<Mutex<ActiveRunRegistry>>,
     started_at: DateTime<Utc>,
 }
 
@@ -529,6 +603,132 @@ struct SlidingWindowRateLimiter {
     window: Duration,
     max_events: u32,
     buckets: HashMap<String, VecDeque<Instant>>,
+}
+
+/// In-memory registry of in-flight Telegram-triggered runs for reply interruption/resume.
+#[derive(Debug, Default)]
+struct ActiveRunRegistry {
+    by_request: HashMap<String, ActiveRunEntry>,
+    by_message: HashMap<SessionMessageKey, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRunEntry {
+    request_id: String,
+    chat_id: i64,
+    runner_name: String,
+    runner_kind: RunnerKind,
+    source_user_message_id: Option<i32>,
+    invocation: RunnerInvocationMetadata,
+    session: Option<RunnerSessionHandle>,
+    message_ids: HashSet<i32>,
+    abort_handle: AbortHandle,
+    started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRunInterrupt {
+    interrupted_request_id: String,
+    binding: SessionMessageBinding,
+}
+
+enum ActiveRunReplyResolution {
+    NotFound,
+    MissingSession {
+        request_id: String,
+        runner_name: String,
+    },
+    Interrupted(ActiveRunInterrupt),
+}
+
+impl ActiveRunRegistry {
+    fn register(&mut self, entry: ActiveRunEntry) {
+        let request_id = entry.request_id.clone();
+        if self.by_request.contains_key(&request_id) {
+            self.remove_request(&request_id);
+        }
+        self.by_request.insert(request_id, entry);
+    }
+
+    fn remove_request(&mut self, request_id: &str) {
+        let Some(entry) = self.by_request.remove(request_id) else {
+            return;
+        };
+        for message_id in entry.message_ids {
+            self.by_message.remove(&SessionMessageKey {
+                chat_id: entry.chat_id,
+                message_id,
+            });
+        }
+    }
+
+    fn set_session(&mut self, request_id: &str, session: RunnerSessionHandle) {
+        if let Some(entry) = self.by_request.get_mut(request_id) {
+            entry.session = Some(session);
+        }
+    }
+
+    fn sync_messages(&mut self, request_id: &str, message_ids: &[i32]) {
+        let Some(entry) = self.by_request.get_mut(request_id) else {
+            return;
+        };
+        for message_id in message_ids {
+            if entry.message_ids.insert(*message_id) {
+                self.by_message.insert(
+                    SessionMessageKey {
+                        chat_id: entry.chat_id,
+                        message_id: *message_id,
+                    },
+                    request_id.to_string(),
+                );
+            }
+        }
+    }
+
+    fn interrupt_for_reply(
+        &mut self,
+        chat_id: i64,
+        replied_to_message_id: i32,
+    ) -> ActiveRunReplyResolution {
+        let key = SessionMessageKey {
+            chat_id,
+            message_id: replied_to_message_id,
+        };
+        let Some(request_id) = self.by_message.get(&key).cloned() else {
+            return ActiveRunReplyResolution::NotFound;
+        };
+        let Some(entry) = self.by_request.get(&request_id).cloned() else {
+            self.by_message.remove(&key);
+            return ActiveRunReplyResolution::NotFound;
+        };
+
+        let Some(session) = entry.session.clone() else {
+            return ActiveRunReplyResolution::MissingSession {
+                request_id,
+                runner_name: entry.runner_name,
+            };
+        };
+
+        entry.abort_handle.abort();
+        self.remove_request(&entry.request_id);
+
+        let now = Utc::now();
+        ActiveRunReplyResolution::Interrupted(ActiveRunInterrupt {
+            interrupted_request_id: entry.request_id.clone(),
+            binding: SessionMessageBinding {
+                chat_id: entry.chat_id,
+                message_id: replied_to_message_id,
+                runner_name: entry.runner_name,
+                runner_kind: entry.runner_kind,
+                session,
+                invocation: entry.invocation,
+                request_id: entry.request_id,
+                source_user_message_id: entry.source_user_message_id,
+                created_at: entry.started_at,
+                updated_at: now,
+            },
+        })
+    }
 }
 
 impl SlidingWindowRateLimiter {
@@ -896,12 +1096,188 @@ struct RunnerProbe {
 }
 
 /// Terminal run outcome presented to Telegram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 enum RunTerminalState {
     Completed,
     Failed,
     TimedOut,
     Cancelled,
+}
+
+/// Normalized terminal result state used by Telegram summary rendering.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionSummaryStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    Partial,
+}
+
+impl ExecutionSummaryStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Partial => "partial",
+        }
+    }
+
+    fn emoji(self) -> &'static str {
+        match self {
+            Self::Completed => "✅",
+            Self::Failed => "❌",
+            Self::Cancelled => "🛑",
+            Self::Partial => "⚠️",
+        }
+    }
+}
+
+impl From<RunTerminalState> for ExecutionSummaryStatus {
+    fn from(value: RunTerminalState) -> Self {
+        match value {
+            RunTerminalState::Completed => Self::Completed,
+            RunTerminalState::Failed => Self::Failed,
+            RunTerminalState::Cancelled => Self::Cancelled,
+            RunTerminalState::TimedOut => Self::Partial,
+        }
+    }
+}
+
+/// Machine-readable request metadata retained outside Telegram compact rendering.
+#[derive(Debug, Clone, Serialize)]
+struct ExecutionRawRequestMetadata {
+    request_id: String,
+    transport: String,
+    chat_id: i64,
+    user_id: Option<i64>,
+    source_message_id: Option<i32>,
+    update_id: i32,
+    runner_name: String,
+    runner_kind: RunnerKind,
+    mode: &'static str,
+    attachment_count: usize,
+    received_at: DateTime<Utc>,
+}
+
+/// Optional diagnostic details for operator debugging.
+#[derive(Debug, Clone, Serialize, Default)]
+struct ExecutionDiagnostics {
+    first_error: Option<String>,
+    stderr_preview: Option<String>,
+    raw_log_path: Option<String>,
+}
+
+/// Normalized summary model rendered into Telegram presentation tiers.
+#[derive(Debug, Clone, Serialize)]
+struct ExecutionResultSummary {
+    title: String,
+    final_status: ExecutionSummaryStatus,
+    runner_name: String,
+    repo_name: Option<String>,
+    branch: Option<String>,
+    duration_secs: u64,
+    high_level_summary: Vec<String>,
+    tool_activity: Vec<String>,
+    changed_files: Vec<String>,
+    verification_steps: Vec<String>,
+    notable_outputs: Vec<String>,
+    next_actions: Vec<String>,
+    raw_request_metadata: ExecutionRawRequestMetadata,
+    diagnostics: Option<ExecutionDiagnostics>,
+}
+
+/// Timestamped runner progress event retained for raw logs and semantic summary building.
+#[derive(Debug, Clone, Serialize)]
+struct RunnerProgressEventRecord {
+    at: DateTime<Utc>,
+    event: RunnerProgressEvent,
+}
+
+/// Captures detailed runner events and extracts semantic signals for terminal summaries.
+#[derive(Debug, Clone, Default)]
+struct ExecutionResultCollector {
+    events: Vec<RunnerProgressEventRecord>,
+    statuses: Vec<String>,
+    milestones: Vec<String>,
+    errors: Vec<String>,
+    output: String,
+    tool_commands: Vec<String>,
+    verification_steps: Vec<String>,
+}
+
+impl ExecutionResultCollector {
+    fn ingest(&mut self, event: &RunnerProgressEvent) {
+        self.events.push(RunnerProgressEventRecord {
+            at: Utc::now(),
+            event: event.clone(),
+        });
+
+        match event {
+            RunnerProgressEvent::Status(message) => {
+                self.statuses.push(message.clone());
+            }
+            RunnerProgressEvent::Milestone(message) => {
+                self.milestones.push(message.clone());
+                self.capture_tool_and_verification_signal(message);
+            }
+            RunnerProgressEvent::OutputDelta(delta) => {
+                push_limited(&mut self.output, delta, 150_000);
+            }
+            RunnerProgressEvent::SessionBound { .. } => {}
+            RunnerProgressEvent::Error(message) => {
+                self.errors.push(message.clone());
+            }
+        }
+    }
+
+    fn capture_tool_and_verification_signal(&mut self, milestone: &str) {
+        if let Some(command) = parse_tool_command_from_milestone(milestone) {
+            self.tool_commands.push(command.clone());
+            if is_verification_command(&command) {
+                self.verification_steps.push(normalize_whitespace(&command));
+            }
+        }
+    }
+}
+
+/// Durable raw execution record preserved outside compact Telegram summaries.
+#[derive(Debug, Clone, Serialize)]
+struct PersistedExecutionRecord {
+    schema_version: u32,
+    request: ExecutionRawRequestMetadata,
+    runner_description: String,
+    terminal_state: RunTerminalState,
+    duration_secs: u64,
+    prompt: String,
+    attachments: Vec<PersistedAttachmentRecord>,
+    progress_events: Vec<RunnerProgressEventRecord>,
+    stdout: String,
+    stderr: String,
+    summary: ExecutionResultSummary,
+}
+
+/// Persisted attachment detail for raw execution records.
+#[derive(Debug, Clone, Serialize)]
+struct PersistedAttachmentRecord {
+    kind: &'static str,
+    mime_type: String,
+    size_bytes: usize,
+    width: Option<u32>,
+    height: Option<u32>,
+    file_name: Option<String>,
+    path: String,
+}
+
+/// Git snapshot captured before/after a run to report file-change deltas.
+#[derive(Debug, Clone, Default)]
+struct GitSnapshot {
+    repo_root: Option<PathBuf>,
+    repo_name: Option<String>,
+    branch: Option<String>,
+    porcelain_status: BTreeMap<String, String>,
 }
 
 impl RunTerminalState {
@@ -916,7 +1292,8 @@ impl RunTerminalState {
 }
 
 /// Normalized runner progress event consumed by transport presenters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum RunnerProgressEvent {
     Status(String),
     Milestone(String),
@@ -937,6 +1314,7 @@ impl RunnerProgressEvent {
 const TELEGRAM_STREAM_RENDERED_OUTPUT_EMPTY: &str = "(waiting for output...)";
 const TELEGRAM_STREAM_CONTINUED_NOTE: &str = "[continued in next message]";
 const TELEGRAM_MAX_TEXT_HARD_LIMIT: usize = 4096;
+const CLAUDE_SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
 /// Throttle policy for Telegram message edits.
 #[derive(Debug, Clone)]
@@ -1045,6 +1423,7 @@ struct TelegramStreamRenderer {
     output: String,
     terminal_state: Option<RunTerminalState>,
     final_summary: Option<String>,
+    final_render_override: Option<String>,
 }
 
 impl TelegramStreamRenderer {
@@ -1057,6 +1436,7 @@ impl TelegramStreamRenderer {
             output: String::new(),
             terminal_state: None,
             final_summary: None,
+            final_render_override: None,
         }
     }
 
@@ -1083,9 +1463,15 @@ impl TelegramStreamRenderer {
         }
     }
 
-    fn mark_terminal(&mut self, state: RunTerminalState, summary: String) {
+    fn mark_terminal(
+        &mut self,
+        state: RunTerminalState,
+        summary: String,
+        render_override: Option<String>,
+    ) {
         self.terminal_state = Some(state);
         self.final_summary = Some(summary);
+        self.final_render_override = render_override;
         self.status_line = state.label().to_string();
     }
 
@@ -1094,6 +1480,12 @@ impl TelegramStreamRenderer {
     }
 
     fn render(&self, part_number: usize, output_slice: &str, continued: bool) -> String {
+        if self.terminal_state.is_some()
+            && let Some(override_text) = &self.final_render_override
+        {
+            return override_text.clone();
+        }
+
         let mut lines = Vec::new();
         let state = self
             .terminal_state
@@ -1305,8 +1697,9 @@ impl TelegramRunPresenter {
         &mut self,
         state: RunTerminalState,
         summary: String,
+        render_override: Option<String>,
     ) -> color_eyre::eyre::Result<()> {
-        self.renderer.mark_terminal(state, summary);
+        self.renderer.mark_terminal(state, summary, render_override);
         self.dirty = true;
         self.flush(true).await
     }
@@ -1545,6 +1938,9 @@ pub async fn run_serve(
     tokio::fs::create_dir_all(&serve_cfg.media_dir)
         .await
         .wrap_err("Failed to create media directory")?;
+    tokio::fs::create_dir_all(&serve_cfg.presentation.raw_log_dir)
+        .await
+        .wrap_err("Failed to create serve raw log directory")?;
 
     let session_store = SessionResumeStore::load(
         serve_cfg.session_resume.store_path.clone(),
@@ -1613,6 +2009,7 @@ pub async fn run_serve(
         concurrency: Arc::new(Semaphore::new(serve_cfg.max_concurrent_tasks)),
         session_store: Arc::new(Mutex::new(session_store)),
         session_locks: Arc::new(Mutex::new(HashMap::new())),
+        active_runs: Arc::new(Mutex::new(ActiveRunRegistry::default())),
         started_at: Utc::now(),
     });
 
@@ -1626,6 +2023,13 @@ pub async fn run_serve(
         streaming_enabled = ctx.cfg.streaming.enabled,
         streaming_edit_throttle_secs = ctx.cfg.streaming.edit_throttle.as_secs(),
         streaming_max_message_chars = ctx.cfg.streaming.max_message_chars,
+        result_verbosity = ?ctx.cfg.presentation.default_verbosity,
+        result_max_changed_files = ctx.cfg.presentation.max_changed_files,
+        result_max_section_chars = ctx.cfg.presentation.max_section_chars,
+        result_debug_footer_on_success = ctx.cfg.presentation.include_debug_footer_on_success,
+        result_follow_up_hints = ctx.cfg.presentation.include_follow_up_hints,
+        result_path_truncation = ?ctx.cfg.presentation.path_truncation,
+        raw_log_dir = %ctx.cfg.presentation.raw_log_dir.display(),
         session_resume_enabled = ctx.cfg.session_resume.enabled,
         session_store_path = %ctx.cfg.session_resume.store_path.display(),
         session_max_bindings = ctx.cfg.session_resume.max_bindings,
@@ -1730,6 +2134,33 @@ impl ServeResolvedConfig {
                 .unwrap_or(3600)
                 .clamp(512, 3900),
             flush_on_milestones: raw.streaming.flush_on_milestones.unwrap_or(true),
+        };
+
+        let presentation = TelegramPresentationConfig {
+            default_verbosity: raw
+                .presentation
+                .default_verbosity
+                .unwrap_or(TelegramResultVerbosity::Compact),
+            max_changed_files: raw.presentation.max_changed_files.unwrap_or(5).clamp(1, 25),
+            max_section_chars: raw
+                .presentation
+                .max_section_chars
+                .unwrap_or(500)
+                .clamp(120, 1800),
+            include_debug_footer_on_success: raw
+                .presentation
+                .include_debug_footer_on_success
+                .unwrap_or(false),
+            include_follow_up_hints: raw.presentation.include_follow_up_hints.unwrap_or(true),
+            path_truncation: raw
+                .presentation
+                .path_truncation
+                .unwrap_or(TelegramPathTruncation::Left),
+            raw_log_dir: match raw.presentation.raw_log_dir {
+                Some(path) if path.is_absolute() => path,
+                Some(path) => cwd.join(path),
+                None => cwd.join(".velor/serve-run-logs"),
+            },
         };
 
         let media_dir = match raw.media_dir {
@@ -1888,6 +2319,7 @@ impl ServeResolvedConfig {
             max_requests_per_minute,
             max_concurrent_tasks,
             streaming,
+            presentation,
             media_dir,
             attachment_policy,
             session_resume,
@@ -2021,8 +2453,8 @@ fn default_runner_profiles() -> BTreeMap<String, RunnerProfileRaw> {
             supports_session_resume: Some(true),
             codex: CodexProfileRaw {
                 full_auto: Some(true),
-                sandbox: Some("workspace-write".to_string()),
-                skip_git_repo_check: Some(false),
+                sandbox: Some("danger-full-access".to_string()),
+                skip_git_repo_check: Some(true),
                 progress_cursor: Some(false),
                 reasoning_effort: Some(CodexReasoningEffort::Xhigh),
                 profile: None,
@@ -2046,8 +2478,8 @@ fn default_runner_profiles() -> BTreeMap<String, RunnerProfileRaw> {
             supports_session_resume: Some(true),
             codex: CodexProfileRaw {
                 full_auto: Some(true),
-                sandbox: Some("workspace-write".to_string()),
-                skip_git_repo_check: Some(false),
+                sandbox: Some("danger-full-access".to_string()),
+                skip_git_repo_check: Some(true),
                 progress_cursor: Some(false),
                 reasoning_effort: None,
                 profile: None,
@@ -2202,7 +2634,44 @@ async fn handle_update(ctx: Arc<ServeContext>, update: Update) -> color_eyre::ey
         return Ok(());
     }
 
-    let resume_binding = lookup_reply_session_binding(&ctx, &inbound).await;
+    let mut resume_binding = lookup_reply_session_binding(&ctx, &inbound).await;
+    if resume_binding.is_none()
+        && inbound.replied_to_is_bot_message
+        && inbound.replied_to_message_id.is_some()
+    {
+        match interrupt_active_run_for_reply(&ctx, &inbound).await {
+            ActiveRunReplyResolution::Interrupted(interrupted) => {
+                info!(
+                    chat_id = inbound.chat_id,
+                    message_id = inbound.message_id,
+                    replied_to_message_id = inbound.replied_to_message_id,
+                    interrupted_request_id = %interrupted.interrupted_request_id,
+                    resumed_runner = %interrupted.binding.runner_name,
+                    resumed_session_id = %interrupted.binding.session.session_id(),
+                    "Interrupted active Telegram run and converted reply into session continuation"
+                );
+                resume_binding = Some(interrupted.binding);
+            }
+            ActiveRunReplyResolution::MissingSession {
+                request_id,
+                runner_name,
+            } => {
+                let _ = send_telegram_message(
+                    &ctx.bot,
+                    ctx.parse_mode,
+                    inbound.chat_id,
+                    Some(inbound.message_id),
+                    &format!(
+                        "The active `{runner_name}` run (`{request_id}`) is not resumable yet. Retry in a few seconds, or start a new request with a model prefix."
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+            ActiveRunReplyResolution::NotFound => {}
+        }
+    }
+
     let route = route_inbound(&ctx.cfg.routing, &inbound, resume_binding.as_ref());
 
     if matches!(
@@ -2256,7 +2725,7 @@ async fn handle_update(ctx: Arc<ServeContext>, update: Update) -> color_eyre::ey
                 }
             }
 
-            if !ctx.cfg.runners.contains_key(&execution.runner_name) {
+            let Some(profile) = ctx.cfg.runners.get(&execution.runner_name).cloned() else {
                 let _ = send_telegram_message(
                     &ctx.bot,
                     ctx.parse_mode,
@@ -2269,14 +2738,53 @@ async fn handle_update(ctx: Arc<ServeContext>, update: Update) -> color_eyre::ey
                 )
                 .await;
                 return Ok(());
-            }
+            };
 
             let request = build_execution_request(&inbound, execution);
-            tokio::task::spawn_local(async move {
-                if let Err(err) = process_execution_request(ctx, request).await {
+            let request_id = request.request_id.clone();
+            let initial_session = request
+                .mode
+                .resume_binding()
+                .map(|binding| binding.session.clone());
+            let invocation = RunnerInvocationMetadata {
+                binary: profile.binary.clone(),
+                permission_mode: profile.permission_mode.clone(),
+                model: profile.model.clone(),
+                codex_profile: profile.codex.profile.clone(),
+                codex_reasoning_effort: profile.codex.reasoning_effort,
+            };
+
+            let ctx_for_task = Arc::clone(&ctx);
+            let request_for_task = request.clone();
+            let request_id_for_task = request_id.clone();
+            let task = tokio::task::spawn_local(async move {
+                let result =
+                    process_execution_request(Arc::clone(&ctx_for_task), request_for_task).await;
+                {
+                    let mut active = ctx_for_task.active_runs.lock().await;
+                    active.remove_request(&request_id_for_task);
+                }
+                if let Err(err) = result {
                     error!(error = %err, "Failed to process Telegram execution request");
                 }
             });
+            let abort_handle = task.abort_handle();
+
+            {
+                let mut active = ctx.active_runs.lock().await;
+                active.register(ActiveRunEntry {
+                    request_id,
+                    chat_id: inbound.chat_id,
+                    runner_name: profile.name.clone(),
+                    runner_kind: profile.kind,
+                    source_user_message_id: Some(inbound.message_id),
+                    invocation,
+                    session: initial_session,
+                    message_ids: HashSet::new(),
+                    abort_handle,
+                    started_at: Utc::now(),
+                });
+            }
             Ok(())
         }
     }
@@ -2317,6 +2825,17 @@ async fn lookup_reply_session_binding(
     }
 
     binding
+}
+
+async fn interrupt_active_run_for_reply(
+    ctx: &ServeContext,
+    inbound: &InboundMessage,
+) -> ActiveRunReplyResolution {
+    let Some(replied_to_message_id) = inbound.replied_to_message_id else {
+        return ActiveRunReplyResolution::NotFound;
+    };
+    let mut active = ctx.active_runs.lock().await;
+    active.interrupt_for_reply(inbound.chat_id, replied_to_message_id)
 }
 
 async fn react_with_random_emoji(
@@ -2405,6 +2924,9 @@ async fn process_execution_request(
         .clone();
 
     let _resume_session_guard = acquire_resume_session_guard(&ctx, &request).await?;
+    let request_prompt = request.prompt.clone();
+    let mut collector = ExecutionResultCollector::default();
+    let before_git = capture_git_snapshot(&ctx.cwd);
 
     info!(
         request_id = %request.request_id,
@@ -2421,138 +2943,176 @@ async fn process_execution_request(
     );
 
     let mut presenter = TelegramRunPresenter::new(&ctx, &request, &profile).await?;
-    presenter
-        .ingest(RunnerProgressEvent::Milestone(format!(
+    sync_active_run_messages(&ctx, &request.request_id, presenter.sent_message_ids()).await;
+    if let Some(binding) = request.mode.resume_binding() {
+        sync_active_run_session(&ctx, &request.request_id, binding.session.clone()).await;
+    }
+    let mut synced_message_count = presenter.sent_message_ids().len();
+    ingest_presenter_event(
+        &mut presenter,
+        &mut collector,
+        RunnerProgressEvent::Milestone(format!(
             "accepted request (streaming={} attachments={})",
             profile.supports_streaming, profile.supports_attachments
-        )))
-        .await;
+        )),
+    )
+    .await;
 
+    let mut run_outcome: Option<RunOutcome> = None;
+    let mut terminal_error: Option<color_eyre::eyre::Report> = None;
     if let Err(err) = validate_resume_request(&request, &profile) {
         let detail = truncate_for_telegram(&err.to_string(), 280);
-        presenter
-            .ingest(RunnerProgressEvent::Error(detail.clone()))
-            .await;
-        let _ = presenter
-            .finalize(
-                RunTerminalState::Failed,
-                format!("resume validation failed: {detail}"),
-            )
-            .await;
-        return Err(err);
+        ingest_presenter_event(
+            &mut presenter,
+            &mut collector,
+            RunnerProgressEvent::Error(detail.clone()),
+        )
+        .await;
+        run_outcome = Some(RunOutcome::Failed(format!(
+            "resume validation failed: {detail}"
+        )));
+        terminal_error = Some(err);
     }
 
     let mut downloaded = Vec::new();
-    for attachment in &request.attachment_refs {
-        match download_attachment(&ctx, &request.request_id, &attachment).await {
-            Ok(file) => {
-                presenter
-                    .ingest(RunnerProgressEvent::Milestone(format!(
-                        "downloaded {} {} bytes mime={}",
-                        attachment.kind.label(),
-                        file.file_size,
-                        file.mime_type
-                    )))
-                    .await;
-                downloaded.push(file);
-            }
-            Err(err) => {
-                presenter
-                    .ingest(RunnerProgressEvent::Error(format!(
-                        "attachment handling failed: {}",
-                        err
-                    )))
-                    .await;
-                let _ = presenter
-                    .finalize(
-                        RunTerminalState::Failed,
-                        "failed during attachment handling".to_string(),
+    if run_outcome.is_none() {
+        for attachment in &request.attachment_refs {
+            match download_attachment(&ctx, &request.request_id, attachment).await {
+                Ok(file) => {
+                    ingest_presenter_event(
+                        &mut presenter,
+                        &mut collector,
+                        RunnerProgressEvent::Milestone(format!(
+                            "downloaded {} {} bytes mime={}",
+                            attachment.kind.label(),
+                            file.file_size,
+                            file.mime_type
+                        )),
                     )
                     .await;
-                return Err(err);
+                    downloaded.push(file);
+                }
+                Err(err) => {
+                    let detail = format!("attachment handling failed: {err}");
+                    ingest_presenter_event(
+                        &mut presenter,
+                        &mut collector,
+                        RunnerProgressEvent::Error(detail.clone()),
+                    )
+                    .await;
+                    run_outcome = Some(RunOutcome::Failed(detail));
+                    terminal_error = Some(err);
+                    break;
+                }
             }
         }
     }
 
     request.attachments = downloaded.clone();
     request.prompt = build_prompt_with_attachments(&request.prompt, &request.attachments);
-
-    if !request.attachments.is_empty() && !profile.supports_attachments {
-        presenter
-            .ingest(RunnerProgressEvent::Milestone(format!(
+    if run_outcome.is_none() && !request.attachments.is_empty() && !profile.supports_attachments {
+        ingest_presenter_event(
+            &mut presenter,
+            &mut collector,
+            RunnerProgressEvent::Milestone(format!(
                 "runner {} receives attachments as metadata/path context",
                 request.runner_name
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
 
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::unbounded_channel::<RunnerProgressEvent>();
-
-    let req_for_runner = request.clone();
-    let profile_for_runner = profile.clone();
-    let defaults = ctx.defaults.clone();
-    let exec_cwd = ctx.cwd.clone();
-
-    let mut runner_task = tokio::task::spawn_local(async move {
-        let runner = ProcessExecutionRunner;
-        let mut progress_cb = |event: RunnerProgressEvent| {
-            let _ = progress_tx.send(event);
-        };
-        let run_fut = runner.run(
-            &req_for_runner,
-            &profile_for_runner,
-            &defaults,
-            &exec_cwd,
-            &mut progress_cb,
-        );
-        tokio::time::timeout(profile_for_runner.timeout, run_fut).await
-    });
-
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut discovered_session: Option<RunnerSessionHandle> = request
         .mode
         .resume_binding()
         .map(|binding| binding.session.clone());
 
-    let run_outcome: RunOutcome = loop {
-        tokio::select! {
-            maybe_event = progress_rx.recv() => {
-                if let Some(event) = maybe_event {
-                    if let RunnerProgressEvent::SessionBound { session } = &event {
-                        discovered_session = Some(session.clone());
-                    }
-                    presenter.ingest(event).await;
-                }
-            }
-            _ = ticker.tick() => {
-                presenter.tick().await;
-            }
-            join_result = &mut runner_task => {
-                break match join_result {
-                    Ok(Ok(Ok(execution))) => RunOutcome::Completed(execution),
-                    Ok(Ok(Err(err))) => RunOutcome::Failed(err.to_string()),
-                    Ok(Err(_)) => RunOutcome::TimedOut,
-                    Err(err) => {
-                        if err.is_cancelled() {
-                            RunOutcome::Cancelled("runner task cancelled".to_string())
-                        } else {
-                            RunOutcome::Failed(format!("runner task join failure: {}", err))
+    let run_outcome = if let Some(preflight) = run_outcome {
+        preflight
+    } else {
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<RunnerProgressEvent>();
+
+        let req_for_runner = request.clone();
+        let profile_for_runner = profile.clone();
+        let defaults = ctx.defaults.clone();
+        let exec_cwd = ctx.cwd.clone();
+
+        let mut runner_task = tokio::task::spawn_local(async move {
+            let runner = ProcessExecutionRunner;
+            let mut progress_cb = |event: RunnerProgressEvent| {
+                let _ = progress_tx.send(event);
+            };
+            let run_fut = runner.run(
+                &req_for_runner,
+                &profile_for_runner,
+                &defaults,
+                &exec_cwd,
+                &mut progress_cb,
+            );
+            tokio::time::timeout(profile_for_runner.timeout, run_fut).await
+        });
+
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let outcome: RunOutcome = loop {
+            tokio::select! {
+                maybe_event = progress_rx.recv() => {
+                    if let Some(event) = maybe_event {
+                        if let RunnerProgressEvent::SessionBound { session } = &event {
+                            discovered_session = Some(session.clone());
+                            sync_active_run_session(&ctx, &request.request_id, session.clone()).await;
+                        }
+                        ingest_presenter_event(&mut presenter, &mut collector, event).await;
+                        if presenter.sent_message_ids().len() > synced_message_count {
+                            sync_active_run_messages(&ctx, &request.request_id, presenter.sent_message_ids()).await;
+                            synced_message_count = presenter.sent_message_ids().len();
                         }
                     }
-                };
+                }
+                _ = ticker.tick() => {
+                    presenter.tick().await;
+                    if presenter.sent_message_ids().len() > synced_message_count {
+                        sync_active_run_messages(&ctx, &request.request_id, presenter.sent_message_ids()).await;
+                        synced_message_count = presenter.sent_message_ids().len();
+                    }
+                }
+                join_result = &mut runner_task => {
+                    break match join_result {
+                        Ok(Ok(Ok(execution))) => RunOutcome::Completed(execution),
+                        Ok(Ok(Err(err))) => RunOutcome::Failed(err.to_string()),
+                        Ok(Err(_)) => RunOutcome::TimedOut,
+                        Err(err) => {
+                            if err.is_cancelled() {
+                                RunOutcome::Cancelled("runner task cancelled".to_string())
+                            } else {
+                                RunOutcome::Failed(format!("runner task join failure: {}", err))
+                            }
+                        }
+                    };
+                }
+            }
+        };
+
+        while let Ok(event) = progress_rx.try_recv() {
+            ingest_presenter_event(&mut presenter, &mut collector, event).await;
+            if presenter.sent_message_ids().len() > synced_message_count {
+                sync_active_run_messages(&ctx, &request.request_id, presenter.sent_message_ids())
+                    .await;
+                synced_message_count = presenter.sent_message_ids().len();
             }
         }
+        outcome
     };
 
-    while let Ok(event) = progress_rx.try_recv() {
-        presenter.ingest(event).await;
-    }
-
     let elapsed = Utc::now() - request.received_at;
-    let elapsed_secs = elapsed.num_seconds().max(0);
-    match run_outcome {
+    let elapsed_secs = elapsed.num_seconds().max(0) as u64;
+    let after_git = capture_git_snapshot(&ctx.cwd);
+
+    let mut completed_execution: Option<RunnerExecution> = None;
+    let mut failure_reason: Option<String> = None;
+    let terminal_state = match run_outcome {
         RunOutcome::Completed(execution) => {
             info!(
                 request_id = %request.request_id,
@@ -2560,45 +3120,8 @@ async fn process_execution_request(
                 elapsed_secs,
                 "Runner execution completed"
             );
-            if presenter.renderer.output.trim().is_empty() {
-                let fallback = summarize_runner_output(
-                    &request.request_id,
-                    &execution.stdout,
-                    &execution.stderr,
-                );
-                presenter
-                    .ingest(RunnerProgressEvent::OutputDelta(fallback))
-                    .await;
-            }
-            presenter
-                .finalize(
-                    RunTerminalState::Completed,
-                    format!("completed in {}s", elapsed_secs),
-                )
-                .await?;
-
-            let session_to_persist = execution.session.or(discovered_session);
-            if ctx.cfg.session_resume.enabled
-                && let Some(session) = session_to_persist
-            {
-                let message_ids = presenter.sent_message_ids().to_vec();
-                if let Err(err) = persist_session_bindings_for_run(
-                    &ctx,
-                    &request,
-                    &profile,
-                    &session,
-                    &message_ids,
-                )
-                .await
-                {
-                    warn!(
-                        request_id = %request.request_id,
-                        runner = %request.runner_name,
-                        error = %err,
-                        "Failed to persist session bindings for Telegram continuation"
-                    );
-                }
-            }
+            completed_execution = Some(execution);
+            RunTerminalState::Completed
         }
         RunOutcome::Failed(error_text) => {
             warn!(
@@ -2607,39 +3130,31 @@ async fn process_execution_request(
                 error = %error_text,
                 "Runner execution failed"
             );
-            presenter
-                .ingest(RunnerProgressEvent::Error(error_text.clone()))
-                .await;
-            presenter
-                .finalize(
-                    RunTerminalState::Failed,
-                    format!(
-                        "failed after {}s: {}",
-                        elapsed_secs,
-                        truncate_for_telegram(&error_text, 400)
-                    ),
-                )
-                .await?;
+            ingest_presenter_event(
+                &mut presenter,
+                &mut collector,
+                RunnerProgressEvent::Error(error_text.clone()),
+            )
+            .await;
+            failure_reason = Some(error_text);
+            RunTerminalState::Failed
         }
         RunOutcome::TimedOut => {
+            let detail = format!("execution timed out at {}s", profile.timeout.as_secs());
             warn!(
                 request_id = %request.request_id,
                 runner = %request.runner_name,
                 timeout_secs = profile.timeout.as_secs(),
                 "Runner execution timed out"
             );
-            presenter
-                .ingest(RunnerProgressEvent::Error(format!(
-                    "execution timed out at {}s",
-                    profile.timeout.as_secs()
-                )))
-                .await;
-            presenter
-                .finalize(
-                    RunTerminalState::TimedOut,
-                    format!("timed out after {}s", profile.timeout.as_secs()),
-                )
-                .await?;
+            ingest_presenter_event(
+                &mut presenter,
+                &mut collector,
+                RunnerProgressEvent::Error(detail.clone()),
+            )
+            .await;
+            failure_reason = Some(detail);
+            RunTerminalState::TimedOut
         }
         RunOutcome::Cancelled(reason) => {
             warn!(
@@ -2648,15 +3163,118 @@ async fn process_execution_request(
                 reason = %reason,
                 "Runner execution cancelled"
             );
-            presenter
-                .ingest(RunnerProgressEvent::Error(reason.clone()))
-                .await;
-            presenter
-                .finalize(
-                    RunTerminalState::Cancelled,
-                    format!("cancelled after {}s", elapsed_secs),
-                )
-                .await?;
+            ingest_presenter_event(
+                &mut presenter,
+                &mut collector,
+                RunnerProgressEvent::Error(reason.clone()),
+            )
+            .await;
+            failure_reason = Some(reason);
+            RunTerminalState::Cancelled
+        }
+    };
+
+    let session_to_persist = completed_execution
+        .as_ref()
+        .and_then(|exec| exec.session.clone().or(discovered_session.clone()));
+    if let Some(session) = session_to_persist.clone() {
+        sync_active_run_session(&ctx, &request.request_id, session).await;
+    }
+    let stdout_text = completed_execution
+        .as_ref()
+        .map(|exec| exec.stdout.clone())
+        .unwrap_or_default();
+    let stderr_text = completed_execution
+        .as_ref()
+        .map(|exec| exec.stderr.clone())
+        .unwrap_or_default();
+
+    let mut summary = build_execution_result_summary(
+        &ctx.cfg.presentation,
+        &request,
+        &request_prompt,
+        &profile,
+        terminal_state,
+        elapsed_secs,
+        &collector,
+        &stdout_text,
+        &stderr_text,
+        failure_reason.as_deref(),
+        before_git.as_ref(),
+        after_git.as_ref(),
+    );
+
+    let raw_log_path =
+        execution_record_path(&ctx.cfg.presentation.raw_log_dir, &request.request_id);
+    let raw_log_path_display = raw_log_path.display().to_string();
+    summary
+        .diagnostics
+        .get_or_insert_with(ExecutionDiagnostics::default)
+        .raw_log_path = Some(raw_log_path_display.clone());
+
+    let persisted = PersistedExecutionRecord {
+        schema_version: 1,
+        request: summary.raw_request_metadata.clone(),
+        runner_description: profile.description.clone(),
+        terminal_state,
+        duration_secs: elapsed_secs,
+        prompt: request_prompt.clone(),
+        attachments: request
+            .attachments
+            .iter()
+            .map(|attachment| PersistedAttachmentRecord {
+                kind: attachment.kind.label(),
+                mime_type: attachment.mime_type.clone(),
+                size_bytes: attachment.file_size,
+                width: attachment.width,
+                height: attachment.height,
+                file_name: attachment.file_name.clone(),
+                path: attachment.path.display().to_string(),
+            })
+            .collect(),
+        progress_events: collector.events.clone(),
+        stdout: stdout_text.clone(),
+        stderr: stderr_text.clone(),
+        summary: summary.clone(),
+    };
+    if let Err(err) = persist_execution_record(&raw_log_path, &persisted).await {
+        warn!(
+            request_id = %request.request_id,
+            path = %raw_log_path.display(),
+            error = %err,
+            "Failed to persist raw execution record"
+        );
+    }
+
+    let rendered_final = render_execution_summary(
+        &summary,
+        ctx.cfg.presentation.default_verbosity,
+        &ctx.cfg.presentation,
+    );
+    presenter
+        .finalize(
+            terminal_state,
+            format!("{} in {}s", terminal_state.label(), elapsed_secs),
+            Some(rendered_final),
+        )
+        .await?;
+    if presenter.sent_message_ids().len() > synced_message_count {
+        sync_active_run_messages(&ctx, &request.request_id, presenter.sent_message_ids()).await;
+    }
+
+    if ctx.cfg.session_resume.enabled
+        && let Some(session) = session_to_persist
+    {
+        let message_ids = presenter.sent_message_ids().to_vec();
+        if let Err(err) =
+            persist_session_bindings_for_run(&ctx, &request, &profile, &session, &message_ids).await
+        {
+            warn!(
+                request_id = %request.request_id,
+                runner = %request.runner_name,
+                error = %err,
+                "Failed to persist session bindings for Telegram continuation"
+            );
         }
     }
 
@@ -2673,7 +3291,1045 @@ async fn process_execution_request(
         }
     }
 
+    if let Some(err) = terminal_error {
+        return Err(err);
+    }
+
     Ok(())
+}
+
+async fn ingest_presenter_event(
+    presenter: &mut TelegramRunPresenter,
+    collector: &mut ExecutionResultCollector,
+    event: RunnerProgressEvent,
+) {
+    collector.ingest(&event);
+    presenter.ingest(event).await;
+}
+
+async fn sync_active_run_messages(ctx: &ServeContext, request_id: &str, message_ids: &[i32]) {
+    let mut active = ctx.active_runs.lock().await;
+    active.sync_messages(request_id, message_ids);
+}
+
+async fn sync_active_run_session(
+    ctx: &ServeContext,
+    request_id: &str,
+    session: RunnerSessionHandle,
+) {
+    let mut active = ctx.active_runs.lock().await;
+    active.set_session(request_id, session);
+}
+
+fn build_execution_result_summary(
+    presentation: &TelegramPresentationConfig,
+    request: &ExecutionRequest,
+    request_prompt: &str,
+    profile: &RunnerProfile,
+    terminal_state: RunTerminalState,
+    duration_secs: u64,
+    collector: &ExecutionResultCollector,
+    stdout: &str,
+    stderr: &str,
+    failure_reason: Option<&str>,
+    before_git: Option<&GitSnapshot>,
+    after_git: Option<&GitSnapshot>,
+) -> ExecutionResultSummary {
+    let mut changed_files = changed_files_from_git(before_git, after_git);
+    if changed_files.is_empty() {
+        changed_files = changed_files_from_activity(collector, stdout, stderr);
+    }
+    changed_files = dedupe_preserve_order(changed_files);
+
+    let verification_steps = dedupe_preserve_order(collector.verification_steps.clone());
+    let summary_status = ExecutionSummaryStatus::from(terminal_state);
+    let first_error = failure_reason.map(normalize_whitespace).or_else(|| {
+        collector
+            .errors
+            .first()
+            .map(|err| normalize_whitespace(err))
+    });
+    let stderr_preview = first_nonempty_line(stderr).map(|line| truncate_for_telegram(line, 220));
+
+    let mut high_level_summary = Vec::new();
+    if summary_status == ExecutionSummaryStatus::Completed {
+        high_level_summary.push(if changed_files.is_empty() {
+            "Completed with no detected repository file changes.".to_string()
+        } else {
+            format!("Updated {} file(s).", changed_files.len())
+        });
+        if !verification_steps.is_empty() {
+            high_level_summary.push(format!(
+                "Verification checks run: {}.",
+                verification_steps.len()
+            ));
+        }
+        if !request.attachments.is_empty() {
+            high_level_summary.push(format!(
+                "Processed {} attachment(s).",
+                request.attachments.len()
+            ));
+        }
+    } else {
+        if let Some(error) = first_error.as_deref() {
+            high_level_summary.push(format!(
+                "Run ended with: {}",
+                truncate_for_telegram(error, 180)
+            ));
+        }
+        if !changed_files.is_empty() {
+            high_level_summary.push(format!(
+                "{} file(s) were modified before completion.",
+                changed_files.len()
+            ));
+        }
+    }
+    if high_level_summary.is_empty() {
+        high_level_summary.push("Execution finished with limited telemetry.".to_string());
+    }
+
+    let tool_activity = semantic_tool_activity(collector, presentation.max_section_chars);
+    let notable_outputs = notable_output_lines(
+        stdout,
+        stderr,
+        &collector.output,
+        presentation.max_section_chars,
+        summary_status == ExecutionSummaryStatus::Completed,
+    );
+    let next_actions = next_actions_for_summary(
+        summary_status,
+        failure_reason,
+        &verification_steps,
+        &changed_files,
+        &profile.name,
+    );
+
+    let repo_name = after_git
+        .and_then(|snapshot| snapshot.repo_name.clone())
+        .or_else(|| before_git.and_then(|snapshot| snapshot.repo_name.clone()));
+    let branch = after_git
+        .and_then(|snapshot| snapshot.branch.clone())
+        .or_else(|| before_git.and_then(|snapshot| snapshot.branch.clone()));
+
+    ExecutionResultSummary {
+        title: derive_task_title(request_prompt),
+        final_status: summary_status,
+        runner_name: profile.name.clone(),
+        repo_name,
+        branch,
+        duration_secs,
+        high_level_summary: cap_lines(high_level_summary, 4),
+        tool_activity: cap_lines(tool_activity, 5),
+        changed_files,
+        verification_steps,
+        notable_outputs: cap_lines(notable_outputs, 5),
+        next_actions: cap_lines(next_actions, 4),
+        raw_request_metadata: ExecutionRawRequestMetadata {
+            request_id: request.request_id.clone(),
+            transport: request.source.transport.to_string(),
+            chat_id: request.source.chat_id,
+            user_id: request.source.user_id,
+            source_message_id: request.source.message_id,
+            update_id: request.source.update_id,
+            runner_name: request.runner_name.clone(),
+            runner_kind: profile.kind,
+            mode: if request.mode.resume_binding().is_some() {
+                "resume"
+            } else {
+                "new"
+            },
+            attachment_count: request.attachments.len(),
+            received_at: request.received_at,
+        },
+        diagnostics: if first_error.is_some() || stderr_preview.is_some() {
+            Some(ExecutionDiagnostics {
+                first_error,
+                stderr_preview,
+                raw_log_path: None,
+            })
+        } else {
+            None
+        },
+    }
+}
+
+fn render_execution_summary(
+    summary: &ExecutionResultSummary,
+    verbosity: TelegramResultVerbosity,
+    presentation: &TelegramPresentationConfig,
+) -> String {
+    match verbosity {
+        TelegramResultVerbosity::Compact => render_compact_summary(summary, presentation),
+        TelegramResultVerbosity::Standard => render_standard_summary(summary, presentation),
+        TelegramResultVerbosity::Verbose => render_verbose_summary(summary, presentation),
+        TelegramResultVerbosity::Raw => render_raw_summary(summary, presentation),
+    }
+}
+
+fn render_compact_summary(
+    summary: &ExecutionResultSummary,
+    presentation: &TelegramPresentationConfig,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} {}: {}",
+        summary.final_status.emoji(),
+        capitalize(summary.final_status.label()),
+        summary.title
+    ));
+    lines.push(render_metadata_line(summary));
+    lines.push(String::new());
+    lines.push("Summary".to_string());
+    push_section_lines(
+        &mut lines,
+        &summary.high_level_summary,
+        presentation.max_section_chars,
+        3,
+    );
+    lines.push(String::new());
+    lines.push(
+        if summary.final_status == ExecutionSummaryStatus::Completed {
+            "Changed".to_string()
+        } else {
+            "Changed before failure".to_string()
+        },
+    );
+    push_changed_files_section(
+        &mut lines,
+        &summary.changed_files,
+        presentation.max_changed_files,
+        56,
+        presentation.path_truncation,
+    );
+    lines.push(String::new());
+    if summary.final_status == ExecutionSummaryStatus::Completed {
+        lines.push("Result".to_string());
+        let result_lines = if summary.notable_outputs.is_empty() {
+            vec!["No additional textual output captured.".to_string()]
+        } else {
+            summary.notable_outputs.clone()
+        };
+        push_section_lines(&mut lines, &result_lines, presentation.max_section_chars, 3);
+    } else {
+        lines.push("Failure".to_string());
+        let failure = summary
+            .diagnostics
+            .as_ref()
+            .and_then(|diag| diag.first_error.clone())
+            .or_else(|| summary.high_level_summary.first().cloned())
+            .unwrap_or_else(|| "Execution failed without a detailed error.".to_string());
+        push_section_lines(&mut lines, &[failure], presentation.max_section_chars, 2);
+        lines.push("Likely cause".to_string());
+        push_section_lines(
+            &mut lines,
+            &[derive_likely_cause(summary)],
+            presentation.max_section_chars,
+            1,
+        );
+        lines.push("Next suggested action".to_string());
+        push_section_lines(
+            &mut lines,
+            &summary.next_actions,
+            presentation.max_section_chars,
+            2,
+        );
+    }
+
+    if presentation.include_follow_up_hints {
+        lines.push(String::new());
+        lines.push("Hints".to_string());
+        lines.push("- Reply `details` for full logs".to_string());
+        lines.push("- Reply `rerun` to retry".to_string());
+        lines.push("- Reply `diff` for changed files summary".to_string());
+    }
+
+    normalize_telegram_text(&lines.join("\n"))
+}
+
+fn render_standard_summary(
+    summary: &ExecutionResultSummary,
+    presentation: &TelegramPresentationConfig,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} {}: {}",
+        summary.final_status.emoji(),
+        capitalize(summary.final_status.label()),
+        summary.title
+    ));
+    lines.push(render_metadata_line(summary));
+    lines.push(String::new());
+    lines.push("Summary".to_string());
+    push_section_lines(
+        &mut lines,
+        &summary.high_level_summary,
+        presentation.max_section_chars,
+        4,
+    );
+    lines.push(String::new());
+    lines.push(
+        if summary.final_status == ExecutionSummaryStatus::Completed {
+            "Changed".to_string()
+        } else {
+            "Changed before failure".to_string()
+        },
+    );
+    push_changed_files_section(
+        &mut lines,
+        &summary.changed_files,
+        presentation.max_changed_files,
+        64,
+        presentation.path_truncation,
+    );
+    lines.push(String::new());
+    lines.push("Verification".to_string());
+    if summary.verification_steps.is_empty() {
+        lines.push("- none observed".to_string());
+    } else {
+        push_section_lines(
+            &mut lines,
+            &summary.verification_steps,
+            presentation.max_section_chars,
+            4,
+        );
+    }
+
+    lines.push(String::new());
+    if summary.final_status == ExecutionSummaryStatus::Completed {
+        lines.push("Result".to_string());
+        push_section_lines(
+            &mut lines,
+            &summary.notable_outputs,
+            presentation.max_section_chars,
+            4,
+        );
+    } else {
+        lines.push("Failure".to_string());
+        let failure = summary
+            .diagnostics
+            .as_ref()
+            .and_then(|diag| diag.first_error.clone())
+            .unwrap_or_else(|| "No detailed failure cause captured.".to_string());
+        push_section_lines(&mut lines, &[failure], presentation.max_section_chars, 2);
+        lines.push("Likely cause".to_string());
+        let cause = derive_likely_cause(summary);
+        push_section_lines(&mut lines, &[cause], presentation.max_section_chars, 2);
+        if !summary.next_actions.is_empty() {
+            lines.push("Next suggested action".to_string());
+            push_section_lines(
+                &mut lines,
+                &summary.next_actions,
+                presentation.max_section_chars,
+                2,
+            );
+        }
+    }
+
+    if should_include_debug_footer(summary, TelegramResultVerbosity::Standard, presentation) {
+        lines.push(String::new());
+        lines.push("Debug".to_string());
+        for line in debug_footer_lines(summary) {
+            lines.push(format!("- {line}"));
+        }
+    }
+
+    if presentation.include_follow_up_hints {
+        lines.push(String::new());
+        lines.push("Hints".to_string());
+        lines.push("- Reply `details` for full logs".to_string());
+        lines.push("- Reply `rerun` to retry".to_string());
+        lines.push("- Reply `diff` for changed files summary".to_string());
+    }
+
+    normalize_telegram_text(&lines.join("\n"))
+}
+
+fn render_verbose_summary(
+    summary: &ExecutionResultSummary,
+    presentation: &TelegramPresentationConfig,
+) -> String {
+    let mut lines = render_standard_summary(summary, presentation)
+        .split('\n')
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    lines.push(String::new());
+    lines.push("Actions".to_string());
+    if summary.tool_activity.is_empty() {
+        lines.push("- no tool activity captured".to_string());
+    } else {
+        push_section_lines(
+            &mut lines,
+            &summary.tool_activity,
+            presentation.max_section_chars,
+            5,
+        );
+    }
+    if should_include_debug_footer(summary, TelegramResultVerbosity::Verbose, presentation) {
+        if !lines.iter().any(|line| line == "Debug") {
+            lines.push(String::new());
+            lines.push("Debug".to_string());
+            for line in debug_footer_lines(summary) {
+                lines.push(format!("- {line}"));
+            }
+        }
+    }
+    normalize_telegram_text(&lines.join("\n"))
+}
+
+fn render_raw_summary(
+    summary: &ExecutionResultSummary,
+    presentation: &TelegramPresentationConfig,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} RAW {}: {}",
+        summary.final_status.emoji(),
+        capitalize(summary.final_status.label()),
+        summary.title
+    ));
+    lines.push(render_metadata_line(summary));
+    lines.push(String::new());
+    lines.push("Summary".to_string());
+    push_section_lines(
+        &mut lines,
+        &summary.high_level_summary,
+        presentation.max_section_chars,
+        5,
+    );
+    lines.push(String::new());
+    lines.push("Actions".to_string());
+    push_section_lines(
+        &mut lines,
+        &summary.tool_activity,
+        presentation.max_section_chars,
+        8,
+    );
+    lines.push(String::new());
+    lines.push("Changed".to_string());
+    push_changed_files_section(
+        &mut lines,
+        &summary.changed_files,
+        presentation.max_changed_files.max(10),
+        76,
+        presentation.path_truncation,
+    );
+    lines.push(String::new());
+    lines.push("Verification".to_string());
+    push_section_lines(
+        &mut lines,
+        &summary.verification_steps,
+        presentation.max_section_chars,
+        8,
+    );
+    lines.push(String::new());
+    lines.push("Debug".to_string());
+    for line in debug_footer_lines(summary) {
+        lines.push(format!("- {line}"));
+    }
+    normalize_telegram_text(&lines.join("\n"))
+}
+
+fn render_metadata_line(summary: &ExecutionResultSummary) -> String {
+    let repo = summary
+        .repo_name
+        .clone()
+        .unwrap_or_else(|| "n/a".to_string());
+    let branch = summary.branch.clone().unwrap_or_else(|| "n/a".to_string());
+    format!(
+        "repo={} | branch={} | runner={} | duration={}s",
+        repo, branch, summary.runner_name, summary.duration_secs
+    )
+}
+
+fn should_include_debug_footer(
+    summary: &ExecutionResultSummary,
+    verbosity: TelegramResultVerbosity,
+    presentation: &TelegramPresentationConfig,
+) -> bool {
+    let success = summary.final_status == ExecutionSummaryStatus::Completed;
+    if matches!(
+        verbosity,
+        TelegramResultVerbosity::Verbose | TelegramResultVerbosity::Raw
+    ) {
+        return true;
+    }
+    if matches!(verbosity, TelegramResultVerbosity::Standard) {
+        return true;
+    }
+    if success {
+        return presentation.include_debug_footer_on_success;
+    }
+    true
+}
+
+fn debug_footer_lines(summary: &ExecutionResultSummary) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "request_id={}",
+        summary.raw_request_metadata.request_id
+    ));
+    lines.push(format!(
+        "mode={} transport={} update_id={} chat_id={}",
+        summary.raw_request_metadata.mode,
+        summary.raw_request_metadata.transport,
+        summary.raw_request_metadata.update_id,
+        summary.raw_request_metadata.chat_id
+    ));
+    if let Some(diag) = &summary.diagnostics {
+        if let Some(err) = &diag.first_error {
+            lines.push(format!("error={}", truncate_for_telegram(err, 200)));
+        }
+        if let Some(stderr) = &diag.stderr_preview {
+            lines.push(format!("stderr={}", truncate_for_telegram(stderr, 200)));
+        }
+        if let Some(path) = &diag.raw_log_path {
+            lines.push(format!("raw_log={path}"));
+        }
+    }
+    lines
+}
+
+fn derive_task_title(prompt: &str) -> String {
+    let first_line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("telegram task");
+    truncate_for_telegram(first_line, 72)
+}
+
+fn semantic_tool_activity(
+    collector: &ExecutionResultCollector,
+    max_section_chars: usize,
+) -> Vec<String> {
+    let mut reads = 0usize;
+    let mut writes = 0usize;
+    let mut verifications = 0usize;
+    let mut unique_commands = BTreeSet::new();
+
+    for command in &collector.tool_commands {
+        let normalized = normalize_whitespace(command);
+        if normalized.is_empty() {
+            continue;
+        }
+        unique_commands.insert(truncate_for_telegram(&normalized, 100));
+        if is_read_command(&normalized) {
+            reads += 1;
+        }
+        if is_write_command(&normalized) {
+            writes += 1;
+        }
+        if is_verification_command(&normalized) {
+            verifications += 1;
+        }
+    }
+
+    let mut lines = Vec::new();
+    if reads > 0 {
+        lines.push(format!(
+            "Analysed code/resources through {} read action(s).",
+            reads
+        ));
+    }
+    if writes > 0 {
+        lines.push(format!("Applied {} write/edit action(s).", writes));
+    }
+    if verifications > 0 {
+        lines.push(format!(
+            "Ran {} verification-oriented command(s).",
+            verifications
+        ));
+    }
+    for command in unique_commands.into_iter().take(3) {
+        lines.push(format!(
+            "Observed command: {}",
+            truncate_for_telegram(&command, max_section_chars.min(140))
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("No structured tool actions were captured.".to_string());
+    }
+    lines
+}
+
+fn notable_output_lines(
+    stdout: &str,
+    stderr: &str,
+    collector_output: &str,
+    max_section_chars: usize,
+    prefer_stdout: bool,
+) -> Vec<String> {
+    let primary = if prefer_stdout {
+        if !stdout.trim().is_empty() {
+            stdout
+        } else {
+            collector_output
+        }
+    } else if !stderr.trim().is_empty() {
+        stderr
+    } else if !stdout.trim().is_empty() {
+        stdout
+    } else {
+        collector_output
+    };
+
+    let mut out = Vec::new();
+    for line in primary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let normalized = normalize_whitespace(line);
+        if normalized.starts_with('{') && normalized.ends_with('}') {
+            continue;
+        }
+        out.push(truncate_for_telegram(
+            &normalized,
+            max_section_chars.min(220),
+        ));
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push("No concise textual summary was emitted by the runner.".to_string());
+    }
+    out
+}
+
+fn next_actions_for_summary(
+    status: ExecutionSummaryStatus,
+    failure_reason: Option<&str>,
+    verification_steps: &[String],
+    changed_files: &[String],
+    runner_name: &str,
+) -> Vec<String> {
+    if status == ExecutionSummaryStatus::Completed {
+        if verification_steps.is_empty() && !changed_files.is_empty() {
+            return vec!["Run local verification to confirm the changed files.".to_string()];
+        }
+        return vec!["Reply `details` for the full execution record if needed.".to_string()];
+    }
+
+    let cause = failure_reason.unwrap_or("");
+    let mut next = Vec::new();
+    if cause.to_ascii_lowercase().contains("timed out") {
+        next.push(format!(
+            "Increase timeout for `{runner_name}` or send a narrower prompt."
+        ));
+    } else if cause.to_ascii_lowercase().contains("not found") {
+        next.push("Check runner binary availability and PATH configuration.".to_string());
+    } else if cause.to_ascii_lowercase().contains("permission") {
+        next.push("Review permissions/sandbox settings, then rerun.".to_string());
+    } else {
+        next.push("Reply `rerun` with a refined prompt.".to_string());
+    }
+    next.push("Reply `details` to inspect full raw logs.".to_string());
+    next
+}
+
+fn derive_likely_cause(summary: &ExecutionResultSummary) -> String {
+    let message = summary
+        .diagnostics
+        .as_ref()
+        .and_then(|diag| diag.first_error.clone())
+        .unwrap_or_else(|| "No detailed error captured.".to_string())
+        .to_ascii_lowercase();
+
+    if message.contains("timed out") {
+        "Runner exceeded configured timeout.".to_string()
+    } else if message.contains("not found") {
+        "Runner executable could not be resolved.".to_string()
+    } else if message.contains("permission") {
+        "Permission/sandbox policy blocked execution.".to_string()
+    } else if message.contains("non-zero") {
+        "Runner command returned a non-zero exit.".to_string()
+    } else {
+        "Runner reported an execution error.".to_string()
+    }
+}
+
+fn push_section_lines(
+    out: &mut Vec<String>,
+    lines: &[String],
+    max_section_chars: usize,
+    max_lines: usize,
+) {
+    if lines.is_empty() {
+        out.push("- none".to_string());
+        return;
+    }
+
+    for line in lines.iter().take(max_lines) {
+        let normalized = normalize_whitespace(line);
+        out.push(format!(
+            "- {}",
+            truncate_for_telegram(&normalized, max_section_chars)
+        ));
+    }
+    if lines.len() > max_lines {
+        out.push(format!("- +{} more", lines.len() - max_lines));
+    }
+}
+
+fn push_changed_files_section(
+    out: &mut Vec<String>,
+    files: &[String],
+    max_files: usize,
+    display_width: usize,
+    truncation: TelegramPathTruncation,
+) {
+    if files.is_empty() {
+        out.push("- none".to_string());
+        return;
+    }
+    for file in files.iter().take(max_files) {
+        out.push(format!(
+            "- {}",
+            truncate_path(file, display_width, truncation)
+        ));
+    }
+    if files.len() > max_files {
+        out.push(format!("- +{} more", files.len() - max_files));
+    }
+}
+
+fn execution_record_path(base_dir: &Path, request_id: &str) -> PathBuf {
+    base_dir.join(format!("{}.json", sanitize_component(request_id)))
+}
+
+async fn persist_execution_record(
+    path: &Path,
+    record: &PersistedExecutionRecord,
+) -> color_eyre::eyre::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.wrap_err_with(|| {
+            format!("failed to create execution record dir {}", parent.display())
+        })?;
+    }
+
+    let payload =
+        serde_json::to_string_pretty(record).wrap_err("failed to serialize execution record")?;
+    let tmp = path.with_extension("tmp");
+    tokio::fs::write(&tmp, payload)
+        .await
+        .wrap_err_with(|| format!("failed to write temp execution record {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, path).await.wrap_err_with(|| {
+        format!(
+            "failed to replace execution record {} with {}",
+            path.display(),
+            tmp.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn changed_files_from_git(
+    before: Option<&GitSnapshot>,
+    after: Option<&GitSnapshot>,
+) -> Vec<String> {
+    let (Some(before), Some(after)) = (before, after) else {
+        return Vec::new();
+    };
+    if before.repo_root.is_none()
+        || after.repo_root.is_none()
+        || before.repo_root != after.repo_root
+    {
+        return Vec::new();
+    }
+
+    let mut paths = BTreeSet::new();
+    for (path, status) in &after.porcelain_status {
+        if before.porcelain_status.get(path) != Some(status) {
+            paths.insert(path.clone());
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn changed_files_from_activity(
+    collector: &ExecutionResultCollector,
+    stdout: &str,
+    stderr: &str,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    for command in &collector.tool_commands {
+        if is_write_command(command) {
+            files.extend(extract_paths_from_text(command));
+        }
+    }
+    if files.is_empty() {
+        files.extend(extract_paths_from_text(stdout));
+    }
+    if files.is_empty() {
+        files.extend(extract_paths_from_text(stderr));
+    }
+    dedupe_preserve_order(files)
+}
+
+fn capture_git_snapshot(cwd: &Path) -> Option<GitSnapshot> {
+    let repo_root_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !repo_root_output.status.success() {
+        return None;
+    }
+    let repo_root = String::from_utf8_lossy(&repo_root_output.stdout)
+        .trim()
+        .to_string();
+    if repo_root.is_empty() {
+        return None;
+    }
+    let repo_root_path = PathBuf::from(&repo_root);
+    let repo_name = repo_root_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string());
+
+    let branch_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok();
+    let branch = branch_output.and_then(|out| {
+        if out.status.success() {
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        } else {
+            None
+        }
+    });
+
+    let status_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .ok();
+    let porcelain_status = status_output
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).to_string())
+            } else {
+                None
+            }
+        })
+        .map(|raw| parse_porcelain_status(&raw))
+        .unwrap_or_default();
+
+    Some(GitSnapshot {
+        repo_root: Some(repo_root_path),
+        repo_name,
+        branch,
+        porcelain_status,
+    })
+}
+
+fn parse_porcelain_status(raw: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let status = line[0..2].to_string();
+        let mut path = line[3..].trim().to_string();
+        if let Some((_, to)) = path.split_once("->") {
+            path = to.trim().to_string();
+        }
+        if !path.is_empty() {
+            out.insert(path, status);
+        }
+    }
+    out
+}
+
+fn parse_tool_command_from_milestone(milestone: &str) -> Option<String> {
+    if let Some(rest) = milestone.strip_prefix("tool start: ") {
+        return Some(normalize_whitespace(rest));
+    }
+    if let Some(rest) = milestone.strip_prefix("tool result: ") {
+        let command = rest.split(" success=").next().unwrap_or(rest).trim();
+        if !command.is_empty() {
+            return Some(normalize_whitespace(command));
+        }
+    }
+    None
+}
+
+fn is_verification_command(command: &str) -> bool {
+    let cmd = command.to_ascii_lowercase();
+    [
+        "test",
+        "check",
+        "clippy",
+        "lint",
+        "pytest",
+        "cargo test",
+        "cargo check",
+        "just check",
+        "bun test",
+        "npm test",
+        "pnpm test",
+        "go test",
+        "ruff",
+        "vitest",
+    ]
+    .iter()
+    .any(|needle| cmd.contains(needle))
+}
+
+fn is_read_command(command: &str) -> bool {
+    let cmd = command.to_ascii_lowercase();
+    [
+        "cat ", "rg ", "ls ", "find ", "sed -n", "head ", "tail ", "grep ",
+    ]
+    .iter()
+    .any(|needle| cmd.contains(needle))
+}
+
+fn is_write_command(command: &str) -> bool {
+    let cmd = command.to_ascii_lowercase();
+    [
+        "apply_patch",
+        ">>",
+        " >",
+        "touch ",
+        "mkdir ",
+        "mv ",
+        "cp ",
+        "rm ",
+        "cargo fmt",
+        "gofmt",
+        "rustfmt",
+        "perl -pi",
+        "sed -i",
+    ]
+    .iter()
+    .any(|needle| cmd.contains(needle))
+}
+
+fn extract_paths_from_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in text.split_whitespace() {
+        let candidate = token
+            .trim_matches(|ch: char| "`\"'(),;[]{}".contains(ch))
+            .trim();
+        if candidate.len() < 2 || candidate.contains("://") || candidate.starts_with('-') {
+            continue;
+        }
+        let looks_like_path = candidate.contains('/')
+            || Path::new(candidate)
+                .extension()
+                .is_some_and(|ext| !ext.is_empty());
+        if !looks_like_path {
+            continue;
+        }
+        out.push(candidate.to_string());
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    dedupe_preserve_order(out)
+}
+
+fn dedupe_preserve_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if item.is_empty() {
+            continue;
+        }
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn first_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_limited(target: &mut String, fragment: &str, max_len: usize) {
+    target.push_str(fragment);
+    if target.len() <= max_len {
+        return;
+    }
+    let keep_start = target.floor_char_boundary(target.len().saturating_sub(max_len));
+    *target = target[keep_start..].to_string();
+}
+
+fn cap_lines(lines: Vec<String>, max_lines: usize) -> Vec<String> {
+    let total = lines.len();
+    if total <= max_lines {
+        return lines;
+    }
+    let mut capped = lines.into_iter().take(max_lines).collect::<Vec<_>>();
+    capped.push(format!("+{} more", total.saturating_sub(max_lines)));
+    capped
+}
+
+fn truncate_path(path: &str, max_len: usize, mode: TelegramPathTruncation) -> String {
+    if path.len() <= max_len {
+        return path.to_string();
+    }
+    match mode {
+        TelegramPathTruncation::Left => truncate_path_left(path, max_len),
+        TelegramPathTruncation::Middle => truncate_path_middle(path, max_len),
+    }
+}
+
+fn truncate_path_left(path: &str, max_len: usize) -> String {
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() <= 1 {
+        return truncate_for_telegram(path, max_len);
+    }
+    let mut kept = Vec::new();
+    let mut len = 1usize; // ellipsis
+    for part in parts.iter().rev() {
+        let next_len = len + part.len() + usize::from(!kept.is_empty());
+        if next_len > max_len.saturating_sub(2) {
+            break;
+        }
+        kept.push(*part);
+        len = next_len;
+    }
+    if kept.is_empty() {
+        return truncate_for_telegram(path, max_len);
+    }
+    kept.reverse();
+    format!("…/{}", kept.join("/"))
+}
+
+fn truncate_path_middle(path: &str, max_len: usize) -> String {
+    if max_len < 8 {
+        return truncate_for_telegram(path, max_len);
+    }
+    let left_len = (max_len / 2).saturating_sub(1);
+    let right_len = max_len.saturating_sub(left_len + 1);
+    let left_idx = path.floor_char_boundary(left_len.min(path.len()));
+    let right_start = path
+        .len()
+        .saturating_sub(right_len)
+        .max(left_idx)
+        .min(path.len());
+    let right_idx = path.floor_char_boundary(right_start);
+    format!("{}…{}", &path[..left_idx], &path[right_idx..])
+}
+
+fn capitalize(input: &str) -> String {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
 }
 
 fn validate_resume_request(
@@ -3221,6 +4877,13 @@ fn safe_update_id(raw: u32) -> i32 {
 }
 
 fn apply_reserved_runner_overrides(name: &str, profile: &mut RunnerProfile) {
+    if profile.kind == RunnerKind::Codex {
+        // Telegram Codex policy: always run with maximum permissiveness to avoid trust/sandbox blocks.
+        profile.codex.full_auto = Some(true);
+        profile.codex.sandbox = Some("danger-full-access".to_string());
+        profile.codex.skip_git_repo_check = Some(true);
+    }
+
     // Policy guardrail: keep GPT-5.3 Codex on extra-high reasoning for Telegram-triggered runs.
     if name == "codex-gpt-5-3-codex" && profile.kind == RunnerKind::Codex {
         profile.codex.reasoning_effort = Some(CodexReasoningEffort::Xhigh);
@@ -3287,6 +4950,12 @@ async fn run_codex_profile(
     if let Some(profile_name) = &profile.codex.profile {
         codex_cfg.profile = Some(profile_name.clone());
     }
+
+    // Telegram Codex policy: always maximize execution permissions.
+    codex_cfg.full_auto = true;
+    codex_cfg.sandbox = "danger-full-access".to_string();
+    codex_cfg.skip_git_repo_check = true;
+
     let reasoning_label = codex_cfg
         .model_reasoning_effort
         .map(CodexReasoningEffort::as_str)
@@ -3328,6 +4997,7 @@ async fn run_codex_profile(
 
     let mut cmd = Command::new(&profile.binary);
     cmd.current_dir(cwd)
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3669,8 +5339,10 @@ async fn run_claude_like_profile(
 
     let mut cmd = Command::new(&profile.binary);
     cmd.current_dir(cwd)
+        .kill_on_drop(true)
         .arg("--permission-mode")
         .arg(&profile.permission_mode)
+        .arg(CLAUDE_SKIP_PERMISSIONS_FLAG)
         .arg("-p")
         .arg("--verbose")
         .arg("--input-format")
@@ -4074,23 +5746,6 @@ fn select_natural_split(prefix: &str) -> usize {
     hard_end
 }
 
-fn summarize_runner_output(request_id: &str, stdout: &str, stderr: &str) -> String {
-    let out = truncate_for_telegram(stdout, 3000);
-    let err = truncate_for_telegram(stderr, 700);
-
-    if out.is_empty() && err.is_empty() {
-        return format!("`{}` completed with no textual output.", request_id);
-    }
-
-    if err.is_empty() {
-        format!("`{}` completed.\n\n{}", request_id, out)
-    } else if out.is_empty() {
-        format!("`{}` completed with stderr only.\n\n{}", request_id, err)
-    } else {
-        format!("`{}` completed.\n\n{}\n\nstderr:\n{}", request_id, out, err)
-    }
-}
-
 fn build_prompt_with_attachments(prompt: &str, attachments: &[DownloadedAttachment]) -> String {
     if attachments.is_empty() {
         return prompt.to_string();
@@ -4274,6 +5929,73 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn test_presentation_config() -> TelegramPresentationConfig {
+        TelegramPresentationConfig {
+            default_verbosity: TelegramResultVerbosity::Compact,
+            max_changed_files: 5,
+            max_section_chars: 120,
+            include_debug_footer_on_success: false,
+            include_follow_up_hints: true,
+            path_truncation: TelegramPathTruncation::Left,
+            raw_log_dir: PathBuf::from("/tmp/velor-serve-run-logs"),
+        }
+    }
+
+    fn sample_summary(status: ExecutionSummaryStatus) -> ExecutionResultSummary {
+        ExecutionResultSummary {
+            title: "Refactor config loader".to_string(),
+            final_status: status,
+            runner_name: "codex-gpt-5-4".to_string(),
+            repo_name: Some("velor".to_string()),
+            branch: Some("main".to_string()),
+            duration_secs: 18,
+            high_level_summary: vec![
+                "Updated configuration merge logic.".to_string(),
+                "Kept backwards compatibility for legacy fields.".to_string(),
+            ],
+            tool_activity: vec![
+                "Analysed code/resources through 3 read action(s).".to_string(),
+                "Applied 2 write/edit action(s).".to_string(),
+            ],
+            changed_files: vec![
+                "apps/velor-cli/src/serve.rs".to_string(),
+                "docs/codex-telegram-server.md".to_string(),
+            ],
+            verification_steps: vec![
+                "cargo check -q -p velor-cli".to_string(),
+                "cargo test -q -p velor-cli".to_string(),
+            ],
+            notable_outputs: vec!["All checks passed.".to_string()],
+            next_actions: vec!["Reply `details` for full logs.".to_string()],
+            raw_request_metadata: ExecutionRawRequestMetadata {
+                request_id: "tg-1-123".to_string(),
+                transport: "telegram".to_string(),
+                chat_id: -100,
+                user_id: Some(1),
+                source_message_id: Some(222),
+                update_id: 1,
+                runner_name: "codex-gpt-5-4".to_string(),
+                runner_kind: RunnerKind::Codex,
+                mode: "new",
+                attachment_count: 0,
+                received_at: Utc::now(),
+            },
+            diagnostics: Some(ExecutionDiagnostics {
+                first_error: if status == ExecutionSummaryStatus::Completed {
+                    None
+                } else {
+                    Some("runner exited non-zero".to_string())
+                },
+                stderr_preview: if status == ExecutionSummaryStatus::Completed {
+                    None
+                } else {
+                    Some("stderr preview".to_string())
+                },
+                raw_log_path: Some("/tmp/velor-serve-run-logs/tg-1-123.json".to_string()),
+            }),
+        }
+    }
+
     #[test]
     fn replay_cache_rejects_duplicates() {
         let now = Instant::now();
@@ -4412,6 +6134,15 @@ mod tests {
                 max_message_chars: 3600,
                 flush_on_milestones: true,
             },
+            presentation: TelegramPresentationConfig {
+                default_verbosity: TelegramResultVerbosity::Compact,
+                max_changed_files: 5,
+                max_section_chars: 500,
+                include_debug_footer_on_success: false,
+                include_follow_up_hints: true,
+                path_truncation: TelegramPathTruncation::Left,
+                raw_log_dir: PathBuf::from("/tmp/velor-serve-run-logs"),
+            },
             media_dir: PathBuf::from("/tmp"),
             attachment_policy: ServeAttachmentPolicy {
                 enabled: true,
@@ -4491,7 +6222,11 @@ mod tests {
         let mut renderer = TelegramStreamRenderer::new("r1".to_string(), "codex".to_string());
         renderer.ingest_event(RunnerProgressEvent::Status("running".to_string()));
         renderer.ingest_event(RunnerProgressEvent::OutputDelta("hello".to_string()));
-        renderer.mark_terminal(RunTerminalState::Completed, "completed in 2s".to_string());
+        renderer.mark_terminal(
+            RunTerminalState::Completed,
+            "completed in 2s".to_string(),
+            None,
+        );
         let text = renderer.render(1, renderer.output_tail(0), false);
         assert!(
             text.contains("vel serve | completed"),
@@ -4500,6 +6235,194 @@ mod tests {
         assert!(
             text.contains("result: completed in 2s"),
             "terminal summary should be rendered"
+        );
+    }
+
+    #[test]
+    fn compact_success_render_is_scannable() {
+        let summary = sample_summary(ExecutionSummaryStatus::Completed);
+        let rendered = render_execution_summary(
+            &summary,
+            TelegramResultVerbosity::Compact,
+            &test_presentation_config(),
+        );
+        assert!(
+            rendered.contains("✅ Completed:"),
+            "missing success status line"
+        );
+        assert!(rendered.contains("Summary"), "missing Summary section");
+        assert!(rendered.contains("Changed"), "missing Changed section");
+        assert!(rendered.contains("Result"), "missing Result section");
+        assert!(
+            !rendered.contains("tool start:"),
+            "compact output should not dump raw tool traces"
+        );
+    }
+
+    #[test]
+    fn standard_failure_render_includes_failure_sections() {
+        let summary = sample_summary(ExecutionSummaryStatus::Failed);
+        let rendered = render_execution_summary(
+            &summary,
+            TelegramResultVerbosity::Standard,
+            &test_presentation_config(),
+        );
+        assert!(
+            rendered.contains("❌ Failed:"),
+            "missing failure status line"
+        );
+        assert!(rendered.contains("Failure"), "missing Failure section");
+        assert!(rendered.contains("Likely cause"), "missing likely cause");
+        assert!(
+            rendered.contains("Changed before failure"),
+            "missing changed-before-failure section"
+        );
+        assert!(
+            rendered.contains("Next suggested action"),
+            "missing next action section"
+        );
+    }
+
+    #[test]
+    fn section_truncation_and_more_aggregation_work() {
+        let mut summary = sample_summary(ExecutionSummaryStatus::Completed);
+        summary.changed_files = vec![
+            "a/one.rs".to_string(),
+            "a/two.rs".to_string(),
+            "a/three.rs".to_string(),
+            "a/four.rs".to_string(),
+            "a/five.rs".to_string(),
+            "a/six.rs".to_string(),
+        ];
+        let mut cfg = test_presentation_config();
+        cfg.max_changed_files = 3;
+        let rendered = render_execution_summary(&summary, TelegramResultVerbosity::Compact, &cfg);
+        assert!(rendered.contains("+3 more"), "expected +N aggregation");
+    }
+
+    #[test]
+    fn section_length_limit_truncates_long_lines() {
+        let mut summary = sample_summary(ExecutionSummaryStatus::Completed);
+        summary.high_level_summary = vec!["x".repeat(260)];
+        let mut cfg = test_presentation_config();
+        cfg.max_section_chars = 40;
+        let rendered = render_execution_summary(&summary, TelegramResultVerbosity::Compact, &cfg);
+        assert!(
+            rendered.contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"),
+            "long summary line should be truncated"
+        );
+    }
+
+    #[test]
+    fn empty_sections_render_gracefully() {
+        let mut summary = sample_summary(ExecutionSummaryStatus::Completed);
+        summary.changed_files.clear();
+        summary.verification_steps.clear();
+        summary.notable_outputs.clear();
+        let rendered = render_execution_summary(
+            &summary,
+            TelegramResultVerbosity::Standard,
+            &test_presentation_config(),
+        );
+        assert!(
+            rendered.contains("- none"),
+            "empty sections should render with explicit none marker"
+        );
+    }
+
+    #[test]
+    fn markdown_escape_still_handles_rendered_summary() {
+        let mut summary = sample_summary(ExecutionSummaryStatus::Completed);
+        summary.title = "Fix a_b*(c)".to_string();
+        let rendered = render_execution_summary(
+            &summary,
+            TelegramResultVerbosity::Compact,
+            &test_presentation_config(),
+        );
+        let (escaped, mode) =
+            format_outbound_message(&rendered, Some(TelegramParseMode::MarkdownV2));
+        assert!(mode.is_some(), "markdown parse mode should be set");
+        assert!(
+            escaped.contains("\\_") && escaped.contains("\\*"),
+            "markdown output should be escaped"
+        );
+    }
+
+    #[test]
+    fn formatting_schema_is_stable_across_runner_names() {
+        let mut codex = sample_summary(ExecutionSummaryStatus::Completed);
+        codex.runner_name = "codex-gpt-5-4".to_string();
+        let mut claude = sample_summary(ExecutionSummaryStatus::Completed);
+        claude.runner_name = "claude-sonnet-4-6".to_string();
+        let codex_render = render_execution_summary(
+            &codex,
+            TelegramResultVerbosity::Compact,
+            &test_presentation_config(),
+        );
+        let claude_render = render_execution_summary(
+            &claude,
+            TelegramResultVerbosity::Compact,
+            &test_presentation_config(),
+        );
+        for header in ["Summary", "Changed", "Result"] {
+            assert!(
+                codex_render.contains(header) && claude_render.contains(header),
+                "section {header} should be stable across runners"
+            );
+        }
+    }
+
+    #[test]
+    fn long_path_truncation_preserves_tail() {
+        let long = "/Users/liam/git/velor/apps/velor-cli/src/server/telegram/presenter.rs";
+        let truncated = truncate_path(long, 32, TelegramPathTruncation::Left);
+        assert!(truncated.starts_with('…'), "should truncate from left");
+        assert!(
+            truncated.ends_with("telegram/presenter.rs"),
+            "tail should remain visible"
+        );
+    }
+
+    #[test]
+    fn persisted_execution_record_serializes() {
+        let record = PersistedExecutionRecord {
+            schema_version: 1,
+            request: ExecutionRawRequestMetadata {
+                request_id: "req-1".to_string(),
+                transport: "telegram".to_string(),
+                chat_id: -100,
+                user_id: Some(1),
+                source_message_id: Some(10),
+                update_id: 42,
+                runner_name: "codex-gpt-5-4".to_string(),
+                runner_kind: RunnerKind::Codex,
+                mode: "new",
+                attachment_count: 0,
+                received_at: Utc::now(),
+            },
+            runner_description: "test".to_string(),
+            terminal_state: RunTerminalState::Completed,
+            duration_secs: 1,
+            prompt: "hello".to_string(),
+            attachments: Vec::new(),
+            progress_events: vec![RunnerProgressEventRecord {
+                at: Utc::now(),
+                event: RunnerProgressEvent::SessionBound {
+                    session: RunnerSessionHandle::Codex {
+                        session_id: "thread-1".to_string(),
+                    },
+                },
+            }],
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            summary: sample_summary(ExecutionSummaryStatus::Completed),
+        };
+
+        let serialized =
+            serde_json::to_string(&record).expect("persisted execution record should serialize");
+        assert!(
+            serialized.contains("session_bound"),
+            "serialized payload should include progress event enum tag"
         );
     }
 
@@ -4555,6 +6478,17 @@ mod tests {
         assert_eq!(
             profile.codex.reasoning_effort,
             Some(CodexReasoningEffort::Xhigh)
+        );
+        assert_eq!(profile.codex.full_auto, Some(true));
+        assert_eq!(
+            profile.codex.sandbox.as_deref(),
+            Some("danger-full-access"),
+            "codex should always run with maximum sandbox permissions in serve mode"
+        );
+        assert_eq!(
+            profile.codex.skip_git_repo_check,
+            Some(true),
+            "codex should always skip git trust checks in serve mode"
         );
     }
 
@@ -4801,6 +6735,93 @@ mod tests {
             }
             _ => panic!("expected usage for missing reply mapping"),
         }
+    }
+
+    #[tokio::test]
+    async fn active_run_registry_interrupts_reply_and_returns_binding() {
+        let mut registry = ActiveRunRegistry::default();
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let abort_handle = task.abort_handle();
+        let started_at = Utc::now();
+
+        registry.register(ActiveRunEntry {
+            request_id: "active-1".to_string(),
+            chat_id: -100,
+            runner_name: "codex-gpt-5-4".to_string(),
+            runner_kind: RunnerKind::Codex,
+            source_user_message_id: Some(10),
+            invocation: RunnerInvocationMetadata {
+                binary: "codex".to_string(),
+                permission_mode: "acceptEdits".to_string(),
+                model: Some("gpt-5.4".to_string()),
+                codex_profile: None,
+                codex_reasoning_effort: None,
+            },
+            session: Some(RunnerSessionHandle::Codex {
+                session_id: "thread-9".to_string(),
+            }),
+            message_ids: HashSet::new(),
+            abort_handle,
+            started_at,
+        });
+        registry.sync_messages("active-1", &[222]);
+
+        match registry.interrupt_for_reply(-100, 222) {
+            ActiveRunReplyResolution::Interrupted(interrupted) => {
+                assert_eq!(interrupted.interrupted_request_id, "active-1");
+                assert_eq!(interrupted.binding.runner_name, "codex-gpt-5-4");
+                assert_eq!(interrupted.binding.session.session_id(), "thread-9");
+            }
+            _ => panic!("expected interrupted response"),
+        }
+        assert!(
+            !registry.by_request.contains_key("active-1"),
+            "active run should be removed after interruption"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn active_run_registry_missing_session_is_reported() {
+        let mut registry = ActiveRunRegistry::default();
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let abort_handle = task.abort_handle();
+
+        registry.register(ActiveRunEntry {
+            request_id: "active-2".to_string(),
+            chat_id: -100,
+            runner_name: "claude-sonnet-4-6".to_string(),
+            runner_kind: RunnerKind::Claude,
+            source_user_message_id: Some(11),
+            invocation: RunnerInvocationMetadata {
+                binary: "claude".to_string(),
+                permission_mode: "acceptEdits".to_string(),
+                model: Some("claude-sonnet-4-6".to_string()),
+                codex_profile: None,
+                codex_reasoning_effort: None,
+            },
+            session: None,
+            message_ids: HashSet::new(),
+            abort_handle,
+            started_at: Utc::now(),
+        });
+        registry.sync_messages("active-2", &[333]);
+
+        match registry.interrupt_for_reply(-100, 333) {
+            ActiveRunReplyResolution::MissingSession {
+                request_id,
+                runner_name,
+            } => {
+                assert_eq!(request_id, "active-2");
+                assert_eq!(runner_name, "claude-sonnet-4-6");
+            }
+            _ => panic!("expected missing-session response"),
+        }
+        task.abort();
     }
 
     #[test]
@@ -5223,6 +7244,13 @@ if [ "${1:-}" = "--version" ]; then
   echo "fake-claude 1.0"
   exit 0
 fi
+case " $* " in
+  *" --dangerously-skip-permissions "*) : ;;
+  *)
+    echo "missing expected --dangerously-skip-permissions arg: $*" >&2
+    exit 11
+    ;;
+esac
 cat >/dev/null
 printf '{"type":"system","session_id":"claude-session-fresh"}\n'
 printf '{"type":"content_block_delta","delta":{"text":"claude-ok"}}\n'
@@ -5299,6 +7327,13 @@ if [ "${1:-}" = "--version" ]; then
   echo "fake-claude 1.0"
   exit 0
 fi
+case " $* " in
+  *" --dangerously-skip-permissions "*) : ;;
+  *)
+    echo "missing expected --dangerously-skip-permissions arg: $*" >&2
+    exit 11
+    ;;
+esac
 case " $* " in
   *" --resume claude-session-123 "*) : ;;
   *)
