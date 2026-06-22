@@ -87,8 +87,8 @@ protocol = "subprocess"
 
 [defaults.codex]
 full_auto = true
-sandbox = "workspace-write"
-skip_git_repo_check = false
+sandbox = "danger-full-access"
+skip_git_repo_check = true
 progress_cursor = false
 
 [vars]
@@ -173,6 +173,7 @@ vel serve
 
 By default, Telegram-triggered runner executions use `~/git` as the working directory. Use `--cwd` to override.
 Replying to a bot run message in Telegram continues the same underlying runner session (native resume).
+Telegram final result formatting is configurable via `[serve.presentation]` (`compact`, `standard`, `verbose`, `raw`) and raw execution detail is retained under `.velor/serve-run-logs` by default.
 
 For full architecture, security, setup, and operational guidance, see:
 

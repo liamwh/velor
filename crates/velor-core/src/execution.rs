@@ -200,7 +200,7 @@ impl Default for ExecutionMetrics {
     fn default() -> Self {
         Self {
             iteration: 1,
-            max_iterations: 50,
+            max_iterations: 1000,
             retries: 0,
             max_retries: 5,
             total_duration: Duration::ZERO,
@@ -241,7 +241,7 @@ impl ExecutionConfig {
         Self {
             prompt_name,
             template_vars: BTreeMap::new(),
-            max_iterations: 50,
+            max_iterations: 1000,
             complete_token: "<promise>COMPLETE</promise>".to_string(),
             binary: "claude-glm".to_string(),
             permission_mode: "acceptEdits".to_string(),
@@ -512,7 +512,7 @@ mod tests {
     fn test_execution_config_new() {
         let config = ExecutionConfig::new("test-prompt".to_string());
         assert_eq!(config.prompt_name, "test-prompt");
-        assert_eq!(config.max_iterations, 50);
+        assert_eq!(config.max_iterations, 1000);
         assert_eq!(config.complete_token, "<promise>COMPLETE</promise>");
         assert_eq!(config.binary, "claude-glm");
         assert_eq!(config.permission_mode, "acceptEdits");

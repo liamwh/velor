@@ -105,6 +105,15 @@ edit_throttle_secs = 1
 max_message_chars = 3600
 flush_on_milestones = true
 
+[serve.presentation]
+default_verbosity = "compact" # compact | standard | verbose | raw
+max_changed_files = 5
+max_section_chars = 500
+include_debug_footer_on_success = false
+include_follow_up_hints = true
+path_truncation = "left" # left | middle
+raw_log_dir = ".velor/serve-run-logs"
+
 [serve.telegram]
 allowed_chat_ids = []
 allowed_user_ids = []
@@ -147,7 +156,8 @@ binary = "codex"
 model = "gpt-5.4"
 [serve.runners."codex-gpt-5-4".codex]
 full_auto = true
-sandbox = "workspace-write"
+sandbox = "danger-full-access"
+skip_git_repo_check = true
 
 [serve.runners."codex-gpt-5-3-codex".codex]
 reasoning_effort = "xhigh"
@@ -167,11 +177,17 @@ vel serve
 
 `vel serve` defaults runner execution cwd to `~/git`. Override with `--cwd` when needed.
 
+Example before/after Telegram result output fixtures:
+- [`docs/telegram-result-renderer-fixtures.md`](telegram-result-renderer-fixtures.md)
+
 ## Notes
 
 - Telegram long-polling mode does not support webhook-signature validation.
 - Telegram does not normally redeliver bot-originated outbound messages as inbound updates; real execution tests must come from an authorized human sender in the configured chat.
 - `progress_update_interval_secs` is still accepted as a legacy fallback for edit throttle when `[serve.streaming].edit_throttle_secs` is not provided.
 - `vel serve` loads runner/streaming config at process startup; after changing `.velor/velor.toml`, restart the service (`just serve-ensure-running`) to apply updates.
+- Final Telegram result rendering is controlled by `[serve.presentation]`; compact operator-friendly summaries are default.
+- Full raw progress/output detail is persisted per request in `.velor/serve-run-logs` (or `raw_log_dir`) to preserve deep-debug visibility.
+- Codex runs in `vel serve` are forced to max-permission policy (`full_auto=true`, `sandbox="danger-full-access"`, `skip_git_repo_check=true`).
 - Runner profile model settings support Codex reasoning control with `reasoning_effort = "low|medium|high|xhigh"` under `[serve.runners."<name>".codex]`.
 - `codex-gpt-5-3-codex` is enforced to `xhigh` reasoning at runtime as a policy guardrail.

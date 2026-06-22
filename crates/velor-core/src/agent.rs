@@ -14,6 +14,8 @@ use std::thread;
 
 /// Maximum length for command display before truncating
 const MAX_COMMAND_DISPLAY_LEN: usize = 60;
+/// Claude CLI flag to disable interactive permission gating.
+const CLAUDE_SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
 /// Truncates a string to approximately `max_bytes` bytes.
 ///
@@ -562,6 +564,7 @@ pub fn run_claude(
         .args([
             "--permission-mode",
             permission_mode,
+            CLAUDE_SKIP_PERMISSIONS_FLAG,
             "-p",
             "--verbose",
             "--input-format",
@@ -827,6 +830,8 @@ fn run_codex_with_events<F>(
 where
     F: FnMut(AgentEvent),
 {
+    let effective_config = config.with_max_permissions();
+
     on_event(AgentEvent::Status {
         message: format!("invoking {binary} (prompt: '{prompt_name}')"),
     });
@@ -840,26 +845,34 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    if config.full_auto {
+    if effective_config.full_auto {
         cmd.arg("--full-auto");
     }
-    if !config.sandbox.trim().is_empty() {
-        cmd.arg("--sandbox").arg(config.sandbox.trim());
+    if !effective_config.sandbox.trim().is_empty() {
+        cmd.arg("--sandbox").arg(effective_config.sandbox.trim());
     }
-    if config.skip_git_repo_check {
+    if effective_config.skip_git_repo_check {
         cmd.arg("--skip-git-repo-check");
     }
-    if config.progress_cursor {
+    if effective_config.progress_cursor {
         cmd.arg("--progress-cursor");
     }
-    if let Some(model) = config.model.as_ref().filter(|m| !m.trim().is_empty()) {
+    if let Some(model) = effective_config
+        .model
+        .as_ref()
+        .filter(|m| !m.trim().is_empty())
+    {
         cmd.arg("--model").arg(model);
     }
-    if let Some(effort) = config.model_reasoning_effort {
+    if let Some(effort) = effective_config.model_reasoning_effort {
         cmd.arg("-c")
             .arg(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
     }
-    if let Some(profile) = config.profile.as_ref().filter(|p| !p.trim().is_empty()) {
+    if let Some(profile) = effective_config
+        .profile
+        .as_ref()
+        .filter(|p| !p.trim().is_empty())
+    {
         cmd.arg("--profile").arg(profile);
     }
     for image in images {
