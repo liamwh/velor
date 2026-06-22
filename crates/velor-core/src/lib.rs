@@ -28,6 +28,7 @@ pub mod acp;
 pub mod agent;
 pub mod config;
 pub mod execution;
+pub mod execution_service;
 pub mod git;
 pub mod notification;
 pub mod prompts;
