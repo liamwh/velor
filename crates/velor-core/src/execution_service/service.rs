@@ -207,6 +207,19 @@ impl Default for AgentExecutionService {
     }
 }
 
+/// Returns the process-global shared [`AgentExecutionService`] (one worker
+/// thread per app context), creating it on first use.
+///
+/// This is the canonical entry point for consumers that build an
+/// [`AgentProfile`] and want streaming events + a completion future. Legacy
+/// callers that still go through [`crate::agent::AgentRunner`] also route here.
+#[must_use]
+pub fn shared_service() -> &'static AgentExecutionService {
+    use std::sync::OnceLock;
+    static SERVICE: OnceLock<AgentExecutionService> = OnceLock::new();
+    SERVICE.get_or_init(AgentExecutionService::new)
+}
+
 /// The worker loop: builds each adapter on the LocalSet and runs it.
 fn worker_main(job_rx: &mut mpsc::Receiver<WorkerJob>) {
     let runtime = match tokio::runtime::Builder::new_current_thread()

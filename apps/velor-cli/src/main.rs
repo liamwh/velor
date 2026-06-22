@@ -2086,8 +2086,9 @@ async fn execute_with_retry(
             Err(e) => {
                 last_error = e.to_string();
 
-                // Classify error as retryable or permanent
-                if core::retry::is_permanent_error(&e) {
+                // Typed classification: provider/process errors decide retryability
+                // structurally, not by string matching.
+                if !e.retryability().is_retryable() {
                     tracing::error!("permanent error detected on iteration {iteration}: {e}");
                     return Err(RetryError::Permanent(e.to_string()));
                 }
