@@ -161,6 +161,11 @@ struct CommonArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
 
+    /// Emit a sanitised invocation diagnostic + replay manifest (JSON) and the
+    /// replay command, then run normally. No secrets are printed.
+    #[arg(long, action = ArgAction::SetTrue)]
+    diagnose: bool,
+
     /// Append additional instructions to the final rendered prompt.
     #[arg(long)]
     append: Option<String>,
@@ -806,6 +811,7 @@ async fn run_interactive_menu(
                         binary: None,
                         set_vars: vec![],
                         dry_run: false,
+                        diagnose: false,
                         append: None,
                     },
                 },
@@ -831,6 +837,7 @@ async fn run_interactive_menu(
                         binary: None,
                         set_vars: vec![],
                         dry_run: false,
+                        diagnose: false,
                         append: None,
                     },
                     iterations: None,
@@ -1050,6 +1057,10 @@ async fn run_once(
         file_cfg.defaults.codex.clone(),
     );
 
+    if common.diagnose {
+        emit_diagnostic(&binary, &permission_mode, &final_prompt, &cwd)?;
+    }
+
     // Run the agent (no callback for streaming output in this mode)
     runner
         .run(
@@ -1061,6 +1072,53 @@ async fn run_once(
             process_timeouts_from_defaults(&file_cfg.defaults),
         )
         .await?;
+    Ok(())
+}
+
+/// Emits a sanitised invocation diagnostic (JSON) + a replay manifest to stderr,
+/// for comparing Velor's invocation against a direct manual run. No secrets.
+fn emit_diagnostic(
+    binary: &str,
+    permission_mode: &str,
+    prompt: &str,
+    cwd: &Path,
+) -> color_eyre::eyre::Result<()> {
+    use core::execution_service::diagnostics::{InvocationRecord, ReplayManifest};
+    let env = std::collections::BTreeMap::new();
+    let record =
+        InvocationRecord::derive(binary, prompt.as_bytes(), Some(cwd), None, None, 0, &env);
+    eprintln!("{}", serde_json::to_string_pretty(&record)?);
+    // Standard Claude stream-json flags (mirrors the Claude adapter); the prompt
+    // is written out-of-line so no secret lands in the replay command.
+    let args = vec![
+        "--permission-mode".to_string(),
+        permission_mode.to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "-p".to_string(),
+        "--verbose".to_string(),
+        "--input-format".to_string(),
+        "text".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--include-partial-messages".to_string(),
+    ];
+    let prompt_path = std::env::temp_dir().join(format!(
+        "velor-diagnose-{}.txt",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let manifest = ReplayManifest::build(
+        binary,
+        &args,
+        Some(cwd),
+        prompt.as_bytes(),
+        &prompt_path,
+        &env,
+    )?;
+    eprintln!("{}", serde_json::to_string_pretty(&manifest)?);
+    eprintln!("# replay:\n{}", manifest.replay_command());
     Ok(())
 }
 
