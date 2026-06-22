@@ -9,5 +9,6 @@
 //! - [`codex`] — Codex `codex exec --json`.
 //! - [`acp`] — Agent Client Protocol over stdio (driven on a dedicated worker).
 
+pub mod acp;
 pub mod claude;
 pub mod codex;
