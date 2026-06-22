@@ -9,7 +9,9 @@
 //! onto this in later phases; this module provides the routing + ownership core.
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +21,9 @@ use crate::execution_service::adapters::acp::{AcpAdapter, AcpParams};
 use crate::execution_service::adapters::claude::{ClaudeParams, ClaudeSubprocessAdapter};
 use crate::execution_service::adapters::codex::{CodexParams, CodexSubprocessAdapter};
 use crate::execution_service::error::AgentExecutionError;
+use crate::execution_service::policy::{
+    CircuitBreaker, CircuitBreakerConfig, ConcurrencyLimit, is_transient_upstream,
+};
 
 /// One agent invocation, selecting the adapter and carrying its parameters.
 ///
@@ -53,6 +58,16 @@ impl AgentProfile {
             Self::Claude(p) => p.prompt.len(),
             Self::Codex(p) => p.prompt.len(),
             Self::Acp(p) => p.prompt.len(),
+        }
+    }
+
+    /// Returns the agent binary, used to key concurrency + circuit-breaker scope.
+    #[must_use]
+    pub fn binary(&self) -> &str {
+        match self {
+            Self::Claude(p) => &p.binary,
+            Self::Codex(p) => &p.binary,
+            Self::Acp(p) => &p.binary,
         }
     }
 }
@@ -141,16 +156,45 @@ struct WorkerJob {
     profile: AgentProfile,
     event_tx: mpsc::Sender<AgentEvent>,
     result_tx: oneshot::Sender<Result<AgentRunReport, AgentExecutionError>>,
+    scope: Option<Arc<ScopeState>>,
+}
+
+/// Per-scope policy state: a concurrency limit and a circuit breaker, keyed by
+/// the agent binary so independent providers/profiles don't interfere.
+struct ScopeState {
+    concurrency: Arc<ConcurrencyLimit>,
+    breaker: CircuitBreaker,
+}
+
+/// Configuration for the service's scoped policy.
+#[derive(Debug, Clone)]
+pub struct ServicePolicy {
+    /// Maximum concurrent runs per scope (per agent binary).
+    pub concurrency_max: usize,
+    /// Circuit-breaker configuration per scope.
+    pub breaker: CircuitBreakerConfig,
+}
+
+impl Default for ServicePolicy {
+    fn default() -> Self {
+        Self {
+            concurrency_max: 4,
+            breaker: CircuitBreakerConfig::default(),
+        }
+    }
 }
 
 /// The long-lived agent execution service. One instance per application context.
 ///
 /// Spawns a dedicated worker thread running a current-thread Tokio runtime +
 /// `LocalSet`, where every adapter runs (uniformly handling `!Send` ACP). The
-/// public [`AgentExecution`] handle is `Send`-safe.
+/// public [`AgentExecution`] handle is `Send`-safe. Per-scope concurrency
+/// limiting and a circuit breaker bound overlapping/overloaded runs.
 pub struct AgentExecutionService {
     job_tx: mpsc::Sender<WorkerJob>,
     _worker: Arc<WorkerHandle>,
+    scopes: Mutex<HashMap<String, Arc<ScopeState>>>,
+    policy: ServicePolicy,
 }
 
 struct WorkerHandle {
@@ -158,9 +202,15 @@ struct WorkerHandle {
 }
 
 impl AgentExecutionService {
-    /// Creates a new service, starting its worker thread.
+    /// Creates a new service with the default scoped policy.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_policy(ServicePolicy::default())
+    }
+
+    /// Creates a new service with a custom scoped policy.
+    #[must_use]
+    pub fn with_policy(policy: ServicePolicy) -> Self {
         let (job_tx, mut job_rx) = mpsc::channel::<WorkerJob>(64);
         let thread = std::thread::Builder::new()
             .name("velor-agent-exec".into())
@@ -171,24 +221,50 @@ impl AgentExecutionService {
         Self {
             job_tx,
             _worker: Arc::new(WorkerHandle { _thread: thread }),
+            scopes: Mutex::new(HashMap::new()),
+            policy,
         }
+    }
+
+    /// Returns (creating if needed) the policy state for a scope.
+    fn scope_state(&self, key: &str) -> Arc<ScopeState> {
+        let mut g = self.scopes.lock().expect("scopes mutex poisoned");
+        g.entry(key.to_string())
+            .or_insert_with(|| {
+                Arc::new(ScopeState {
+                    concurrency: Arc::new(ConcurrencyLimit::new(self.policy.concurrency_max)),
+                    breaker: CircuitBreaker::new(self.policy.breaker),
+                })
+            })
+            .clone()
     }
 
     /// Starts an execution, returning a handle to its event stream + completion.
     ///
     /// # Errors
-    /// Returns an error only if the worker has stopped accepting jobs.
+    /// Returns [`AgentExecutionError::CircuitOpen`] if the scope's breaker is
+    /// open, or [`AgentExecutionError::Cancelled`] if the worker has stopped.
     pub async fn execute(
         &self,
         profile: AgentProfile,
     ) -> Result<AgentExecution, AgentExecutionError> {
         let cancellation = profile.cancellation().clone();
+        let scope_key = profile.binary().to_string();
+        let scope = self.scope_state(&scope_key);
+        // Circuit-breaker gate: refuse fast if the upstream is saturated.
+        if let Err(until) = scope.breaker.allow(Instant::now()) {
+            return Err(AgentExecutionError::CircuitOpen {
+                scope: scope_key,
+                until,
+            });
+        }
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
         let (result_tx, result_rx) = oneshot::channel();
         let job = WorkerJob {
             profile,
             event_tx,
             result_tx,
+            scope: Some(scope),
         };
         if self.job_tx.send(job).await.is_err() {
             return Err(AgentExecutionError::Cancelled);
@@ -243,10 +319,26 @@ async fn run_one_job(job: WorkerJob) {
         profile,
         event_tx,
         result_tx,
+        scope,
     } = job;
+    // Acquire the per-scope concurrency permit (held for the run; released on drop)
+    // so overlapping runs against the same provider are bounded.
+    let _permit = match &scope {
+        Some(s) => Some(s.concurrency.clone().acquire().await),
+        None => None,
+    };
     let mut adapter = build_adapter(profile);
     let mut sink = ChannelSink { tx: event_tx };
     let result = adapter.execute(&mut sink).await;
+    // Update the circuit breaker: success closes it; only transient upstream
+    // failures count toward opening it.
+    if let Some(s) = &scope {
+        match &result {
+            Ok(_) => s.breaker.record_success(),
+            Err(e) if is_transient_upstream(e) => s.breaker.record_failure(Instant::now()),
+            Err(_) => {}
+        }
+    }
     let report = result.map(|r| AgentRunReport {
         result: r,
         attempts: vec![AttemptRecord { succeeded: true }],
