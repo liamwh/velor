@@ -28,6 +28,12 @@ Cargo.lock
 .velor/automations/
 .velor/prompts/
 
+# Velor runtime logs and session state
+.velor/logs/
+.velor/serve-run-logs/
+.velor/telegram-media/
+.velor/telegram-session-bindings.json
+
 # Temporary backup directories
 *backup
 
