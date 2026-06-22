@@ -31,8 +31,6 @@ use teloxide::types::{
     Update, UpdateKind,
 };
 use teloxide::{ApiError, RequestError};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::MissedTickBehavior;
@@ -1314,7 +1312,6 @@ impl RunnerProgressEvent {
 const TELEGRAM_STREAM_RENDERED_OUTPUT_EMPTY: &str = "(waiting for output...)";
 const TELEGRAM_STREAM_CONTINUED_NOTE: &str = "[continued in next message]";
 const TELEGRAM_MAX_TEXT_HARD_LIMIT: usize = 4096;
-const CLAUDE_SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
 /// Throttle policy for Telegram message edits.
 #[derive(Debug, Clone)]
@@ -4950,7 +4947,6 @@ async fn run_codex_profile(
     if let Some(profile_name) = &profile.codex.profile {
         codex_cfg.profile = Some(profile_name.clone());
     }
-
     // Telegram Codex policy: always maximize execution permissions.
     codex_cfg.full_auto = true;
     codex_cfg.sandbox = "danger-full-access".to_string();
@@ -4985,7 +4981,7 @@ async fn run_codex_profile(
             "resume"
         } else {
             "new"
-        }
+        },
     )));
 
     let image_paths: Vec<PathBuf> = request
@@ -4995,314 +4991,31 @@ async fn run_codex_profile(
         .map(|a| a.path.clone())
         .collect();
 
-    let mut cmd = Command::new(&profile.binary);
-    cmd.current_dir(cwd)
-        .kill_on_drop(true)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    cmd.arg("exec");
-    if let Some(session_id) = &resume_session_id {
-        cmd.arg("resume").arg(session_id).arg("-");
-    } else {
-        cmd.arg("-");
-    }
-    cmd.arg("--json");
-
-    if codex_cfg.full_auto {
-        cmd.arg("--full-auto");
-    }
-    if !codex_cfg.sandbox.trim().is_empty() {
-        cmd.arg("--sandbox").arg(codex_cfg.sandbox.trim());
-    }
-    if codex_cfg.skip_git_repo_check {
-        cmd.arg("--skip-git-repo-check");
-    }
-    if codex_cfg.progress_cursor {
-        cmd.arg("--progress-cursor");
-    }
-    if let Some(model) = codex_cfg.model.as_ref().filter(|m| !m.trim().is_empty()) {
-        cmd.arg("--model").arg(model);
-    }
-    if let Some(effort) = codex_cfg.model_reasoning_effort {
-        cmd.arg("-c")
-            .arg(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
-    }
-    if let Some(profile_name) = codex_cfg.profile.as_ref().filter(|p| !p.trim().is_empty()) {
-        cmd.arg("--profile").arg(profile_name);
-    }
-    for image in &image_paths {
-        cmd.arg("--image").arg(image);
-    }
-    cmd.args(&profile.args);
-    for (key, value) in &profile.env {
-        cmd.env(key, value);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| eyre!("failed to execute {}: {}", profile.binary, e))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(request.prompt.as_bytes())
-            .await
-            .wrap_err("failed writing prompt to codex stdin")?;
-        if !request.prompt.ends_with('\n') {
-            stdin
-                .write_all(b"\n")
-                .await
-                .wrap_err("failed writing trailing newline to codex stdin")?;
-        }
-    }
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| eyre!("failed to capture codex stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| eyre!("failed to capture codex stderr"))?;
-
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<RunnerProgressEvent>();
-    let initial_session_for_parser = resume_session_id.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut output = String::new();
-        let mut session_id = initial_session_for_parser;
-        let mut lines = BufReader::new(stdout).lines();
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .wrap_err("failed reading codex stdout")?
-        {
-            if line.trim().is_empty() {
-                continue;
-            }
-            parse_codex_stream_line(&line, &mut output, &mut session_id, &event_tx);
-        }
-        Ok::<(String, Option<String>), color_eyre::eyre::Report>((output, session_id))
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut buf = String::new();
-        reader
-            .read_to_string(&mut buf)
-            .await
-            .wrap_err("failed reading codex stderr")?;
-        Ok::<String, color_eyre::eyre::Report>(buf)
-    });
-
-    let mut wait_fut = Box::pin(child.wait());
-    loop {
-        tokio::select! {
-            maybe_event = event_rx.recv() => {
-                if let Some(event) = maybe_event {
-                    on_progress(event);
-                }
-            }
-            status = &mut wait_fut => {
-                let status = status.wrap_err("failed waiting for codex runner")?;
-                while let Ok(event) = event_rx.try_recv() {
-                    on_progress(event);
-                }
-
-                let (stdout_text, resolved_session_id) = stdout_task
-                    .await
-                    .map_err(|e| eyre!("codex stdout task join error: {}", e))??;
-                let stderr_text = stderr_task
-                    .await
-                    .map_err(|e| eyre!("codex stderr task join error: {}", e))??;
-
-                if !status.success() {
-                    let stderr_preview = truncate_for_telegram(stderr_text.trim(), 700);
-                    return Err(eyre!(
-                        "codex runner exited non-zero ({}) stderr: {}",
-                        status,
-                        if stderr_preview.is_empty() {
-                            "<empty>"
-                        } else {
-                            &stderr_preview
-                        }
-                    ));
-                }
-
-                return Ok(RunnerExecution {
-                    stdout: stdout_text,
-                    stderr: stderr_text,
-                    session: resolved_session_id.map(|session_id| RunnerSessionHandle::Codex { session_id }),
-                });
-            }
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum CodexStreamEvent {
-    #[serde(rename = "thread.started", alias = "thread_started")]
-    ThreadStarted { thread_id: String },
-    #[serde(rename = "turn.started", alias = "turn_started")]
-    TurnStarted,
-    #[serde(rename = "item.started", alias = "item_started")]
-    ItemStarted { item: CodexStreamItem },
-    #[serde(rename = "item.completed", alias = "item_completed")]
-    ItemCompleted { item: CodexStreamItem },
-    #[serde(rename = "turn.completed", alias = "turn_completed")]
-    TurnCompleted { usage: Option<CodexStreamUsage> },
-    #[serde(rename = "error")]
-    Error {
-        message: Option<String>,
-        error: Option<String>,
-    },
-    #[serde(other)]
-    Unknown,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexStreamItem {
-    #[serde(rename = "type")]
-    item_type: String,
-    text: Option<String>,
-    command: Option<String>,
-    aggregated_output: Option<String>,
-    exit_code: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexStreamUsage {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-}
-
-fn parse_codex_stream_line(
-    line: &str,
-    output: &mut String,
-    session_id: &mut Option<String>,
-    event_tx: &tokio::sync::mpsc::UnboundedSender<RunnerProgressEvent>,
-) {
-    let Ok(event) = serde_json::from_str::<CodexStreamEvent>(line) else {
-        return;
+    let params = velor_core::execution_service::adapters::codex::CodexParams {
+        binary: profile.binary.clone(),
+        prompt: bytes::Bytes::copy_from_slice(request.prompt.as_bytes()),
+        working_directory: cwd.to_path_buf(),
+        config: codex_cfg,
+        images: image_paths,
+        resume_session: resume_session_id,
+        extra_args: profile.args.clone(),
+        extra_env: profile
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        timeouts: velor_core::execution_service::supervisor::ProcessTimeouts {
+            total: Some(profile.timeout),
+            ..std::default::Default::default()
+        },
+        cancellation: tokio_util::sync::CancellationToken::new(),
     };
-
-    match event {
-        CodexStreamEvent::ThreadStarted { thread_id } => {
-            if session_id.as_deref() != Some(thread_id.as_str()) {
-                *session_id = Some(thread_id.clone());
-                let _ = event_tx.send(RunnerProgressEvent::SessionBound {
-                    session: RunnerSessionHandle::Codex {
-                        session_id: thread_id.clone(),
-                    },
-                });
-            }
-            let _ = event_tx.send(RunnerProgressEvent::Status(format!(
-                "thread started: {thread_id}"
-            )));
-        }
-        CodexStreamEvent::TurnStarted => {
-            let _ = event_tx.send(RunnerProgressEvent::Status("turn started".to_string()));
-        }
-        CodexStreamEvent::ItemStarted { item } => {
-            if item.item_type == "command_execution" {
-                let detail = item
-                    .command
-                    .unwrap_or_else(|| "command execution".to_string());
-                let _ = event_tx.send(RunnerProgressEvent::Milestone(format!(
-                    "tool start: {}",
-                    truncate_for_telegram(&detail, 120)
-                )));
-            }
-        }
-        CodexStreamEvent::ItemCompleted { item } => {
-            if item.item_type == "agent_message" {
-                if let Some(text) = item.text {
-                    output.push_str(&text);
-                    let _ = event_tx.send(RunnerProgressEvent::OutputDelta(text));
-                }
-            } else if item.item_type == "command_execution" {
-                let command = item
-                    .command
-                    .unwrap_or_else(|| "command execution".to_string());
-                let detail = item
-                    .aggregated_output
-                    .as_deref()
-                    .map(|o| truncate_for_telegram(o, 80))
-                    .unwrap_or_else(|| "<no output>".to_string());
-                let _ = event_tx.send(RunnerProgressEvent::Milestone(format!(
-                    "tool result: {} success={} ({})",
-                    truncate_for_telegram(&command, 70),
-                    item.exit_code.map(|code| code == 0).unwrap_or(true),
-                    detail
-                )));
-            }
-        }
-        CodexStreamEvent::TurnCompleted { usage } => {
-            if let Some(usage) = usage {
-                let _ = event_tx.send(RunnerProgressEvent::Milestone(format!(
-                    "usage input={} output={}",
-                    usage.input_tokens.unwrap_or(0),
-                    usage.output_tokens.unwrap_or(0)
-                )));
-            }
-            let _ = event_tx.send(RunnerProgressEvent::Status("turn completed".to_string()));
-        }
-        CodexStreamEvent::Error { message, error } => {
-            let detail = message
-                .or(error)
-                .unwrap_or_else(|| "codex stream error".to_string());
-            let _ = event_tx.send(RunnerProgressEvent::Error(detail));
-        }
-        CodexStreamEvent::Unknown => {}
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClaudeStreamEvent {
-    System {
-        session_id: Option<String>,
-    },
-    ContentBlockDelta {
-        delta: ClaudeDelta,
-    },
-    Assistant {
-        message: ClaudeMessage,
-    },
-    User {
-        message: ClaudeMessage,
-    },
-    Result,
-    #[serde(other)]
-    Unknown,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeDelta {
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeMessage {
-    content: Vec<ClaudeContent>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClaudeContent {
-    Text {
-        text: String,
-    },
-    ToolUse {
-        name: String,
-        input: serde_json::Value,
-    },
-    ToolResult {
-        content: serde_json::Value,
-    },
-    #[serde(other)]
-    Unknown,
+    run_profile_via_service(
+        velor_core::execution_service::service::AgentProfile::Codex(params),
+        RunnerKind::Codex,
+        on_progress,
+    )
+    .await
 }
 
 async fn run_claude_like_profile(
@@ -5334,192 +5047,129 @@ async fn run_claude_like_profile(
             "resume"
         } else {
             "new"
-        }
+        },
     )));
 
-    let mut cmd = Command::new(&profile.binary);
-    cmd.current_dir(cwd)
-        .kill_on_drop(true)
-        .arg("--permission-mode")
-        .arg(&profile.permission_mode)
-        .arg(CLAUDE_SKIP_PERMISSIONS_FLAG)
-        .arg("-p")
-        .arg("--verbose")
-        .arg("--input-format")
-        .arg("text")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--include-partial-messages")
-        .args(&profile.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(model) = &profile.model {
-        cmd.arg("--model").arg(model);
-    }
-    if let Some(session_id) = &resume_session_id {
-        cmd.arg("--resume").arg(session_id);
-    }
-
-    for (key, value) in &profile.env {
-        cmd.env(key, value);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| eyre!("failed to execute {}: {}", profile.binary, e))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(request.prompt.as_bytes())
-            .await
-            .wrap_err("failed writing prompt to runner stdin")?;
-        if !request.prompt.ends_with('\n') {
-            stdin
-                .write_all(b"\n")
-                .await
-                .wrap_err("failed writing newline to runner stdin")?;
-        }
-    }
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| eyre!("failed to capture runner stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| eyre!("failed to capture runner stderr"))?;
-
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<RunnerProgressEvent>();
-    let initial_session_for_parser = resume_session_id.clone();
-
-    let stdout_task = tokio::spawn(async move {
-        let mut text = String::new();
-        let mut session_id = initial_session_for_parser;
-        let mut lines = BufReader::new(stdout).lines();
-        while let Some(line) = lines.next_line().await.wrap_err("failed reading stdout")? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            parse_claude_stream_line(&line, &mut text, &mut session_id, &event_tx);
-        }
-        Ok::<(String, Option<String>), color_eyre::eyre::Report>((text, session_id))
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut buf = String::new();
-        reader
-            .read_to_string(&mut buf)
-            .await
-            .wrap_err("failed reading stderr")?;
-        Ok::<String, color_eyre::eyre::Report>(buf)
-    });
-
-    let mut wait_fut = Box::pin(child.wait());
-
-    loop {
-        tokio::select! {
-            maybe_event = event_rx.recv() => {
-                if let Some(event) = maybe_event {
-                    on_progress(event);
-                }
-            }
-            status = &mut wait_fut => {
-                let status = status.wrap_err("failed waiting for runner")?;
-
-                while let Ok(event) = event_rx.try_recv() {
-                    on_progress(event);
-                }
-
-                let (stdout_text, resolved_session_id) = stdout_task
-                    .await
-                    .map_err(|e| eyre!("stdout task join error: {}", e))??;
-                let stderr_text = stderr_task
-                    .await
-                    .map_err(|e| eyre!("stderr task join error: {}", e))??;
-
-                if !status.success() {
-                    let stderr_preview = truncate_for_telegram(stderr_text.trim(), 700);
-                    return Err(eyre!(
-                        "runner exited non-zero ({}) stderr: {}",
-                        status,
-                        if stderr_preview.is_empty() {
-                            "<empty>"
-                        } else {
-                            &stderr_preview
-                        }
-                    ));
-                }
-
-                return Ok(RunnerExecution {
-                    stdout: stdout_text,
-                    stderr: stderr_text,
-                    session: resolved_session_id
-                        .map(|session_id| RunnerSessionHandle::Claude { session_id }),
-                });
-            }
-        }
-    }
+    let params = velor_core::execution_service::adapters::claude::ClaudeParams {
+        binary: profile.binary.clone(),
+        permission_mode: profile.permission_mode.clone(),
+        prompt: bytes::Bytes::copy_from_slice(request.prompt.as_bytes()),
+        working_directory: cwd.to_path_buf(),
+        model: profile.model.clone(),
+        resume_session: resume_session_id,
+        extra_args: profile.args.clone(),
+        extra_env: profile
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        timeouts: velor_core::execution_service::supervisor::ProcessTimeouts {
+            total: Some(profile.timeout),
+            ..std::default::Default::default()
+        },
+        cancellation: tokio_util::sync::CancellationToken::new(),
+    };
+    run_profile_via_service(
+        velor_core::execution_service::service::AgentProfile::Claude(params),
+        RunnerKind::Claude,
+        on_progress,
+    )
+    .await
 }
 
-fn parse_claude_stream_line(
-    line: &str,
-    output: &mut String,
-    session_id: &mut Option<String>,
-    event_tx: &tokio::sync::mpsc::UnboundedSender<RunnerProgressEvent>,
-) {
-    let Ok(event) = serde_json::from_str::<ClaudeStreamEvent>(line) else {
-        return;
-    };
+/// Runs an agent profile through the shared [`AgentExecutionService`], mapping
+/// provider [`AgentEvent`]s to serve [`RunnerProgressEvent`]s and capturing the
+/// resumed session.
+///
+/// [`AgentExecutionService`]: velor_core::execution_service::service::AgentExecutionService
+/// [`AgentEvent`]: velor_core::agent::AgentEvent
+async fn run_profile_via_service(
+    profile: velor_core::execution_service::service::AgentProfile,
+    kind: RunnerKind,
+    on_progress: &mut (dyn FnMut(RunnerProgressEvent) + Send),
+) -> color_eyre::eyre::Result<RunnerExecution> {
+    let mut execution = velor_core::execution_service::service::shared_service()
+        .execute(profile)
+        .await
+        .map_err(|e| eyre!("failed to start agent execution: {e}"))?;
+    let mut session: Option<RunnerSessionHandle> = None;
+    while let Some(event) = execution.next_event().await {
+        for progress_event in map_agent_event_to_progress(event, kind, &mut session) {
+            on_progress(progress_event);
+        }
+    }
+    let report = execution.complete().await.map_err(|e| match e {
+        velor_core::execution_service::error::AgentExecutionError::UnsuccessfulExit(ue) => {
+            // Preserve the legacy diagnostic: exit code + stderr tail (e.g. the
+            // "resume session expired" message a wrapper writes to stderr).
+            let stderr_preview = truncate_for_telegram(ue.stderr.tail_str().trim(), 700);
+            eyre!(
+                "runner exited non-zero (code={}) stderr: {}",
+                ue.code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "<signal>".to_string()),
+                if stderr_preview.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    stderr_preview
+                }
+            )
+        }
+        other => eyre!("agent execution failed: {other}"),
+    })?;
+    Ok(RunnerExecution {
+        stdout: report.result.stdout,
+        stderr: String::new(),
+        session,
+    })
+}
 
+/// Maps one provider [`AgentEvent`] to zero or more [`RunnerProgressEvent`]s and
+/// updates the captured session when a session-id is observed.
+///
+/// [`AgentEvent`]: velor_core::agent::AgentEvent
+fn map_agent_event_to_progress(
+    event: velor_core::agent::AgentEvent,
+    kind: RunnerKind,
+    session: &mut Option<RunnerSessionHandle>,
+) -> Vec<RunnerProgressEvent> {
+    use velor_core::agent::AgentEvent;
     match event {
-        ClaudeStreamEvent::System { session_id: sid } => {
-            if let Some(sid) = sid
-                && session_id.as_deref() != Some(sid.as_str())
-            {
-                *session_id = Some(sid.clone());
-                let _ = event_tx.send(RunnerProgressEvent::SessionBound {
-                    session: RunnerSessionHandle::Claude { session_id: sid },
-                });
-            }
-        }
-        ClaudeStreamEvent::ContentBlockDelta { delta } => {
-            output.push_str(&delta.text);
-            if !delta.text.is_empty() {
-                let _ = event_tx.send(RunnerProgressEvent::OutputDelta(delta.text));
-            }
-        }
-        ClaudeStreamEvent::Assistant { message } | ClaudeStreamEvent::User { message } => {
-            for content in message.content {
-                match content {
-                    ClaudeContent::Text { text } => {
-                        output.push_str(&text);
-                        if !text.is_empty() {
-                            let _ = event_tx.send(RunnerProgressEvent::OutputDelta(text));
-                        }
-                    }
-                    ClaudeContent::ToolUse { name, input } => {
-                        let detail = truncate_for_telegram(&input.to_string(), 80);
-                        let _ = event_tx.send(RunnerProgressEvent::Milestone(format!(
-                            "tool start: {} ({})",
-                            name, detail
-                        )));
-                    }
-                    ClaudeContent::ToolResult { content } => {
-                        let detail = truncate_for_telegram(&content.to_string(), 80);
-                        let _ = event_tx.send(RunnerProgressEvent::Milestone(format!(
-                            "tool result: {}",
-                            detail
-                        )));
-                    }
-                    ClaudeContent::Unknown => {}
+        AgentEvent::Status { message } => {
+            let mut out = Vec::new();
+            if let Some(id) = message.strip_prefix("thread started: ") {
+                if matches!(kind, RunnerKind::Codex) {
+                    let handle = RunnerSessionHandle::Codex {
+                        session_id: id.to_string(),
+                    };
+                    *session = Some(handle.clone());
+                    out.push(RunnerProgressEvent::SessionBound { session: handle });
+                }
+            } else if let Some(id) = message.strip_prefix("session: ") {
+                if matches!(kind, RunnerKind::Claude) {
+                    let handle = RunnerSessionHandle::Claude {
+                        session_id: id.to_string(),
+                    };
+                    *session = Some(handle.clone());
+                    out.push(RunnerProgressEvent::SessionBound { session: handle });
                 }
             }
+            out.push(RunnerProgressEvent::Status(message));
+            out
         }
-        ClaudeStreamEvent::Result | ClaudeStreamEvent::Unknown => {}
+        AgentEvent::TextDelta { text } => vec![RunnerProgressEvent::OutputDelta(text)],
+        AgentEvent::ToolCall { tool, detail } => {
+            vec![RunnerProgressEvent::Milestone(format!(
+                "tool start: {tool} ({detail})"
+            ))]
+        }
+        AgentEvent::ToolResult { detail, .. } => {
+            vec![RunnerProgressEvent::Milestone(format!(
+                "tool result: {detail}"
+            ))]
+        }
+        AgentEvent::Usage { .. } => Vec::new(),
+        AgentEvent::Error { message } => vec![RunnerProgressEvent::Error(message)],
     }
 }
 
