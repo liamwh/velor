@@ -639,6 +639,17 @@ async fn run_execution_task(
     });
 
     let event_tx_for_runner = event_tx.clone();
+    let attempt_timeouts = velor_core::execution_service::supervisor::ProcessTimeouts {
+        startup: None,
+        stdin_write: None,
+        idle: merged.defaults.idle_timeout.map(|t| t.get()),
+        total: merged.defaults.attempt_timeout.map(|t| t.get()),
+        termination_grace: merged
+            .defaults
+            .termination_grace
+            .map(|t| t.get())
+            .unwrap_or_else(|| std::time::Duration::from_secs(5)),
+    };
     let run_result = runner
         .run_with_events(
             &binary,
@@ -647,6 +658,7 @@ async fn run_execution_task(
             &record.config.prompt_name,
             Path::new(&record.config.cwd),
             &[],
+            attempt_timeouts,
             move |event| {
                 let _ = event_tx_for_runner.send(event);
             },

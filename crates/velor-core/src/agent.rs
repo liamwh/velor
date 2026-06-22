@@ -143,6 +143,7 @@ impl AgentRunner {
         prompt_name: &str,
         cwd: &Path,
         images: &[PathBuf],
+        timeouts: ProcessTimeouts,
     ) -> AgentProfile {
         match self {
             Self::ClaudeSubprocess => AgentProfile::Claude(ClaudeParams {
@@ -154,7 +155,7 @@ impl AgentRunner {
                 resume_session: None,
                 extra_args: Vec::new(),
                 extra_env: Vec::new(),
-                timeouts: ProcessTimeouts::default(),
+                timeouts,
                 cancellation: CancellationToken::new(),
             }),
             Self::Codex(config) => AgentProfile::Codex(CodexParams {
@@ -166,7 +167,7 @@ impl AgentRunner {
                 resume_session: None,
                 extra_args: Vec::new(),
                 extra_env: Vec::new(),
-                timeouts: ProcessTimeouts::default(),
+                timeouts,
                 cancellation: CancellationToken::new(),
             }),
             Self::ClaudeAcp(config) => AgentProfile::Acp(AcpParams {
@@ -183,7 +184,8 @@ impl AgentRunner {
     /// Runs the agent, returning the collected output.
     ///
     /// Routes through the shared [`crate::execution_service::service`]. Events
-    /// are not streamed in this mode (use [`Self::run_with_events`]).
+    /// are not streamed in this mode (use [`Self::run_with_events`]). `timeouts`
+    /// bounds this attempt (startup/idle/total + termination grace).
     ///
     /// # Errors
     ///
@@ -196,8 +198,17 @@ impl AgentRunner {
         prompt: &str,
         prompt_name: &str,
         cwd: &Path,
+        timeouts: ProcessTimeouts,
     ) -> Result<ClaudeRunResult, AgentExecutionError> {
-        let profile = self.build_profile(binary, permission_mode, prompt, prompt_name, cwd, &[]);
+        let profile = self.build_profile(
+            binary,
+            permission_mode,
+            prompt,
+            prompt_name,
+            cwd,
+            &[],
+            timeouts,
+        );
         let execution = shared_service().execute(profile).await?;
         let report = execution.complete().await?;
         Ok(ClaudeRunResult {
@@ -206,6 +217,7 @@ impl AgentRunner {
     }
 
     /// Runs the agent and forwards structured events to `on_event` as they arrive.
+    /// `timeouts` bounds this attempt.
     ///
     /// # Errors
     ///
@@ -218,12 +230,21 @@ impl AgentRunner {
         prompt_name: &str,
         cwd: &Path,
         images: &[PathBuf],
+        timeouts: ProcessTimeouts,
         mut on_event: F,
     ) -> Result<AgentRunResult, AgentExecutionError>
     where
         F: FnMut(AgentEvent) + Send,
     {
-        let profile = self.build_profile(binary, permission_mode, prompt, prompt_name, cwd, images);
+        let profile = self.build_profile(
+            binary,
+            permission_mode,
+            prompt,
+            prompt_name,
+            cwd,
+            images,
+            timeouts,
+        );
         let mut execution = shared_service().execute(profile).await?;
         while let Some(event) = execution.next_event().await {
             on_event(event);
