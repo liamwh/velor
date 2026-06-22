@@ -37,7 +37,7 @@ use core::{
         NotificationPayload, RunStatus, build_notifiers, send_notifications, should_notify,
     },
     prompts::PromptCache,
-    retry::{ConversationHistory, RetryConfig, RetryError},
+    retry::{BackoffPolicy, ConversationHistory, RetryConfig, RetryError},
     rules::{
         RulesCache, RulesState, build_follow_up_prompt_delta, get_rules_by_names, inject_rules,
         select_rules,
@@ -1171,7 +1171,7 @@ async fn run_auto(
     let retry_config = RetryConfig {
         max_retries,
         base_backoff_ms,
-        max_backoff_ms: base_backoff_ms * 16, // Cap at 16x base (5 retries: 100, 200, 400, 800, 1600ms)
+        max_backoff_ms: base_backoff_ms * 16, // legacy cap; delays now come from BackoffPolicy
         absolute_timeout_ms,
     };
 
@@ -1618,6 +1618,13 @@ async fn run_auto_loop(
     append: Option<&str>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
+    // Exponential backoff for remote-inference failures: multi-second floor,
+    // jittered, capped, with Retry-After / per-class-floor precedence. Replaces
+    // the old 100/200/400 ms policy that hammered an overloaded upstream.
+    let backoff_policy = BackoffPolicy {
+        max_attempts: retry_config.max_retries,
+        ..BackoffPolicy::default()
+    };
     let mut current_iteration = 1u32;
     let mut history = ConversationHistory::new();
     let mut final_output = String::new();
@@ -1730,6 +1737,7 @@ async fn run_auto_loop(
                 prompt_name,
                 current_iteration,
                 retry_config,
+                &backoff_policy,
                 cwd,
                 cancel_handler.token(),
             )
@@ -2030,11 +2038,14 @@ async fn execute_with_retry(
     prompt_name: &str,
     iteration: u32,
     config: &RetryConfig,
+    policy: &BackoffPolicy,
     cwd: &std::path::Path,
     cancel_token: &CancellationToken,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
+    let mut last_floor: Option<std::time::Duration> = None;
     let retry_start = std::time::Instant::now();
+    let mut jitter = core::retry::SystemJitter;
 
     for attempt in 1..=config.max_retries {
         // Check for cancellation before each attempt
@@ -2050,15 +2061,11 @@ async fn execute_with_retry(
             )));
         }
         if attempt > 1 {
-            let delay = core::retry::calculate_backoff(
-                attempt,
-                config.base_backoff_ms,
-                config.max_backoff_ms,
-            );
+            let delay = policy.delay(attempt, &mut jitter, last_floor);
+            let secs = delay.as_secs_f64();
             println!(
-                "⏳ Waiting {}ms before retry {}...",
-                delay.as_millis(),
-                attempt
+                "⏳ Retrying attempt {attempt}/{} for iteration {iteration} after {secs:.1}s...",
+                config.max_retries
             );
             tokio::time::sleep(delay).await;
 
@@ -2085,6 +2092,9 @@ async fn execute_with_retry(
             }
             Err(e) => {
                 last_error = e.to_string();
+                // Capture the per-class floor (overload ~5s, rate-limit Retry-After,
+                // connection-reset ~2s) so the next backoff honours it.
+                last_floor = e.retryability().floor();
 
                 // Typed classification: provider/process errors decide retryability
                 // structurally, not by string matching.

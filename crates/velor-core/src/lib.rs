@@ -51,5 +51,5 @@ pub use notification::{
     MacOSNotifier, NotificationPayload, Notifier, RunStatus, TelegramNotifier, build_notifiers,
     format_macos_message, format_telegram_message, send_notifications, should_notify,
 };
-pub use retry::{ConversationHistory, RetryConfig, RetryError, calculate_backoff};
+pub use retry::{BackoffPolicy, ConversationHistory, RetryConfig, RetryError};
 pub use template::{merge_vars, render_template};

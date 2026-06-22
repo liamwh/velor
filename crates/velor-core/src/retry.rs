@@ -6,7 +6,6 @@
 //! - Error classification (permanent vs retryable)
 //! - Configuration for retry behaviour
 
-use color_eyre::eyre::Error;
 use std::time::Duration;
 
 /// Configuration for retry behaviour.
@@ -146,53 +145,102 @@ impl std::fmt::Display for RetryError {
 
 impl std::error::Error for RetryError {}
 
-/// Calculates exponential backoff delay for a given attempt number.
-///
-/// # Arguments
-///
-/// * `attempt` - The attempt number (1-based)
-/// * `base_ms` - Base backoff in milliseconds
-/// * `max_ms` - Maximum backoff in milliseconds
-///
-/// # Returns
-///
-/// A `Duration` for the backoff delay.
-///
-/// # Examples
-///
-/// ```rust
-/// use std::time::Duration;
-/// // With base=100ms, max=1600ms:
-/// // attempt 1: 100ms
-/// // attempt 2: 200ms
-/// // attempt 3: 400ms
-/// // attempt 4: 800ms
-/// // attempt 5: 1600ms
-/// // attempt 6+: 1600ms (capped at max)
-/// ```
-#[tracing::instrument(level = "trace", ret)]
-pub fn calculate_backoff(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
-    let delay_ms = (base_ms * 2_u64.pow(attempt.saturating_sub(1))).min(max_ms);
-    Duration::from_millis(delay_ms)
+/// A source of jitter for [`BackoffPolicy`], injectable so retry tests are
+/// deterministic. Production uses [`SystemJitter`]; tests use [`FixedJitter`].
+pub trait JitterSource {
+    /// Returns a duration uniformly in `[lo, hi]` (clamped to `lo` if `hi < lo`).
+    fn in_range(&mut self, lo: Duration, hi: Duration) -> Duration;
 }
 
-/// Determines if an error is permanent (not retryable).
-///
-/// Permanent errors include:
-/// - Binary not found on PATH
-/// - Permission denied
-/// - Invalid configuration
-/// - Template parsing errors
-#[tracing::instrument(level = "debug", ret)]
-pub fn is_permanent_error(error: &Error) -> bool {
-    let error_msg = error.to_string().to_lowercase();
+/// Production jitter backed by the system RNG.
+pub struct SystemJitter;
 
-    error_msg.contains("not found on path")
-        || error_msg.contains("no such file or directory")
-        || error_msg.contains("permission denied")
-        || error_msg.contains("invalid config")
-        || error_msg.contains("failed to parse template")
-        || (error_msg.contains("prompt") && error_msg.contains("not found"))
+impl JitterSource for SystemJitter {
+    fn in_range(&mut self, lo: Duration, hi: Duration) -> Duration {
+        if hi <= lo {
+            return lo;
+        }
+        let range = (hi.as_nanos() - lo.as_nanos()) as u64;
+        let n = rand::random::<u64>() % range.saturating_add(1);
+        lo + Duration::from_nanos(n)
+    }
+}
+
+/// Deterministic jitter for tests: always returns `value` clamped to `[lo, hi]`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct FixedJitter(pub Duration);
+
+#[cfg(test)]
+impl JitterSource for FixedJitter {
+    fn in_range(&mut self, lo: Duration, hi: Duration) -> Duration {
+        if self.0 < lo {
+            lo
+        } else if self.0 > hi {
+            hi
+        } else {
+            self.0
+        }
+    }
+}
+
+/// Stateless exponential backoff with a non-zero floor and full-jitter-between.
+///
+/// For inference-provider failures, retrying immediately after an overload (the
+/// old 100/200/400 ms policy) hammers an already-loaded upstream. This policy
+/// starts at a multi-second floor, grows exponentially toward a cap, and applies
+/// jitter within `[floor, cap]` so retries decorrelate across concurrent callers.
+/// A provider-supplied `Retry-After` (or the per-class floor from
+/// [`crate::execution_service::error::Retryability`]) takes precedence as a
+/// minimum.
+#[derive(Debug, Clone)]
+pub struct BackoffPolicy {
+    /// Initial delay cap (attempt 2). Default 2 s.
+    pub initial: Duration,
+    /// Hard maximum delay. Default 60 s.
+    pub max: Duration,
+    /// Exponential multiplier applied to the cap per attempt. Default 2.0.
+    pub multiplier: f64,
+    /// Non-zero minimum delay floor. Default 1 s.
+    pub floor: Duration,
+    /// Total executions including the initial attempt. Default 5.
+    pub max_attempts: u32,
+}
+
+impl Default for BackoffPolicy {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_secs(2),
+            max: Duration::from_secs(60),
+            multiplier: 2.0,
+            floor: Duration::from_secs(1),
+            max_attempts: 5,
+        }
+    }
+}
+
+impl BackoffPolicy {
+    /// Computes the delay before `attempt` (1-based; attempt 1 is the initial run
+    /// and is never delayed). The cap is `min(max, initial * multiplier^(attempt-2))`;
+    /// the delay is uniform in `[floor, cap]`, then raised to `retry_after` if
+    /// larger.
+    #[must_use]
+    pub fn delay(
+        &self,
+        attempt: u32,
+        jitter: &mut dyn JitterSource,
+        retry_after: Option<Duration>,
+    ) -> Duration {
+        let exp = self.multiplier.powi(attempt.saturating_sub(2) as i32);
+        let capped = (self.initial.as_secs_f64() * exp).min(self.max.as_secs_f64());
+        let cap = Duration::from_secs_f64(capped);
+        let hi = cap.max(self.floor);
+        let mut delay = jitter.in_range(self.floor, hi);
+        if let Some(retry_after) = retry_after {
+            delay = delay.max(retry_after);
+        }
+        delay.min(self.max).max(self.floor)
+    }
 }
 
 #[cfg(test)]
@@ -281,22 +329,60 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_backoff() {
-        // Test exponential backoff sequence: 100, 200, 400, 800, 1600
-        assert_eq!(calculate_backoff(1, 100, 1600), Duration::from_millis(100));
-        assert_eq!(calculate_backoff(2, 100, 1600), Duration::from_millis(200));
-        assert_eq!(calculate_backoff(3, 100, 1600), Duration::from_millis(400));
-        assert_eq!(calculate_backoff(4, 100, 1600), Duration::from_millis(800));
-        assert_eq!(calculate_backoff(5, 100, 1600), Duration::from_millis(1600));
-        assert_eq!(calculate_backoff(6, 100, 1600), Duration::from_millis(1600)); // capped at max
+    fn backoff_policy_default_starts_at_seconds_not_millis() {
+        // The old policy was 100/200/400 ms; the new default floor is 1 s and the
+        // attempt-2 cap is 2 s — never sub-second after a provider failure.
+        let policy = BackoffPolicy::default();
+        let mut jitter = FixedJitter(Duration::from_secs(1)); // min of range
+        let d2 = policy.delay(2, &mut jitter, None);
+        assert!(d2 >= policy.floor, "delay must respect the floor");
+        assert!(
+            d2 <= policy.initial,
+            "attempt-2 delay must be <= initial cap"
+        );
+        assert!(
+            d2.as_millis() >= 1000,
+            "delay must be multi-second, not sub-second like the old policy (got {d2:?})"
+        );
     }
 
     #[test]
-    fn test_calculate_backoff_different_base() {
-        assert_eq!(calculate_backoff(1, 50, 400), Duration::from_millis(50));
-        assert_eq!(calculate_backoff(2, 50, 400), Duration::from_millis(100));
-        assert_eq!(calculate_backoff(3, 50, 400), Duration::from_millis(200));
-        assert_eq!(calculate_backoff(4, 50, 400), Duration::from_millis(400)); // capped
+    fn backoff_policy_grows_and_caps() {
+        let policy = BackoffPolicy::default();
+        // Max-jitter (FixedJitter returns hi clamped): delays should grow toward max.
+        let caps = [2u64, 4, 8, 16, 32, 60];
+        for (i, &cap) in caps.iter().enumerate() {
+            let attempt = (i + 2) as u32;
+            let mut jitter = FixedJitter(Duration::from_secs(cap + 10)); // clamps to hi
+            let d = policy.delay(attempt, &mut jitter, None);
+            let expected_cap = Duration::from_secs(cap).min(policy.max);
+            assert!(
+                d <= expected_cap,
+                "attempt {attempt}: {d:?} > cap {expected_cap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_policy_retry_after_takes_precedence() {
+        let policy = BackoffPolicy::default();
+        let mut jitter = FixedJitter(Duration::ZERO); // would normally clamp to floor
+        let d = policy.delay(2, &mut jitter, Some(Duration::from_secs(7)));
+        assert_eq!(
+            d,
+            Duration::from_secs(7),
+            "Retry-After should override the jittered floor"
+        );
+    }
+
+    #[test]
+    fn backoff_policy_never_below_floor() {
+        let policy = BackoffPolicy::default();
+        let mut jitter = FixedJitter(Duration::ZERO);
+        for attempt in 2..=6 {
+            let d = policy.delay(attempt, &mut jitter, None);
+            assert!(d >= policy.floor, "attempt {attempt}: {d:?} below floor");
+        }
     }
 
     #[test]
@@ -349,86 +435,5 @@ mod tests {
             err.to_string().contains("cancelled"),
             "error should contain 'cancelled'"
         );
-    }
-
-    #[test]
-    fn test_is_permanent_error_binary_not_found() {
-        let err = color_eyre::eyre::eyre!("claude-glm not found on PATH");
-        assert!(
-            is_permanent_error(&err),
-            "binary not found should be permanent"
-        );
-    }
-
-    #[test]
-    fn test_is_permanent_error_no_such_file() {
-        let err = color_eyre::eyre::eyre!("No such file or directory");
-        assert!(is_permanent_error(&err), "no such file should be permanent");
-    }
-
-    #[test]
-    fn test_is_permanent_error_permission_denied() {
-        let err = color_eyre::eyre::eyre!("Permission denied");
-        assert!(
-            is_permanent_error(&err),
-            "permission denied should be permanent"
-        );
-    }
-
-    #[test]
-    fn test_is_permanent_error_invalid_config() {
-        let err = color_eyre::eyre::eyre!("invalid config at line 42");
-        assert!(
-            is_permanent_error(&err),
-            "invalid config should be permanent"
-        );
-    }
-
-    #[test]
-    fn test_is_permanent_error_failed_to_parse_template() {
-        let err = color_eyre::eyre::eyre!("failed to parse template: unexpected end of input");
-        assert!(
-            is_permanent_error(&err),
-            "template parse error should be permanent"
-        );
-    }
-
-    #[test]
-    fn test_is_permanent_error_prompt_not_found() {
-        let err = color_eyre::eyre::eyre!("prompt 'my-prompt' not found in config");
-        assert!(
-            is_permanent_error(&err),
-            "prompt 'name' not found should be permanent"
-        );
-    }
-
-    #[test]
-    fn test_is_permanent_error_case_insensitive() {
-        let err = color_eyre::eyre::eyre!("Binary NOT FOUND on path");
-        assert!(
-            is_permanent_error(&err),
-            "matching should be case-insensitive"
-        );
-    }
-
-    #[test]
-    fn test_is_permanent_error_retryable_error() {
-        let err = color_eyre::eyre::eyre!("connection timeout");
-        assert!(!is_permanent_error(&err), "timeout should be retryable");
-    }
-
-    #[test]
-    fn test_is_permanent_error_temporary_failure() {
-        let err = color_eyre::eyre::eyre!("temporary network error");
-        assert!(
-            !is_permanent_error(&err),
-            "temporary network error should be retryable"
-        );
-    }
-
-    #[test]
-    fn test_is_permanent_error_api_rate_limit() {
-        let err = color_eyre::eyre::eyre!("API rate limit exceeded");
-        assert!(!is_permanent_error(&err), "rate limit should be retryable");
     }
 }
