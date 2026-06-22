@@ -1052,9 +1052,34 @@ async fn run_once(
 
     // Run the agent (no callback for streaming output in this mode)
     runner
-        .run(&binary, &permission_mode, &final_prompt, &prompt_name, &cwd)
+        .run(
+            &binary,
+            &permission_mode,
+            &final_prompt,
+            &prompt_name,
+            &cwd,
+            process_timeouts_from_defaults(&file_cfg.defaults),
+        )
         .await?;
     Ok(())
+}
+
+/// Builds per-attempt process deadlines from config (idle/total/grace), with a
+/// 5 s termination grace default. Used to bound agent invocations so a hung
+/// provider request cannot block forever.
+fn process_timeouts_from_defaults(
+    d: &core::config::Defaults,
+) -> core::execution_service::supervisor::ProcessTimeouts {
+    core::execution_service::supervisor::ProcessTimeouts {
+        startup: None,
+        stdin_write: None,
+        idle: d.idle_timeout.map(|t| t.get()),
+        total: d.attempt_timeout.map(|t| t.get()),
+        termination_grace: d
+            .termination_grace
+            .map(|t| t.get())
+            .unwrap_or_else(|| std::time::Duration::from_secs(5)),
+    }
 }
 
 /// Runs the `auto` subcommand.
@@ -1197,6 +1222,7 @@ async fn run_auto(
         max_attempts: max_retries,
         multiplier: defaults_d.multiplier,
     };
+    let attempt_timeouts = process_timeouts_from_defaults(&file_cfg.defaults);
 
     println!(
         "🔄 Running auto mode with prompt '{prompt_name}' (max {iterations} iterations, max {max_retries} retries per iteration)..."
@@ -1265,6 +1291,7 @@ async fn run_auto(
         &prompt_name,
         &retry_config,
         &backoff_policy,
+        attempt_timeouts,
         &cwd,
         iterations,
         &cancel_handler,
@@ -1633,6 +1660,7 @@ async fn run_auto_loop(
     prompt_name: &str,
     retry_config: &RetryConfig,
     backoff_policy: &BackoffPolicy,
+    timeouts: core::execution_service::supervisor::ProcessTimeouts,
     cwd: &std::path::Path,
     iterations: u32,
     cancel_handler: &CancellationHandler,
@@ -1756,6 +1784,7 @@ async fn run_auto_loop(
                 current_iteration,
                 retry_config,
                 &backoff_policy,
+                timeouts.clone(),
                 cwd,
                 cancel_handler.token(),
             )
@@ -2057,6 +2086,7 @@ async fn execute_with_retry(
     iteration: u32,
     config: &RetryConfig,
     policy: &BackoffPolicy,
+    timeouts: core::execution_service::supervisor::ProcessTimeouts,
     cwd: &std::path::Path,
     cancel_token: &CancellationToken,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
@@ -2099,7 +2129,14 @@ async fn execute_with_retry(
         }
 
         match runner
-            .run(binary, permission_mode, prompt, prompt_name, cwd)
+            .run(
+                binary,
+                permission_mode,
+                prompt,
+                prompt_name,
+                cwd,
+                timeouts.clone(),
+            )
             .await
         {
             Ok(result) => {
