@@ -376,7 +376,10 @@ pub async fn spawn(
 ///
 /// # Errors
 /// See [`spawn`] and [`RunningProcess::complete`].
-pub async fn run(spec: ProcessSpec, cancellation: CancellationToken) -> Result<ProcessOutput, ProcessError> {
+pub async fn run(
+    spec: ProcessSpec,
+    cancellation: CancellationToken,
+) -> Result<ProcessOutput, ProcessError> {
     let process = spawn(spec, cancellation).await?;
     process.complete().await
 }
@@ -407,12 +410,10 @@ async fn supervise(
     let (drain_tx, mut drain_rx) = mpsc::channel::<DrainChunk>(64);
     let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let stdout_handle = stdout.map(|s| {
-        tokio::spawn(drain_stream(s, OutputStream::Stdout, drain_tx.clone()))
-    });
-    let stderr_handle = stderr.map(|s| {
-        tokio::spawn(drain_stream(s, OutputStream::Stderr, drain_tx.clone()))
-    });
+    let stdout_handle =
+        stdout.map(|s| tokio::spawn(drain_stream(s, OutputStream::Stdout, drain_tx.clone())));
+    let stderr_handle =
+        stderr.map(|s| tokio::spawn(drain_stream(s, OutputStream::Stderr, drain_tx.clone())));
     // Drop our copy so `drain_rx` returning None means both drains are done.
     drop(drain_tx);
 
@@ -628,7 +629,10 @@ async fn terminate_and_reap(child: &mut AsyncGroupChild, grace: Duration) {
             unsafe {
                 let _ = libc::killpg(pid as libc::pid_t, libc::SIGTERM);
             }
-            if tokio::time::timeout(grace, child.inner().wait()).await.is_ok() {
+            if tokio::time::timeout(grace, child.inner().wait())
+                .await
+                .is_ok()
+            {
                 // Reaped during the grace window.
                 return;
             }

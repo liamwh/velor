@@ -5,21 +5,21 @@
 
 #![cfg(unix)]
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use velor_core::agent::AgentEvent;
+use velor_core::execution_service::adapter::{AgentAdapter, AgentEventSink, AgentSinkError};
+use velor_core::execution_service::adapters::claude::{ClaudeParams, ClaudeSubprocessAdapter};
 use velor_core::execution_service::error::{ProcessError, TimeoutKind};
+use velor_core::execution_service::service::{AgentExecutionService, AgentProfile};
+use velor_core::execution_service::supervisor as sup; // for spawn()
 use velor_core::execution_service::supervisor::{
     ProcessInput, ProcessSpec, ProcessSpecBuilder, ProcessTimeouts, run,
 };
-use velor_core::execution_service::supervisor as sup; // for spawn()
-use velor_core::execution_service::adapter::{AgentAdapter, AgentEventSink, AgentSinkError};
-use velor_core::execution_service::adapters::claude::{ClaudeParams, ClaudeSubprocessAdapter};
-use velor_core::execution_service::service::{AgentExecutionService, AgentProfile};
-use velor_core::agent::AgentEvent;
-use async_trait::async_trait;
 
 /// Resolves the fixture binary (a `[[bin]]` of this crate).
 fn fixture() -> PathBuf {
@@ -52,7 +52,11 @@ where
 #[tokio::test]
 async fn happy_path_captures_stdout_and_exits_zero() {
     let output = guard(run(spec("success", &[]).build(), CancellationToken::new())).await;
-    assert!(output.is_ok(), "expected success: {:?}", output.as_ref().err());
+    assert!(
+        output.is_ok(),
+        "expected success: {:?}",
+        output.as_ref().err()
+    );
     let output = output.unwrap();
     assert!(output.is_success(), "termination: {:?}", output.termination);
     assert!(output.stdout.tail_str().contains("done"));
@@ -179,9 +183,12 @@ async fn startup_deadline_fires_before_first_output() {
 #[tokio::test]
 async fn error_on_stdout_empty_stderr_is_captured() {
     // The exact bug class: real error lands on stdout, stderr is empty.
-    let output = guard(run(spec("overload-529", &[]).build(), CancellationToken::new()))
-        .await
-        .unwrap();
+    let output = guard(run(
+        spec("overload-529", &[]).build(),
+        CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
     assert!(!output.is_success());
     assert!(output.stderr.is_empty(), "stderr should be empty");
     assert!(
@@ -192,9 +199,12 @@ async fn error_on_stdout_empty_stderr_is_captured() {
 
 #[tokio::test]
 async fn error_only_on_stderr_is_captured() {
-    let output = guard(run(spec("stderr-only", &[]).build(), CancellationToken::new()))
-        .await
-        .unwrap();
+    let output = guard(run(
+        spec("stderr-only", &[]).build(),
+        CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
     assert!(!output.is_success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.tail_str().contains("stderr"));
@@ -212,9 +222,12 @@ async fn missing_executable_is_classified_not_found() {
 
 #[tokio::test]
 async fn non_utf8_output_is_captured_lossily() {
-    let output = guard(run(spec("invalid-utf8", &[]).build(), CancellationToken::new()))
-        .await
-        .unwrap();
+    let output = guard(run(
+        spec("invalid-utf8", &[]).build(),
+        CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
     assert!(output.is_success());
     // total_bytes counts the raw bytes even though they are invalid UTF-8.
     assert_eq!(output.stdout.total_bytes, 4); // 0xFF 0xFE 0xFD '\n'
@@ -302,10 +315,12 @@ async fn process_group_kill_reaps_grandchildren() {
 
 #[tokio::test]
 async fn running_process_next_event_streams_chunks() {
-    let mut proc =
-        sup::spawn(spec("stdout-lines", &["--count", "3"]).build(), CancellationToken::new())
-            .await
-            .expect("spawn");
+    let mut proc = sup::spawn(
+        spec("stdout-lines", &["--count", "3"]).build(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("spawn");
     let mut stdout = String::new();
     while let Some(event) = proc.next_event().await {
         if let Some(chunk) = event.chunk() {
@@ -364,7 +379,9 @@ async fn claude_adapter_end_to_end_streams_and_classifies() {
         Ok(Ok(result)) => {
             assert!(result.stdout.contains("done"), "stdout: {}", result.stdout);
             assert!(
-                sink.events.iter().any(|e| matches!(e, AgentEvent::TextDelta { .. })),
+                sink.events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::TextDelta { .. })),
                 "expected a text delta event"
             );
         }
@@ -389,7 +406,10 @@ async fn service_runs_profile_streams_and_completes() {
         ..ProcessTimeouts::default()
     };
     let service = AgentExecutionService::new();
-    let mut exec = service.execute(AgentProfile::Claude(params)).await.expect("execute");
+    let mut exec = service
+        .execute(AgentProfile::Claude(params))
+        .await
+        .expect("execute");
     let mut saw_text = false;
     while let Some(event) = exec.next_event().await {
         if matches!(event, AgentEvent::TextDelta { .. }) {
@@ -401,5 +421,3 @@ async fn service_runs_profile_streams_and_completes() {
     assert!(saw_text);
     assert_eq!(report.attempts.len(), 1);
 }
-
-

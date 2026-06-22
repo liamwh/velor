@@ -209,7 +209,10 @@ impl Default for AgentExecutionService {
 
 /// The worker loop: builds each adapter on the LocalSet and runs it.
 fn worker_main(job_rx: &mut mpsc::Receiver<WorkerJob>) {
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(_) => return,
     };

@@ -125,7 +125,12 @@ pub fn classify_output(
     }
 
     if let Some(classified) = structured_error.and_then(|text| {
-        classify_text(text, provider, ClassificationSource::StructuredEvent, ClassificationConfidence::High)
+        classify_text(
+            text,
+            provider,
+            ClassificationSource::StructuredEvent,
+            ClassificationConfidence::High,
+        )
     }) {
         return Some(classified);
     }
@@ -177,7 +182,12 @@ fn classify_text(
     {
         return Some(ClassifiedProvider {
             error: ProviderError::ContextTooLarge,
-            evidence: Classification::new(ProviderErrorKind::ContextTooLarge, source, "context_too_large", confidence),
+            evidence: Classification::new(
+                ProviderErrorKind::ContextTooLarge,
+                source,
+                "context_too_large",
+                confidence,
+            ),
         });
     }
 
@@ -190,7 +200,12 @@ fn classify_text(
     {
         return Some(ClassifiedProvider {
             error: ProviderError::Authentication,
-            evidence: Classification::new(ProviderErrorKind::Authentication, source, "authentication", confidence),
+            evidence: Classification::new(
+                ProviderErrorKind::Authentication,
+                source,
+                "authentication",
+                confidence,
+            ),
         });
     }
 
@@ -213,7 +228,12 @@ fn classify_text(
     if hay.contains("429") || hay.contains("rate limit") || hay.contains("too many requests") {
         return Some(ClassifiedProvider {
             error: ProviderError::RateLimited { retry_after },
-            evidence: Classification::new(ProviderErrorKind::RateLimited, source, "rate_limited", confidence),
+            evidence: Classification::new(
+                ProviderErrorKind::RateLimited,
+                source,
+                "rate_limited",
+                confidence,
+            ),
         });
     }
 
@@ -229,7 +249,12 @@ fn classify_text(
                 provider_code,
                 retry_after,
             },
-            evidence: Classification::new(ProviderErrorKind::Overloaded, source, "overloaded", confidence),
+            evidence: Classification::new(
+                ProviderErrorKind::Overloaded,
+                source,
+                "overloaded",
+                confidence,
+            ),
         });
     }
 
@@ -240,7 +265,12 @@ fn classify_text(
     {
         return Some(ClassifiedProvider {
             error: ProviderError::ConnectionReset,
-            evidence: Classification::new(ProviderErrorKind::ConnectionReset, source, "connection_reset", confidence),
+            evidence: Classification::new(
+                ProviderErrorKind::ConnectionReset,
+                source,
+                "connection_reset",
+                confidence,
+            ),
         });
     }
 
@@ -250,9 +280,16 @@ fn classify_text(
         return Some(ClassifiedProvider {
             error: ProviderError::Other {
                 summary,
-                retryability: crate::execution_service::error::Retryability::Retryable { floor: None },
+                retryability: crate::execution_service::error::Retryability::Retryable {
+                    floor: None,
+                },
             },
-            evidence: Classification::new(ProviderErrorKind::Other, source, "codex_error_event", confidence),
+            evidence: Classification::new(
+                ProviderErrorKind::Other,
+                source,
+                "codex_error_event",
+                confidence,
+            ),
         });
     }
 
@@ -334,7 +371,12 @@ mod tests {
         assert_eq!(c.error.kind(), ProviderErrorKind::Overloaded);
         assert_eq!(c.evidence.source, ClassificationSource::StdoutTail);
         assert_eq!(c.evidence.confidence, ClassificationConfidence::Medium);
-        if let ProviderError::Overloaded { provider_code, status, .. } = &c.error {
+        if let ProviderError::Overloaded {
+            provider_code,
+            status,
+            ..
+        } = &c.error
+        {
             assert_eq!(provider_code.as_deref(), Some("1305"));
             assert_eq!(*status, Some(529));
         } else {
@@ -345,7 +387,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn classifies_econnreset() {
-        let out = make_output(false, "API Error: Unable to connect to API (ECONNRESET)\n", "");
+        let out = make_output(
+            false,
+            "API Error: Unable to connect to API (ECONNRESET)\n",
+            "",
+        );
         let c = classify_output(&out, ProviderKind::Claude, None).expect("classified");
         assert_eq!(c.error.kind(), ProviderErrorKind::ConnectionReset);
         assert!(c.error.retryability().is_retryable());
@@ -363,7 +409,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn classifies_context_too_long_as_permanent() {
-        let out = make_output(false, "Error: prompt is too long: context_length_exceeded\n", "");
+        let out = make_output(
+            false,
+            "Error: prompt is too long: context_length_exceeded\n",
+            "",
+        );
         let c = classify_output(&out, ProviderKind::Claude, None).expect("classified");
         assert_eq!(c.error.kind(), ProviderErrorKind::ContextTooLarge);
         assert!(!c.error.retryability().is_retryable());
@@ -372,7 +422,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn classifies_rate_limit_with_retry_after() {
-        let out = make_output(false, "API Error: 429 Too Many Requests\nRetry-After: 5\n", "");
+        let out = make_output(
+            false,
+            "API Error: 429 Too Many Requests\nRetry-After: 5\n",
+            "",
+        );
         let c = classify_output(&out, ProviderKind::Claude, None).expect("classified");
         assert_eq!(c.error.kind(), ProviderErrorKind::RateLimited);
         if let ProviderError::RateLimited { retry_after } = &c.error {
@@ -394,7 +448,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn split_output_error_is_classified() {
-        let out = make_output(false, "API Error: 529 [1305] overloaded\n", "additional detail\n");
+        let out = make_output(
+            false,
+            "API Error: 529 [1305] overloaded\n",
+            "additional detail\n",
+        );
         let c = classify_output(&out, ProviderKind::Claude, None).expect("classified");
         assert_eq!(c.error.kind(), ProviderErrorKind::Overloaded);
     }
@@ -404,7 +462,11 @@ mod tests {
     fn successful_exit_with_error_like_text_is_not_classified() {
         // False-positive guard: a model that *generated* "API Error: 529" as
         // content but exited successfully must not be classified as overloaded.
-        let out = make_output(true, "Sure, here is an example: API Error: 529 [1305]\n", "");
+        let out = make_output(
+            true,
+            "Sure, here is an example: API Error: 529 [1305]\n",
+            "",
+        );
         assert!(classify_output(&out, ProviderKind::Claude, None).is_none());
     }
 
@@ -412,7 +474,8 @@ mod tests {
     #[test]
     fn structured_event_takes_precedence_over_text() {
         let out = make_output(false, "API Error: 529 [1305]\n", "");
-        let c = classify_output(&out, ProviderKind::Claude, Some("invalid x-api-key")).expect("classified");
+        let c = classify_output(&out, ProviderKind::Claude, Some("invalid x-api-key"))
+            .expect("classified");
         // Structured (auth) wins over the stdout 529.
         assert_eq!(c.error.kind(), ProviderErrorKind::Authentication);
         assert_eq!(c.evidence.source, ClassificationSource::StructuredEvent);
@@ -428,15 +491,24 @@ mod tests {
 
     #[test]
     fn retry_after_only_known_forms() {
-        assert_eq!(parse_retry_after("Retry-After: 7"), Some(Duration::from_secs(7)));
-        assert_eq!(parse_retry_after("retry_after_ms: 2500"), Some(Duration::from_millis(2500)));
+        assert_eq!(
+            parse_retry_after("Retry-After: 7"),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            parse_retry_after("retry_after_ms: 2500"),
+            Some(Duration::from_millis(2500))
+        );
         // Arbitrary numbers in prose must not be extracted.
         assert_eq!(parse_retry_after("please wait 30 seconds"), None);
     }
 
     #[test]
     fn provider_code_extraction() {
-        assert_eq!(extract_provider_code("529 [1305][msg]"), Some("1305".to_string()));
+        assert_eq!(
+            extract_provider_code("529 [1305][msg]"),
+            Some("1305".to_string())
+        );
         assert_eq!(extract_provider_code("no code here"), None);
     }
 }
