@@ -154,7 +154,6 @@ impl CircuitBreaker {
     }
 
     /// Returns `Ok(())` if a request may proceed, or the open-until instant.
-    #[must_use]
     pub fn allow(&self, now: Instant) -> Result<(), Instant> {
         match self.state(now) {
             CircuitState::Closed | CircuitState::HalfOpen => Ok(()),

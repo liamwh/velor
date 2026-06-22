@@ -135,6 +135,7 @@ impl AgentRunner {
     }
 
     /// Builds the execution profile for this runner variant.
+    #[allow(clippy::too_many_arguments)]
     fn build_profile(
         &self,
         binary: &str,
@@ -222,6 +223,7 @@ impl AgentRunner {
     /// # Errors
     ///
     /// Returns [`AgentExecutionError`] if provider execution fails.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_events<F>(
         &self,
         binary: &str,

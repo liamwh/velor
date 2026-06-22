@@ -182,7 +182,7 @@ pub fn redact_secrets(text: &str, max_bytes: usize) -> String {
     }
     let idx = out.floor_char_boundary(max_bytes);
     out.truncate(idx);
-    out.push_str("…");
+    out.push('…');
     out
 }
 
@@ -232,7 +232,7 @@ impl ReplayManifest {
     /// executable's stdin. No secrets are inlined.
     #[must_use]
     pub fn replay_command(&self) -> String {
-        let mut cmd = format!("{}", self.executable);
+        let mut cmd = self.executable.clone();
         for a in &self.arguments {
             cmd.push(' ');
             cmd.push_str(&shell_quote(a));

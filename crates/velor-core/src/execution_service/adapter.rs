@@ -140,43 +140,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splits_on_newlines() {
+    fn splits_on_newlines() -> Result<(), AgentProtocolError> {
         let mut d = LineDecoder::new(1024);
-        let lines = d.push(b"one\ntwo\n").unwrap();
+        let lines = d.push(b"one\ntwo\n")?;
         assert_eq!(lines, vec![b"one".to_vec(), b"two".to_vec()]);
+        Ok(())
     }
 
     #[test]
-    fn accumulates_partial_lines() {
+    fn accumulates_partial_lines() -> Result<(), AgentProtocolError> {
         let mut d = LineDecoder::new(1024);
-        assert!(d.push(b"hel").unwrap().is_empty());
-        assert!(d.push(b"lo").unwrap().is_empty());
-        let lines = d.push(b" world\n").unwrap();
+        assert!(d.push(b"hel")?.is_empty());
+        assert!(d.push(b"lo")?.is_empty());
+        let lines = d.push(b" world\n")?;
         assert_eq!(lines, vec![b"hello world".to_vec()]);
+        Ok(())
     }
 
     #[test]
-    fn handles_carriage_returns() {
+    fn handles_carriage_returns() -> Result<(), AgentProtocolError> {
         let mut d = LineDecoder::new(1024);
-        let lines = d.push(b"a\r\nb\r\n").unwrap();
+        let lines = d.push(b"a\r\nb\r\n")?;
         // '\n' delimits; the trailing '\r' remains in the frame for parsers to trim.
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], b"a\r");
         assert_eq!(lines[1], b"b\r");
+        Ok(())
     }
 
     #[test]
     fn frame_too_long_errors() {
         let mut d = LineDecoder::new(4);
-        let err = d.push(b"abcdefgh").unwrap_err();
-        assert!(matches!(err, AgentProtocolError::FrameTooLong { max: 4 }));
+        match d.push(b"abcdefgh") {
+            Err(AgentProtocolError::FrameTooLong { max: 4 }) => {}
+            other => panic!("expected FrameTooLong, got {other:?}"),
+        }
     }
 
     #[test]
-    fn flush_emits_trailing_frame() {
+    fn flush_emits_trailing_frame() -> Result<(), AgentProtocolError> {
         let mut d = LineDecoder::new(1024);
-        d.push(b"complete\ntrailing-no-newline").unwrap();
-        let last = d.flush_remainder().unwrap();
+        d.push(b"complete\ntrailing-no-newline")?;
+        let last = d.flush_remainder()?;
         assert_eq!(last, Some(b"trailing-no-newline".to_vec()));
+        Ok(())
     }
 }

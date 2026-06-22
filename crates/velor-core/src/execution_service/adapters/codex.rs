@@ -157,10 +157,10 @@ async fn run_codex_stream(
                 for line in lines {
                     let text = String::from_utf8_lossy(&line);
                     for agent_event in parse_codex_line(&text, &mut collected) {
-                        if structured_error.is_none() {
-                            if let AgentEvent::Error { message } = &agent_event {
-                                structured_error = Some(message.clone());
-                            }
+                        if structured_error.is_none()
+                            && let AgentEvent::Error { message } = &agent_event
+                        {
+                            structured_error = Some(message.clone());
                         }
                         sink.emit(agent_event)
                             .await
@@ -218,15 +218,14 @@ fn parse_codex_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
             });
         }
         "item.started" => {
-            if let Some(item) = value.get("item") {
-                if item.get("type").and_then(|t| t.as_str()) == Some("command_execution") {
-                    if let Some(cmd) = item.get("command").and_then(|c| c.as_str()) {
-                        events.push(AgentEvent::ToolCall {
-                            tool: "command_execution".to_string(),
-                            detail: truncate(cmd, 120),
-                        });
-                    }
-                }
+            if let Some(item) = value.get("item")
+                && item.get("type").and_then(|t| t.as_str()) == Some("command_execution")
+                && let Some(cmd) = item.get("command").and_then(|c| c.as_str())
+            {
+                events.push(AgentEvent::ToolCall {
+                    tool: "command_execution".to_string(),
+                    detail: truncate(cmd, 120),
+                });
             }
         }
         "item.completed" => {

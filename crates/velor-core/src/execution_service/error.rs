@@ -363,9 +363,11 @@ pub enum AgentExecutionError {
         /// How and where it was classified.
         evidence: Classification,
     },
-    /// The child exited non-zero with no recognised provider error.
+    /// The child exited non-zero with no recognised provider error. Boxed to keep
+    /// `Result<_, AgentExecutionError>` small (the carried output is bounded but
+    /// non-trivial).
     #[error(transparent)]
-    UnsuccessfulExit(#[from] UnsuccessfulExit),
+    UnsuccessfulExit(#[from] Box<UnsuccessfulExit>),
     /// An ACP protocol failure.
     #[error(transparent)]
     Acp(#[from] AcpError),
