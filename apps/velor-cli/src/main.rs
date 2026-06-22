@@ -1175,6 +1175,29 @@ async fn run_auto(
         absolute_timeout_ms,
     };
 
+    // Build the backoff policy from config (human-readable durations), falling
+    // back to the built-in multi-second defaults.
+    let defaults_d = BackoffPolicy::default();
+    let backoff_policy = BackoffPolicy {
+        initial: file_cfg
+            .defaults
+            .initial_backoff
+            .map(|d| d.get())
+            .unwrap_or(defaults_d.initial),
+        max: file_cfg
+            .defaults
+            .max_backoff
+            .map(|d| d.get())
+            .unwrap_or(defaults_d.max),
+        floor: file_cfg
+            .defaults
+            .backoff_floor
+            .map(|d| d.get())
+            .unwrap_or(defaults_d.floor),
+        max_attempts: max_retries,
+        multiplier: defaults_d.multiplier,
+    };
+
     println!(
         "🔄 Running auto mode with prompt '{prompt_name}' (max {iterations} iterations, max {max_retries} retries per iteration)..."
     );
@@ -1241,6 +1264,7 @@ async fn run_auto(
         &complete_token,
         &prompt_name,
         &retry_config,
+        &backoff_policy,
         &cwd,
         iterations,
         &cancel_handler,
@@ -1608,6 +1632,7 @@ async fn run_auto_loop(
     complete_token: &str,
     prompt_name: &str,
     retry_config: &RetryConfig,
+    backoff_policy: &BackoffPolicy,
     cwd: &std::path::Path,
     iterations: u32,
     cancel_handler: &CancellationHandler,
@@ -1618,13 +1643,6 @@ async fn run_auto_loop(
     append: Option<&str>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
-    // Exponential backoff for remote-inference failures: multi-second floor,
-    // jittered, capped, with Retry-After / per-class-floor precedence. Replaces
-    // the old 100/200/400 ms policy that hammered an overloaded upstream.
-    let backoff_policy = BackoffPolicy {
-        max_attempts: retry_config.max_retries,
-        ..BackoffPolicy::default()
-    };
     let mut current_iteration = 1u32;
     let mut history = ConversationHistory::new();
     let mut final_output = String::new();

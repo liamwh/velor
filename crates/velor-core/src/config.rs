@@ -7,6 +7,48 @@ use color_eyre::eyre::WrapErr;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
+
+/// A [`Duration`] serialized as a human-readable string (e.g. `"5s"`, `"2m"`,
+/// `"500ms"`), deserialized via `humantime`. Lets retry/backoff/timeout config be
+/// written as durations instead of raw milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HumantimeDuration(pub Duration);
+
+impl HumantimeDuration {
+    /// Returns the underlying [`Duration`].
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for HumantimeDuration {
+    fn default() -> Self {
+        Self(Duration::ZERO)
+    }
+}
+
+impl<'de> Deserialize<'de> for HumantimeDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        humantime::parse_duration(&s)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for HumantimeDuration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&humantime::format_duration(self.0).to_string())
+    }
+}
 
 /// Global persistence configuration (shared by multiple commands).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,6 +539,33 @@ pub struct Defaults {
     #[serde(default = "default_absolute_timeout_ms")]
     pub absolute_timeout_ms: u32,
 
+    /// Initial exponential-backoff cap for remote-inference retries (e.g. "2s").
+    /// Overrides the built-in default when set.
+    #[serde(default)]
+    pub initial_backoff: Option<HumantimeDuration>,
+
+    /// Maximum exponential-backoff cap (e.g. "60s").
+    #[serde(default)]
+    pub max_backoff: Option<HumantimeDuration>,
+
+    /// Non-zero minimum backoff floor (e.g. "1s"); retries never happen faster.
+    #[serde(default)]
+    pub backoff_floor: Option<HumantimeDuration>,
+
+    /// Per-attempt idle deadline: no agent output for this long terminates the
+    /// attempt (e.g. "3m"). Optional.
+    #[serde(default)]
+    pub idle_timeout: Option<HumantimeDuration>,
+
+    /// Per-attempt total deadline (e.g. "30m"). Optional.
+    #[serde(default)]
+    pub attempt_timeout: Option<HumantimeDuration>,
+
+    /// Grace period between graceful (SIGTERM) and forced (SIGKILL) termination of
+    /// an agent process group (e.g. "5s").
+    #[serde(default)]
+    pub termination_grace: Option<HumantimeDuration>,
+
     /// ACP-specific configuration (only used when protocol = "acp").
     #[serde(default)]
     pub acp: AcpConfig,
@@ -606,6 +675,12 @@ impl Defaults {
             max_retries: overlay.max_retries,
             base_backoff_ms: overlay.base_backoff_ms,
             absolute_timeout_ms: overlay.absolute_timeout_ms,
+            initial_backoff: overlay.initial_backoff.or(self.initial_backoff),
+            max_backoff: overlay.max_backoff.or(self.max_backoff),
+            backoff_floor: overlay.backoff_floor.or(self.backoff_floor),
+            idle_timeout: overlay.idle_timeout.or(self.idle_timeout),
+            attempt_timeout: overlay.attempt_timeout.or(self.attempt_timeout),
+            termination_grace: overlay.termination_grace.or(self.termination_grace),
             // For acp, overlay takes precedence
             acp: overlay.acp,
             // For codex, overlay takes precedence
