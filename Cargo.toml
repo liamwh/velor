@@ -12,6 +12,10 @@ unwrap_used = "deny"
 # Shared dependencies
 agent-client-protocol = "0.9"
 async-trait = "0.1"
+bytes = "1"
+# Process-group management for the agent execution supervisor (Unix + Windows).
+command-group = { version = "1.0", features = ["with-tokio"] }
+libc = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
