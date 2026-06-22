@@ -16,4 +16,5 @@ pub mod adapters;
 pub mod classify;
 pub mod error;
 pub mod output;
+pub mod service;
 pub mod supervisor;
