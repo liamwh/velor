@@ -143,12 +143,10 @@ async fn run_claude_stream(
                 for line in lines {
                     let text = String::from_utf8_lossy(&line);
                     for agent_event in parse_claude_line(&text, &mut collected) {
-                        if matches!(agent_event, AgentEvent::Error { .. })
-                            && structured_error.is_none()
+                        if structured_error.is_none()
+                            && let AgentEvent::Error { message } = &agent_event
                         {
-                            if let AgentEvent::Error { message } = &agent_event {
-                                structured_error = Some(message.clone());
-                            }
+                            structured_error = Some(message.clone());
                         }
                         emit_event(sink, agent_event).await?;
                     }
@@ -166,10 +164,10 @@ async fn run_claude_stream(
     if let Some(remainder) = decoder.flush_remainder()? {
         let text = String::from_utf8_lossy(&remainder);
         for agent_event in parse_claude_line(&text, &mut collected) {
-            if matches!(agent_event, AgentEvent::Error { .. }) && structured_error.is_none() {
-                if let AgentEvent::Error { message } = &agent_event {
-                    structured_error = Some(message.clone());
-                }
+            if structured_error.is_none()
+                && let AgentEvent::Error { message } = &agent_event
+            {
+                structured_error = Some(message.clone());
             }
             emit_event(sink, agent_event).await?;
         }
@@ -205,11 +203,13 @@ pub(super) fn map_outcome(
             {
                 return Err(AgentExecutionError::Provider { error, evidence });
             }
-            Err(AgentExecutionError::UnsuccessfulExit(UnsuccessfulExit {
-                code: status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            }))
+            Err(AgentExecutionError::UnsuccessfulExit(Box::new(
+                UnsuccessfulExit {
+                    code: status.code(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                },
+            )))
         }
         Termination::TimedOut { which } => {
             Err(AgentExecutionError::Process(ProcessError::TimedOut {
@@ -237,13 +237,12 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                 .get("delta")
                 .and_then(|d| d.get("text"))
                 .and_then(|t| t.as_str())
+                && !text.is_empty()
             {
-                if !text.is_empty() {
-                    collected.push_str(text);
-                    events.push(AgentEvent::TextDelta {
-                        text: text.to_string(),
-                    });
-                }
+                collected.push_str(text);
+                events.push(AgentEvent::TextDelta {
+                    text: text.to_string(),
+                });
             }
         }
         "content_block_start" => {
@@ -251,13 +250,12 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                 .get("content_block")
                 .and_then(|b| b.get("text"))
                 .and_then(|t| t.as_str())
+                && !text.is_empty()
             {
-                if !text.is_empty() {
-                    collected.push_str(text);
-                    events.push(AgentEvent::TextDelta {
-                        text: text.to_string(),
-                    });
-                }
+                collected.push_str(text);
+                events.push(AgentEvent::TextDelta {
+                    text: text.to_string(),
+                });
             }
         }
         "assistant" | "user" => {
@@ -270,13 +268,13 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     match item_type {
                         "text" => {
-                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                if !text.is_empty() {
-                                    collected.push_str(text);
-                                    events.push(AgentEvent::TextDelta {
-                                        text: text.to_string(),
-                                    });
-                                }
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str())
+                                && !text.is_empty()
+                            {
+                                collected.push_str(text);
+                                events.push(AgentEvent::TextDelta {
+                                    text: text.to_string(),
+                                });
                             }
                         }
                         "tool_use" => {

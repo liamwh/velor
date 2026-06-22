@@ -111,7 +111,7 @@ fn main() -> ExitCode {
     let scenario = args
         .iter()
         .skip(1)
-        .find(|a| SCENARIOS.iter().any(|s| *s == a.as_str()))
+        .find(|a| SCENARIOS.contains(&a.as_str()))
         .cloned();
     let Some(scenario) = scenario else {
         eprintln!("velor-test-agent: no recognised scenario in args");

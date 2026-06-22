@@ -315,10 +315,10 @@ fn parse_retry_after(text: &str) -> Option<Duration> {
     }
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("retry_after_ms:") {
-            if let Ok(ms) = rest.trim().parse::<u64>() {
-                return Some(Duration::from_millis(ms));
-            }
+        if let Some(rest) = lower.strip_prefix("retry_after_ms:")
+            && let Ok(ms) = rest.trim().parse::<u64>()
+        {
+            return Some(Duration::from_millis(ms));
         }
     }
     None
