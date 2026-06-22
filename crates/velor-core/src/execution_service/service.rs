@@ -356,10 +356,12 @@ struct ChannelSink {
 #[async_trait(?Send)]
 impl AgentEventSink for ChannelSink {
     async fn emit(&mut self, event: AgentEvent) -> Result<(), AgentSinkError> {
-        // A slow consumer must not stall adapter draining. The supervisor drains
-        // unconditionally; here a full channel drops verbose events (terminal /
-        // error events are emitted before verbose deltas in practice). This keeps
-        // the adapter responsive.
-        self.tx.try_send(event).map_err(|_| AgentSinkError)
+        // Best-effort: a full channel drops verbose events, and a closed channel
+        // (the consumer dropped the receiver, e.g. the non-streaming run() path)
+        // silently drops events too. The sink must NEVER abort the run — a dropped
+        // consumer is not a cancellation request; cancellation flows through the
+        // CancellationToken. This keeps the adapter running to completion.
+        let _ = self.tx.try_send(event);
+        Ok(())
     }
 }
