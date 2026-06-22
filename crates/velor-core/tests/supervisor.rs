@@ -15,6 +15,10 @@ use velor_core::execution_service::supervisor::{
     ProcessInput, ProcessSpec, ProcessSpecBuilder, ProcessTimeouts, run,
 };
 use velor_core::execution_service::supervisor as sup; // for spawn()
+use velor_core::execution_service::adapter::{AgentAdapter, AgentEventSink, AgentSinkError};
+use velor_core::execution_service::adapters::claude::{ClaudeParams, ClaudeSubprocessAdapter};
+use velor_core::agent::AgentEvent;
+use async_trait::async_trait;
 
 /// Resolves the fixture binary (a `[[bin]]` of this crate).
 fn fixture() -> PathBuf {
@@ -326,3 +330,45 @@ async fn drop_without_complete_still_cancels() {
     // If the child leaked, we cannot easily assert it here, but the cancellation
     // path is exercised; the graceful-sigterm test above proves termination works.
 }
+
+struct CollectSink {
+    events: Vec<AgentEvent>,
+}
+
+#[async_trait(?Send)]
+impl AgentEventSink for CollectSink {
+    async fn emit(&mut self, event: AgentEvent) -> Result<(), AgentSinkError> {
+        self.events.push(event);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn claude_adapter_end_to_end_streams_and_classifies() {
+    // The fixture's `success` scenario emits Claude stream-json; the adapter
+    // must parse it into AgentEvents and return success.
+    let mut params = ClaudeParams::new(
+        fixture().to_string_lossy().into_owned(),
+        bytes::Bytes::from_static(b""),
+        std::env::temp_dir(),
+    );
+    params.cancellation = CancellationToken::new();
+    // The fixture locates its scenario token anywhere in argv, so pass it as an
+    // extra arg alongside the adapter's standard Claude flags.
+    params.extra_args = vec!["success".to_string()];
+    let mut adapter = ClaudeSubprocessAdapter::new(params);
+    let mut sink = CollectSink { events: Vec::new() };
+    let outcome = tokio::time::timeout(Duration::from_secs(15), adapter.execute(&mut sink)).await;
+    match outcome {
+        Ok(Ok(result)) => {
+            assert!(result.stdout.contains("done"), "stdout: {}", result.stdout);
+            assert!(
+                sink.events.iter().any(|e| matches!(e, AgentEvent::TextDelta { .. })),
+                "expected a text delta event"
+            );
+        }
+        Ok(Err(e)) => panic!("expected success, got: {e:?}"),
+        Err(_) => panic!("adapter timed out"),
+    }
+}
+
