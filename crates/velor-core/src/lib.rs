@@ -40,8 +40,9 @@ pub mod template;
 pub use agent::{AgentEvent, AgentRunner, ClaudeRunResult};
 pub use config::{
     AcpConfig, AgentProvider, AutomationsConfig, CodexConfig, CodexReasoningEffort,
-    ConversationDbConfig, Defaults, FileConfig, MacOSConfig, NotificationsConfig, PermissionMode,
-    PlanConfig, PromptDef, PromptsConfig, Protocol, TelegramConfig, TelegramParseMode,
+    ConversationDbConfig, Defaults, FileConfig, HumantimeDuration, MacOSConfig,
+    NotificationsConfig, PermissionMode, PlanConfig, PromptDef, PromptsConfig, Protocol,
+    TelegramConfig, TelegramParseMode,
 };
 pub use execution::{
     ExecutionActivity, ExecutionActivityKind, ExecutionConfig, ExecutionEvent, ExecutionId,
