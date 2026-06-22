@@ -400,7 +400,9 @@ impl AgentExecutionError {
     pub fn retryability(&self) -> Retryability {
         match self {
             Self::Process(p) => p.retryability(),
-            Self::Protocol(AgentProtocolError::FrameTooLong { .. } | AgentProtocolError::InvalidUtf8) => {
+            Self::Protocol(
+                AgentProtocolError::FrameTooLong { .. } | AgentProtocolError::InvalidUtf8,
+            ) => {
                 // Transient-ish but not provider; do not retry by default.
                 Retryability::Permanent
             }

@@ -121,7 +121,9 @@ fn main() -> ExitCode {
     let opts = Options::parse(&args[1..]);
     match scenario.as_str() {
         "overload-529" => {
-            print_stdout("API Error: 529 [1305][The service may be temporarily overloaded. Please retry later.]\n");
+            print_stdout(
+                "API Error: 529 [1305][The service may be temporarily overloaded. Please retry later.]\n",
+            );
             ExitCode::from(1)
         }
         "econnreset" => {
@@ -151,7 +153,9 @@ fn main() -> ExitCode {
         }
         "success" => {
             print_stdout("{\"type\":\"system\",\"session_id\":\"sess-123\"}\n");
-            print_stdout("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n");
+            print_stdout(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+            );
             ExitCode::SUCCESS
         }
         "success-quiet" => ExitCode::SUCCESS,

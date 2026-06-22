@@ -204,9 +204,7 @@ impl ProcessOutput {
     /// Returns `true` if the process exited with a zero status.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        self.exit_status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        self.exit_status().map(|s| s.success()).unwrap_or(false)
     }
 }
 

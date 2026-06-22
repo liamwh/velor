@@ -15,7 +15,7 @@ use crate::execution_service::adapters::claude::map_outcome;
 use crate::execution_service::classify::ProviderKind;
 use crate::execution_service::error::AgentExecutionError;
 use crate::execution_service::supervisor::{
-    ProcessInput, ProcessSpec, ProcessTimeouts, ProcessEvent, RunningProcess,
+    ProcessEvent, ProcessInput, ProcessSpec, ProcessTimeouts, RunningProcess,
 };
 
 /// Maximum length of a single codex JSONL frame (line) before rejection.
@@ -144,7 +144,9 @@ async fn run_codex_stream(
                                 structured_error = Some(message.clone());
                             }
                         }
-                        sink.emit(agent_event).await.map_err(|_| AgentExecutionError::Cancelled)?;
+                        sink.emit(agent_event)
+                            .await
+                            .map_err(|_| AgentExecutionError::Cancelled)?;
                     }
                 }
             }
@@ -155,7 +157,9 @@ async fn run_codex_stream(
     if let Some(remainder) = decoder.flush_remainder()? {
         let text = String::from_utf8_lossy(&remainder);
         for agent_event in parse_codex_line(&text, &mut collected) {
-            sink.emit(agent_event).await.map_err(|_| AgentExecutionError::Cancelled)?;
+            sink.emit(agent_event)
+                .await
+                .map_err(|_| AgentExecutionError::Cancelled)?;
         }
     }
 
@@ -213,7 +217,9 @@ fn parse_codex_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                 if item_type == "agent_message" {
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                         collected.push_str(text);
-                        events.push(AgentEvent::TextDelta { text: text.to_string() });
+                        events.push(AgentEvent::TextDelta {
+                            text: text.to_string(),
+                        });
                     }
                 } else if item_type == "command_execution" {
                     let command = item
@@ -230,7 +236,10 @@ fn parse_codex_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                     } else {
                         format!("{command} => {output_preview}")
                     };
-                    let success = item.get("exit_code").and_then(|c| c.as_i64()).map(|code| code == 0);
+                    let success = item
+                        .get("exit_code")
+                        .and_then(|c| c.as_i64())
+                        .map(|code| code == 0);
                     events.push(AgentEvent::ToolResult {
                         tool: "command_execution".to_string(),
                         detail,
@@ -276,7 +285,11 @@ mod tests {
             &mut collected,
         );
         assert_eq!(collected, "hello");
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TextDelta { .. }))
+        );
     }
 
     #[test]

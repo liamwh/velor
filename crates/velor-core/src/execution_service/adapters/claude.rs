@@ -15,7 +15,9 @@ use crate::execution_service::adapter::{AgentAdapter, AgentEventSink, LineDecode
 use crate::execution_service::classify::{ClassifiedProvider, ProviderKind, classify_output};
 use crate::execution_service::error::{AgentExecutionError, ProcessError, UnsuccessfulExit};
 use crate::execution_service::output::Termination;
-use crate::execution_service::supervisor::{ProcessInput, ProcessSpec, ProcessTimeouts, ProcessEvent, RunningProcess};
+use crate::execution_service::supervisor::{
+    ProcessEvent, ProcessInput, ProcessSpec, ProcessTimeouts, RunningProcess,
+};
 
 /// Maximum length of a single stream-json frame (line) before it is rejected.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -141,7 +143,8 @@ async fn run_claude_stream(
                 for line in lines {
                     let text = String::from_utf8_lossy(&line);
                     for agent_event in parse_claude_line(&text, &mut collected) {
-                        if matches!(agent_event, AgentEvent::Error { .. }) && structured_error.is_none()
+                        if matches!(agent_event, AgentEvent::Error { .. })
+                            && structured_error.is_none()
                         {
                             if let AgentEvent::Error { message } = &agent_event {
                                 structured_error = Some(message.clone());
@@ -181,7 +184,9 @@ async fn emit_event(
     sink: &mut dyn AgentEventSink,
     event: AgentEvent,
 ) -> Result<(), AgentExecutionError> {
-    sink.emit(event).await.map_err(|_| AgentExecutionError::Cancelled)
+    sink.emit(event)
+        .await
+        .map_err(|_| AgentExecutionError::Cancelled)
 }
 
 /// Maps a finished [`crate::execution_service::output::ProcessOutput`] to a
@@ -207,7 +212,9 @@ pub(super) fn map_outcome(
             }))
         }
         Termination::TimedOut { which } => {
-            Err(AgentExecutionError::Process(ProcessError::TimedOut { which }))
+            Err(AgentExecutionError::Process(ProcessError::TimedOut {
+                which,
+            }))
         }
         Termination::Cancelled => Err(AgentExecutionError::Cancelled),
     }
@@ -233,7 +240,9 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
             {
                 if !text.is_empty() {
                     collected.push_str(text);
-                    events.push(AgentEvent::TextDelta { text: text.to_string() });
+                    events.push(AgentEvent::TextDelta {
+                        text: text.to_string(),
+                    });
                 }
             }
         }
@@ -245,12 +254,18 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
             {
                 if !text.is_empty() {
                     collected.push_str(text);
-                    events.push(AgentEvent::TextDelta { text: text.to_string() });
+                    events.push(AgentEvent::TextDelta {
+                        text: text.to_string(),
+                    });
                 }
             }
         }
         "assistant" | "user" => {
-            if let Some(content) = value.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+            if let Some(content) = value
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
                 for item in content {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     match item_type {
@@ -258,7 +273,9 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
                                     collected.push_str(text);
-                                    events.push(AgentEvent::TextDelta { text: text.to_string() });
+                                    events.push(AgentEvent::TextDelta {
+                                        text: text.to_string(),
+                                    });
                                 }
                             }
                         }
@@ -379,8 +396,10 @@ mod tests {
     #[test]
     fn parses_text_delta() {
         let mut collected = String::new();
-        let events =
-            parse_claude_line(r#"{"type":"content_block_delta","delta":{"text":"hello"}}"#, &mut collected);
+        let events = parse_claude_line(
+            r#"{"type":"content_block_delta","delta":{"text":"hello"}}"#,
+            &mut collected,
+        );
         assert_eq!(collected, "hello");
         assert!(matches!(events[0], AgentEvent::TextDelta { .. }));
     }
@@ -447,7 +466,10 @@ mod adapter_tests {
         };
         match map_outcome(output, String::new(), None, ProviderKind::Claude) {
             Err(AgentExecutionError::Provider { error, .. }) => {
-                assert_eq!(error.kind(), crate::execution_service::error::ProviderErrorKind::Overloaded);
+                assert_eq!(
+                    error.kind(),
+                    crate::execution_service::error::ProviderErrorKind::Overloaded
+                );
             }
             other => panic!("expected Provider overload, got: {other:?}"),
         }
