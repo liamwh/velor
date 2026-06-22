@@ -34,6 +34,12 @@ pub struct CodexParams {
     pub config: CodexConfig,
     /// Image attachment paths.
     pub images: Vec<PathBuf>,
+    /// Optional session to resume (`exec resume <id> -`).
+    pub resume_session: Option<String>,
+    /// Extra CLI arguments appended after the standard flags.
+    pub extra_args: Vec<String>,
+    /// Extra environment variables (key, value).
+    pub extra_env: Vec<(String, String)>,
     /// Deadlines for this attempt.
     pub timeouts: ProcessTimeouts,
     /// Cancellation token for this attempt.
@@ -50,6 +56,9 @@ impl CodexParams {
             working_directory,
             config: CodexConfig::default(),
             images: Vec::new(),
+            resume_session: None,
+            extra_args: Vec::new(),
+            extra_env: Vec::new(),
             timeouts: ProcessTimeouts::default(),
             cancellation: CancellationToken::new(),
         }
@@ -72,13 +81,16 @@ impl CodexSubprocessAdapter {
         let cfg = self.params.config.with_max_permissions();
         let mut builder = ProcessSpec::builder(&self.params.binary)
             .arg("exec")
-            .arg("--json")
-            .arg("-C")
-            .arg(self.params.working_directory.clone())
             .cwd(self.params.working_directory.clone())
             .input(ProcessInput::Bytes(self.params.prompt.clone()))
             .timeouts(self.params.timeouts.clone())
             .capture_bytes(64 * 1024);
+        // `exec resume <id> -` resumes a session; `exec -` starts a new one. The
+        // trailing `-` instructs codex to read the prompt from stdin.
+        if let Some(session) = &self.params.resume_session {
+            builder = builder.arg("resume").arg(session);
+        }
+        builder = builder.arg("-").arg("--json");
 
         if cfg.full_auto {
             builder = builder.arg("--full-auto");
@@ -105,6 +117,12 @@ impl CodexSubprocessAdapter {
         }
         for image in &self.params.images {
             builder = builder.arg("--image").arg(image);
+        }
+        for arg in &self.params.extra_args {
+            builder = builder.arg(arg);
+        }
+        for (key, value) in &self.params.extra_env {
+            builder = builder.env(key, value);
         }
         builder.build()
     }
