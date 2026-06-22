@@ -34,19 +34,25 @@ impl Options {
         let mut i = 0;
         while i < args.len() {
             let key = args[i].as_str();
-            let value = args.get(i + 1);
-            match (key, value) {
-                ("--bytes", Some(v)) => opts.bytes = v.parse().ok(),
-                ("--count", Some(v)) => opts.count = v.parse().ok(),
-                ("--interval-ms", Some(v)) => opts.interval_ms = v.parse().ok(),
-                ("--duration", Some(v)) => opts.duration = parse_duration_secs(v),
-                ("--children", Some(v)) => opts.children = v.parse().ok(),
-                ("--lockfile", Some(v)) => opts.lockfile = Some(v.clone()),
-                ("--stdout", Some(v)) => opts.stdout = Some(v.clone()),
-                ("--stderr", Some(v)) => opts.stderr = Some(v.clone()),
-                _ => {}
+            if let Some(flag) = key.strip_prefix("--") {
+                let value = args.get(i + 1);
+                match (flag, value) {
+                    ("bytes", Some(v)) => opts.bytes = v.parse().ok(),
+                    ("count", Some(v)) => opts.count = v.parse().ok(),
+                    ("interval-ms", Some(v)) => opts.interval_ms = v.parse().ok(),
+                    ("duration", Some(v)) => opts.duration = parse_duration_secs(v),
+                    ("children", Some(v)) => opts.children = v.parse().ok(),
+                    ("lockfile", Some(v)) => opts.lockfile = Some(v.clone()),
+                    ("stdout", Some(v)) => opts.stdout = Some(v.clone()),
+                    ("stderr", Some(v)) => opts.stderr = Some(v.clone()),
+                    _ => {}
+                }
+                i += 2;
+            } else {
+                // Non-flag token (e.g. the scenario name or a positional); skip
+                // just this token so it cannot swallow the next flag as a value.
+                i += 1;
             }
-            i += 2;
         }
         opts
     }
@@ -72,14 +78,48 @@ fn print_stderr(s: &str) {
     let _ = std::io::stderr().flush();
 }
 
+/// All recognised scenario names (used to locate the scenario token anywhere
+/// in argv, so the fixture can be driven even when a caller prepends its own
+/// flags — e.g. the Claude adapter's `--permission-mode ...` args).
+const SCENARIOS: &[&str] = &[
+    "overload-529",
+    "econnreset",
+    "invalid-key",
+    "context-too-long",
+    "rate-limit-429",
+    "stderr-only",
+    "split-output",
+    "success",
+    "success-quiet",
+    "echo-stdin",
+    "large-output",
+    "long-line",
+    "stdout-lines",
+    "sleep",
+    "close-stdout-early",
+    "exit-before-stdin",
+    "invalid-utf8",
+    "fork-tree",
+    "fork-grandchild",
+    "ignore-sigterm",
+    "exit-code",
+];
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: velor-test-agent <scenario> [--flag value ...]");
+    // Locate the scenario token anywhere in argv (after the program path).
+    let scenario = args
+        .iter()
+        .skip(1)
+        .find(|a| SCENARIOS.iter().any(|s| *s == a.as_str()))
+        .cloned();
+    let Some(scenario) = scenario else {
+        eprintln!("velor-test-agent: no recognised scenario in args");
         return ExitCode::from(2);
-    }
-    let opts = Options::parse(&args[2..]);
-    match args[1].as_str() {
+    };
+    // Options are scanned across all args; unknown flags are ignored.
+    let opts = Options::parse(&args[1..]);
+    match scenario.as_str() {
         "overload-529" => {
             print_stdout("API Error: 529 [1305][The service may be temporarily overloaded. Please retry later.]\n");
             ExitCode::from(1)

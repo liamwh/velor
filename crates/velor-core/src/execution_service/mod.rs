@@ -12,6 +12,7 @@
 //! - [`error`] — typed process-execution errors.
 
 pub mod adapter;
+pub mod adapters;
 pub mod classify;
 pub mod error;
 pub mod output;
