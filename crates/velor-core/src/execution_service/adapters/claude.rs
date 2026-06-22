@@ -185,8 +185,8 @@ async fn emit_event(
 }
 
 /// Maps a finished [`crate::execution_service::output::ProcessOutput`] to a
-/// result, classifying non-zero exits.
-fn map_outcome(
+/// result, classifying non-zero exits. Shared across subprocess adapters.
+pub(super) fn map_outcome(
     output: crate::execution_service::output::ProcessOutput,
     collected: String,
     structured_error: Option<String>,
