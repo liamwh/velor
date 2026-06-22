@@ -17,6 +17,7 @@ use velor_core::execution_service::supervisor::{
 use velor_core::execution_service::supervisor as sup; // for spawn()
 use velor_core::execution_service::adapter::{AgentAdapter, AgentEventSink, AgentSinkError};
 use velor_core::execution_service::adapters::claude::{ClaudeParams, ClaudeSubprocessAdapter};
+use velor_core::execution_service::service::{AgentExecutionService, AgentProfile};
 use velor_core::agent::AgentEvent;
 use async_trait::async_trait;
 
@@ -371,4 +372,34 @@ async fn claude_adapter_end_to_end_streams_and_classifies() {
         Err(_) => panic!("adapter timed out"),
     }
 }
+
+#[tokio::test]
+async fn service_runs_profile_streams_and_completes() {
+    // End-to-end through AgentExecutionService: profile -> worker thread ->
+    // adapter -> supervisor -> events + report.
+    let mut params = ClaudeParams::new(
+        fixture().to_string_lossy().into_owned(),
+        bytes::Bytes::from_static(b""),
+        std::env::temp_dir(),
+    );
+    params.cancellation = CancellationToken::new();
+    params.extra_args = vec!["success".to_string()];
+    params.timeouts = ProcessTimeouts {
+        total: Some(Duration::from_secs(15)),
+        ..ProcessTimeouts::default()
+    };
+    let service = AgentExecutionService::new();
+    let mut exec = service.execute(AgentProfile::Claude(params)).await.expect("execute");
+    let mut saw_text = false;
+    while let Some(event) = exec.next_event().await {
+        if matches!(event, AgentEvent::TextDelta { .. }) {
+            saw_text = true;
+        }
+    }
+    let report = exec.complete().await.expect("report");
+    assert!(report.result.stdout.contains("done"));
+    assert!(saw_text);
+    assert_eq!(report.attempts.len(), 1);
+}
+
 
