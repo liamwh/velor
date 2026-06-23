@@ -184,15 +184,18 @@ impl JitterSource for FixedJitter {
     }
 }
 
-/// Stateless exponential backoff with a non-zero floor and full-jitter-between.
+/// Stateless exponential backoff using **full jitter with a non-zero floor**.
 ///
-/// For inference-provider failures, retrying immediately after an overload (the
-/// old 100/200/400 ms policy) hammers an already-loaded upstream. This policy
-/// starts at a multi-second floor, grows exponentially toward a cap, and applies
-/// jitter within `[floor, cap]` so retries decorrelate across concurrent callers.
-/// A provider-supplied `Retry-After` (or the per-class floor from
-/// [`crate::execution_service::error::Retryability`]) takes precedence as a
-/// minimum.
+/// The delay for attempt `N` (`N >= 2`) is a uniform random value in
+/// `[floor, cap]`, where `cap = min(max, initial * multiplier^(N-2))`. A
+/// provider-supplied `Retry-After` (or the per-class floor from
+/// [`crate::execution_service::error::Retryability`]) overrides the jittered
+/// value when larger. This is *full jitter* (uniform over `[floor, cap]`) —
+/// explicitly not equal-jitter (`cap/2 + rand[0, cap/2]`) and not
+/// decorrelated-jitter (which compounds the previous delay). Full jitter spreads
+/// concurrent retries across the whole range so they don't synchronize. The
+/// non-zero floor replaces the old 100/200/400 ms policy that hammered an
+/// already-overloaded upstream.
 #[derive(Debug, Clone)]
 pub struct BackoffPolicy {
     /// Initial delay cap (attempt 2). Default 2 s.
