@@ -3,6 +3,7 @@ name = "velor-cli"
 version = "0.1.0"
 edition = "2024"
 license = "UNLICENSED"
+build = "build.rs"
 
 [dependencies]
 # Workspace dependencies

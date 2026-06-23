@@ -659,6 +659,7 @@ async fn run_execution_task(
             Path::new(&record.config.cwd),
             &[],
             attempt_timeouts,
+            tokio_util::sync::CancellationToken::new(),
             move |event| {
                 let _ = event_tx_for_runner.send(event);
             },

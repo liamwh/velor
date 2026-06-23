@@ -145,6 +145,7 @@ impl AgentRunner {
         cwd: &Path,
         images: &[PathBuf],
         timeouts: ProcessTimeouts,
+        cancellation: CancellationToken,
     ) -> AgentProfile {
         match self {
             Self::ClaudeSubprocess => AgentProfile::Claude(ClaudeParams {
@@ -157,7 +158,7 @@ impl AgentRunner {
                 extra_args: Vec::new(),
                 extra_env: Vec::new(),
                 timeouts,
-                cancellation: CancellationToken::new(),
+                cancellation,
             }),
             Self::Codex(config) => AgentProfile::Codex(CodexParams {
                 binary: binary.to_string(),
@@ -169,7 +170,7 @@ impl AgentRunner {
                 extra_args: Vec::new(),
                 extra_env: Vec::new(),
                 timeouts,
-                cancellation: CancellationToken::new(),
+                cancellation,
             }),
             Self::ClaudeAcp(config) => AgentProfile::Acp(AcpParams {
                 binary: binary.to_string(),
@@ -177,7 +178,7 @@ impl AgentRunner {
                 prompt_name: prompt_name.to_string(),
                 config: config.clone(),
                 working_directory: cwd.to_path_buf(),
-                cancellation: CancellationToken::new(),
+                cancellation,
             }),
         }
     }
@@ -186,7 +187,8 @@ impl AgentRunner {
     ///
     /// Routes through the shared [`crate::execution_service::service`]. Events
     /// are not streamed in this mode (use [`Self::run_with_events`]). `timeouts`
-    /// bounds this attempt (startup/idle/total + termination grace).
+    /// bounds this attempt; `cancellation` lets the caller (e.g. Ctrl+C) abort +
+    /// reap the agent process mid-run.
     ///
     /// # Errors
     ///
@@ -200,6 +202,7 @@ impl AgentRunner {
         prompt_name: &str,
         cwd: &Path,
         timeouts: ProcessTimeouts,
+        cancellation: CancellationToken,
     ) -> Result<ClaudeRunResult, AgentExecutionError> {
         let profile = self.build_profile(
             binary,
@@ -209,6 +212,7 @@ impl AgentRunner {
             cwd,
             &[],
             timeouts,
+            cancellation,
         );
         let execution = shared_service().execute(profile).await?;
         let report = execution.complete().await?;
@@ -218,7 +222,8 @@ impl AgentRunner {
     }
 
     /// Runs the agent and forwards structured events to `on_event` as they arrive.
-    /// `timeouts` bounds this attempt.
+    /// `timeouts` bounds this attempt; `cancellation` lets the caller abort +
+    /// reap the agent mid-run.
     ///
     /// # Errors
     ///
@@ -233,6 +238,7 @@ impl AgentRunner {
         cwd: &Path,
         images: &[PathBuf],
         timeouts: ProcessTimeouts,
+        cancellation: CancellationToken,
         mut on_event: F,
     ) -> Result<AgentRunResult, AgentExecutionError>
     where
@@ -246,6 +252,7 @@ impl AgentRunner {
             cwd,
             images,
             timeouts,
+            cancellation,
         );
         let mut execution = shared_service().execute(profile).await?;
         while let Some(event) = execution.next_event().await {
