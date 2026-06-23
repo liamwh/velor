@@ -10,11 +10,18 @@
 //! - **Deadlock-free.** stdin write, stdout drain, and stderr drain run as
 //!   independent tasks, so a child that writes 10 MB while we write a large prompt
 //!   cannot wedge a pipe.
-//! - **Whole-group lifecycle.** The child runs in its own process group. On
-//!   timeout or cancellation the group is terminated gracefully
-//!   (SIGTERM → grace → SIGKILL on Unix) and the direct child is reaped, so no
-//!   grandchild (the `node`/`claude` provider client beneath the wrapper) lingers
-//!   and no overlapping request survives.
+//! - **Whole-group lifecycle.** The child runs in its own process group (Unix) or
+//!   job object (Windows, via `command-group`). On timeout or cancellation:
+//!   - **Unix:** `SIGTERM` the group → wait up to `termination_grace` → `SIGKILL`
+//!     the group → reap the direct child. `killpg` reaches the whole group, so
+//!     grandchildren (the `node`/`claude` provider client beneath the wrapper) are
+//!     signalled too.
+//!   - **Non-Unix:** the group is killed immediately (no graceful phase — there is
+//!     no `SIGTERM` equivalent in the job-object path) and the direct child reaped.
+//!   Descendant termination is best-effort on the configured mechanism: on Unix it
+//!   depends on grandchildren staying in the spawned process group (a child that
+//!   itself calls `setsid`/`setpgid` can escape); on Windows it depends on the job
+//!   object. It is not a universal kernel guarantee.
 
 use bytes::Bytes;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
