@@ -106,7 +106,12 @@ struct TuiState {
     show_prompt: bool,
     prompt_scroll: u16,
     scroll_offset: u16,
+    spinner_idx: usize,
+    /// The verb to show in the spinner, derived from the last event type.
+    spinner_verb: &'static str,
 }
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl TuiState {
     fn new() -> Self {
@@ -116,6 +121,8 @@ impl TuiState {
             show_prompt: false,
             prompt_scroll: 0,
             scroll_offset: 0,
+            spinner_idx: 0,
+            spinner_verb: "starting",
         }
     }
 }
@@ -140,6 +147,21 @@ pub async fn run_streaming_tui(
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 TuiMessage::Entry(e) => {
+                    // Update spinner verb based on what just happened.
+                    state.spinner_verb = match &e.kind {
+                        EntryKind::ToolCall { tool, .. } => match tool.as_str() {
+                            "Bash" => "running command",
+                            "Read" => "reading file",
+                            "Edit" | "Write" => "editing",
+                            "Grep" => "searching",
+                            "Glob" => "finding files",
+                            _ => "working",
+                        },
+                        EntryKind::ToolResult { .. } => "thinking",
+                        EntryKind::Text(_) => "generating",
+                        EntryKind::Error(_) => "error",
+                        EntryKind::Info(_) => state.spinner_verb,
+                    };
                     state.entries.push(e);
                     had_new = true;
                 }
@@ -227,10 +249,32 @@ fn render(f: &mut Frame, state: &mut TuiState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
     let log_area = chunks[0];
-    let hints_area = chunks[1];
+    let spinner_area = chunks[1];
+    let hints_area = chunks[2];
+
+    // Advance spinner animation on each render.
+    state.spinner_idx = (state.spinner_idx + 1) % SPINNER.len();
+
+    // Spinner line: shown when the run is active (channel still open, no errors).
+    let spinner = SPINNER[state.spinner_idx];
+    let spinner_line = Line::from(vec![
+        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            state.spinner_verb,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::raw("…"),
+    ]);
+    f.render_widget(Paragraph::new(spinner_line), spinner_area);
 
     // Build all lines from all entries (each entry may produce multiple lines).
     let mut all_lines: Vec<Line> = Vec::new();
