@@ -46,9 +46,19 @@ use core::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+/// Version string with embedded git info (hash + dirty status + branch).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("VELOR_GIT_HASH"),
+    "-",
+    env!("VELOR_GIT_DIRTY"),
+    ")",
+);
+
 /// Velor Agent CLI - Run autonomous coding agents.
 #[derive(Debug, Parser)]
-#[command(name = "velor", version, about)]
+#[command(name = "velor", version = VERSION, about)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1070,6 +1080,7 @@ async fn run_once(
             &prompt_name,
             &cwd,
             process_timeouts_from_defaults(&file_cfg.defaults),
+            CancellationToken::new(),
         )
         .await?;
     Ok(())
@@ -2194,6 +2205,7 @@ async fn execute_with_retry(
                 prompt_name,
                 cwd,
                 timeouts.clone(),
+                cancel_token.clone(),
             )
             .await
         {
