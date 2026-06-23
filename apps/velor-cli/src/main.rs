@@ -17,6 +17,7 @@ mod completion;
 mod plan;
 mod projects;
 mod serve;
+mod streaming_tui;
 mod tui;
 mod vault;
 
@@ -1350,6 +1351,11 @@ async fn run_auto(
     let rules_set_ref = rules_set.as_ref();
     tracing::info!("rules_set_ref.is_some(): {}", rules_set_ref.is_some());
 
+    // Streaming TUI: shows agent events with timestamps in an alternate screen.
+    let (tui_tx, tui_rx) = tokio::sync::mpsc::channel::<streaming_tui::TuiEntry>(256);
+    let tui_cancel = cancel_handler.token().clone();
+    let tui_task = tokio::spawn(streaming_tui::run_streaming_tui(tui_rx, tui_cancel));
+
     let result = run_auto_loop(
         &runner,
         &binary,
@@ -1369,8 +1375,13 @@ async fn run_auto(
         &file_cfg.defaults.acp,
         &file_cfg.rules,
         common.append.as_deref(),
+        &tui_tx,
     )
     .await;
+
+    // Restore terminal (TUI exits when sender is dropped).
+    drop(tui_tx);
+    let _ = tui_task.await;
 
     // Handle result and send notifications
     match result {
@@ -1742,6 +1753,7 @@ async fn run_auto_loop(
     acp_config: &core::config::AcpConfig,
     rules_config: &core::config::RulesConfig,
     append: Option<&str>,
+    tui_tx: &tokio::sync::mpsc::Sender<streaming_tui::TuiEntry>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1860,6 +1872,7 @@ async fn run_auto_loop(
                 timeouts.clone(),
                 cwd,
                 cancel_handler.token(),
+                tui_tx,
             )
             .await;
 
@@ -2162,6 +2175,7 @@ async fn execute_with_retry(
     timeouts: core::execution_service::supervisor::ProcessTimeouts,
     cwd: &std::path::Path,
     cancel_token: &CancellationToken,
+    tui_tx: &tokio::sync::mpsc::Sender<streaming_tui::TuiEntry>,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let mut last_floor: Option<std::time::Duration> = None;
@@ -2211,41 +2225,12 @@ async fn execute_with_retry(
                 &[],
                 timeouts.clone(),
                 cancel_token.clone(),
-                |event: core::agent::AgentEvent| {
-                    use std::io::Write;
-                    match event {
-                        core::agent::AgentEvent::TextDelta { text } => {
-                            print!("{text}");
-                            let _ = std::io::stdout().flush();
+                {
+                    let tui_tx = tui_tx.clone();
+                    move |event: core::agent::AgentEvent| {
+                        if let Some(entry) = streaming_tui::agent_event_to_tui(&event) {
+                            let _ = tui_tx.try_send(entry);
                         }
-                        core::agent::AgentEvent::ToolCall { tool, detail } => {
-                            println!("🔧 {tool}: {detail}");
-                        }
-                        core::agent::AgentEvent::ToolResult {
-                            detail, success, ..
-                        } => {
-                            let prefix = if success == Some(false) {
-                                "⚠️"
-                            } else {
-                                "✅"
-                            };
-                            println!("{prefix} {detail}");
-                        }
-                        core::agent::AgentEvent::Status { message } => {
-                            // Suppress internal session/thread metadata (used by
-                            // serve for resume-tracking; not user-facing progress).
-                            // Claude Code emits many system events with the same
-                            // session_id, which would flood the terminal.
-                            if !message.starts_with("session: ")
-                                && !message.starts_with("thread started: ")
-                            {
-                                println!("ℹ️ {message}");
-                            }
-                        }
-                        core::agent::AgentEvent::Error { message } => {
-                            eprintln!("❌ {message}");
-                        }
-                        core::agent::AgentEvent::Usage { .. } => {}
                     }
                 },
             )
