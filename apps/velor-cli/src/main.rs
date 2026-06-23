@@ -1841,7 +1841,7 @@ async fn run_auto_loop(
                 prompt_name,
                 current_iteration,
                 retry_config,
-                &backoff_policy,
+                backoff_policy,
                 timeouts.clone(),
                 cwd,
                 cancel_handler.token(),
