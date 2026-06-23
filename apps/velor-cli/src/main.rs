@@ -1375,8 +1375,12 @@ async fn run_auto(
     // Handle result and send notifications
     match result {
         Ok(auto_result) => {
-            // Send notification if enabled
-            if !no_notify && should_notify(auto_result.status, &file_cfg.notifications) {
+            // Send notification if enabled — but skip when the user manually
+            // cancelled (Ctrl+C); they already know.
+            if !no_notify
+                && auto_result.status != RunStatus::Cancelled
+                && should_notify(auto_result.status, &file_cfg.notifications)
+            {
                 match build_notifiers(&file_cfg.notifications) {
                     Ok(notifiers) => {
                         if !notifiers.is_empty() {
