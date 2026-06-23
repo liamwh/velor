@@ -1876,4 +1876,70 @@ persist_adapter = false
         assert_eq!(result.acp.permission_mode, PermissionMode::Deny);
         assert!(!result.acp.persist_adapter);
     }
+
+    #[test]
+    fn old_defaults_without_new_duration_fields_still_deserialize() {
+        // A config written before the backoff/timeout fields existed must still parse.
+        let toml = r#"
+            provider = "claude"
+            protocol = "subprocess"
+            binary = "claude-glm"
+            max_retries = 5
+            base_backoff_ms = 100
+            absolute_timeout_ms = 18000000
+        "#;
+        let d: Defaults = toml::from_str(toml).expect("old config should parse");
+        assert_eq!(d.binary, "claude-glm");
+        assert!(d.initial_backoff.is_none());
+        assert!(d.idle_timeout.is_none());
+    }
+
+    #[test]
+    fn new_duration_fields_parse_human_strings() {
+        let toml = r#"
+            initial_backoff = "2s"
+            max_backoff = "1m"
+            backoff_floor = "500ms"
+            idle_timeout = "3m"
+            attempt_timeout = "30m"
+            termination_grace = "5s"
+        "#;
+        let d: Defaults = toml::from_str(toml).expect("durations should parse");
+        assert_eq!(d.initial_backoff.unwrap().get(), Duration::from_secs(2));
+        assert_eq!(d.max_backoff.unwrap().get(), Duration::from_secs(60));
+        assert_eq!(d.backoff_floor.unwrap().get(), Duration::from_millis(500));
+        assert_eq!(d.idle_timeout.unwrap().get(), Duration::from_secs(180));
+        assert_eq!(d.attempt_timeout.unwrap().get(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn invalid_duration_is_rejected() {
+        let toml = r#"
+            initial_backoff = "not a duration"
+        "#;
+        let res: Result<Defaults, _> = toml::from_str(toml);
+        assert!(
+            res.is_err(),
+            "an invalid duration must fail deserialization"
+        );
+    }
+
+    #[test]
+    fn duration_overlays_merge_correctly() {
+        let base = Defaults {
+            idle_timeout: Some(HumantimeDuration(Duration::from_secs(60))),
+            ..Default::default()
+        };
+        let overlay = Defaults {
+            attempt_timeout: Some(HumantimeDuration(Duration::from_secs(600))),
+            ..Default::default()
+        };
+        let merged = base.merge(overlay);
+        // overlay wins where set; base preserved where overlay is None.
+        assert_eq!(merged.idle_timeout.unwrap().get(), Duration::from_secs(60));
+        assert_eq!(
+            merged.attempt_timeout.unwrap().get(),
+            Duration::from_secs(600)
+        );
+    }
 }

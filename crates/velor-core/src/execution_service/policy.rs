@@ -124,9 +124,12 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    /// Creates a breaker with the given config.
+    /// Creates a breaker with the given config. A `threshold` of 0 is clamped to
+    /// 1 (a 0 threshold would otherwise open after a single failure rather than
+    /// never — callers wanting "disabled" should not construct a breaker).
     #[must_use]
-    pub fn new(cfg: CircuitBreakerConfig) -> Self {
+    pub fn new(mut cfg: CircuitBreakerConfig) -> Self {
+        cfg.threshold = cfg.threshold.max(1);
         Self {
             cfg,
             failures: Mutex::new(VecDeque::new()),
