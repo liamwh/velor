@@ -2232,7 +2232,15 @@ async fn execute_with_retry(
                             println!("{prefix} {detail}");
                         }
                         core::agent::AgentEvent::Status { message } => {
-                            println!("ℹ️ {message}");
+                            // Suppress internal session/thread metadata (used by
+                            // serve for resume-tracking; not user-facing progress).
+                            // Claude Code emits many system events with the same
+                            // session_id, which would flood the terminal.
+                            if !message.starts_with("session: ")
+                                && !message.starts_with("thread started: ")
+                            {
+                                println!("ℹ️ {message}");
+                            }
                         }
                         core::agent::AgentEvent::Error { message } => {
                             eprintln!("❌ {message}");
