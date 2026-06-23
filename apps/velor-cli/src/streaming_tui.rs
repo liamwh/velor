@@ -158,8 +158,8 @@ impl Syntax {
         }
     }
 
-    /// Highlights a line of code, returning styled ratatui spans.
-    fn highlight_line(&self, syntax_name: &str, line: &str) -> Vec<Span> {
+    /// Highlights a line of code, returning owned styled ratatui spans.
+    fn highlight_line(&self, syntax_name: &str, line: &str) -> Vec<Span<'static>> {
         let syntax = self
             .set
             .find_syntax_by_extension(syntax_name)
@@ -517,7 +517,7 @@ fn render(f: &mut Frame, state: &mut TuiState, syntax: &Syntax) {
 
     if state.show_prompt {
         if let Some(prompt) = &state.prompt {
-            render_prompt_modal(f, area, prompt, state.prompt_scroll);
+            render_prompt_modal(f, area, prompt, state.prompt_scroll, syntax);
         }
     }
 }
@@ -786,10 +786,10 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
-fn render_prompt_modal(f: &mut Frame, area: Rect, prompt: &str, scroll: u16) {
+fn render_prompt_modal(f: &mut Frame, area: Rect, prompt: &str, scroll: u16, syntax: &Syntax) {
     let popup = center_rect(area, 85, 80);
     f.render_widget(Clear, popup);
-    let lines: Vec<Line> = prompt.lines().map(|l| Line::from(l.to_string())).collect();
+    let lines = render_markdown(prompt, syntax);
     let para = Paragraph::new(lines)
         .block(
             Block::default()
@@ -799,6 +799,258 @@ fn render_prompt_modal(f: &mut Frame, area: Rect, prompt: &str, scroll: u16) {
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(para, popup);
+}
+
+// ── Markdown rendering ──────────────────────────────────────────────────────
+
+/// Renders a markdown string as styled ratatui [`Line`]s.
+///
+/// Handles: headings, bold, inline code, fenced code blocks (with syntax
+/// highlighting via [`Syntax`]), lists, blockquotes, links, and horizontal rules.
+fn render_markdown(text: &str, syntax: &Syntax) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut in_code = false;
+    let mut code_lang: String = String::new();
+    let mut code_lines: Vec<String> = Vec::new();
+
+    for raw_line in text.lines() {
+        // Fenced code block toggle.
+        if raw_line.trim_start().starts_with("```") {
+            if in_code {
+                // Close code block: render accumulated lines with syntax highlighting.
+                let syn_name = syntax_for_file(&code_lang);
+                for cl in &code_lines {
+                    let highlighted = syntax.highlight_line(syn_name, cl);
+                    lines.push(Line::from({
+                        let mut spans = vec![Span::styled(
+                            "  ",
+                            Style::default().bg(Color::Rgb(30, 30, 30)),
+                        )];
+                        spans.extend(highlighted);
+                        spans
+                    }));
+                }
+                in_code = false;
+                code_lines.clear();
+                code_lang.clear();
+            } else {
+                in_code = true;
+                code_lang = raw_line
+                    .trim_start()
+                    .trim_start_matches('`')
+                    .trim()
+                    .to_string();
+            }
+            continue;
+        }
+
+        if in_code {
+            code_lines.push(raw_line.to_string());
+            continue;
+        }
+
+        // Empty line.
+        if raw_line.trim().is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+
+        // Horizontal rule.
+        if (raw_line == "---" || raw_line == "***" || raw_line == "___") && raw_line.len() >= 3 {
+            lines.push(Line::from(Span::styled(
+                "────────────────────────────────────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        // Headings.
+        if let Some(rest) = raw_line.strip_prefix("### ") {
+            lines.push(render_inline_md(
+                rest,
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            continue;
+        }
+        if let Some(rest) = raw_line.strip_prefix("## ") {
+            lines.push(render_inline_md(
+                rest,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            continue;
+        }
+        if let Some(rest) = raw_line.strip_prefix("# ") {
+            lines.push(render_inline_md(
+                rest,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            continue;
+        }
+
+        // Blockquote.
+        if let Some(rest) = raw_line.strip_prefix("> ") {
+            let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
+            spans.extend(
+                render_inline_md(
+                    rest,
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::ITALIC),
+                )
+                .spans,
+            );
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // Unordered list.
+        if let Some(rest) = raw_line
+            .strip_prefix("- ")
+            .or_else(|| raw_line.strip_prefix("* "))
+        {
+            let mut spans = vec![Span::styled("  • ", Style::default().fg(Color::Cyan))];
+            spans.extend(render_inline_md(rest, Style::default()).spans);
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // Ordered list (e.g., "1. text").
+        if let Some(pos) = raw_line.find(". ") {
+            let prefix = &raw_line[..pos + 2];
+            if prefix.chars().all(|c| c.is_ascii_digit() || c == '.') && prefix.len() >= 3 {
+                let rest = &raw_line[pos + 2..];
+                let mut spans = vec![Span::styled(
+                    format!("{prefix:>4}"),
+                    Style::default().fg(Color::Cyan),
+                )];
+                spans.extend(render_inline_md(rest, Style::default()).spans);
+                lines.push(Line::from(spans));
+                continue;
+            }
+        }
+
+        // Regular paragraph.
+        lines.push(render_inline_md(raw_line, Style::default()));
+    }
+
+    // Flush any unclosed code block.
+    if in_code {
+        let syn_name = syntax_for_file(&code_lang);
+        for cl in &code_lines {
+            let highlighted = syntax.highlight_line(syn_name, cl);
+            lines.push(Line::from({
+                let mut spans = vec![Span::styled(
+                    "  ",
+                    Style::default().bg(Color::Rgb(30, 30, 30)),
+                )];
+                spans.extend(highlighted);
+                spans
+            }));
+        }
+    }
+
+    lines
+}
+
+/// Parses inline markdown (bold, inline code, links) within a line.
+fn render_inline_md(text: &str, base_style: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Inline code: `code`
+        if chars[i] == '`' {
+            if !current.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut current), base_style));
+            }
+            i += 1;
+            let mut code = String::new();
+            while i < chars.len() && chars[i] != '`' {
+                code.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1;
+            } // skip closing backtick
+            spans.push(Span::styled(
+                code,
+                base_style.fg(Color::Green).bg(Color::Rgb(30, 30, 30)),
+            ));
+            continue;
+        }
+
+        // Bold: **text**
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+            if !current.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut current), base_style));
+            }
+            i += 2;
+            let mut bold = String::new();
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '*') {
+                bold.push(chars[i]);
+                i += 1;
+            }
+            if i + 1 < chars.len() {
+                i += 2;
+            } // skip closing **
+            spans.push(Span::styled(bold, base_style.add_modifier(Modifier::BOLD)));
+            continue;
+        }
+
+        // Link: [text](url)
+        if chars[i] == '[' {
+            // Look for ]( ... )
+            let mut j = i + 1;
+            let mut label = String::new();
+            while j < chars.len() && chars[j] != ']' {
+                label.push(chars[j]);
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == ']' && j + 1 < chars.len() && chars[j + 1] == '(' {
+                // It's a link.
+                if !current.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut current), base_style));
+                }
+                j += 2;
+                // Skip URL.
+                while j < chars.len() && chars[j] != ')' {
+                    j += 1;
+                }
+                if j < chars.len() {
+                    j += 1;
+                } // skip )
+                spans.push(Span::styled(
+                    label,
+                    base_style
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+                i = j;
+                continue;
+            }
+        }
+
+        current.push(chars[i]);
+        i += 1;
+    }
+
+    if !current.is_empty() {
+        spans.push(Span::styled(current, base_style));
+    }
+
+    if spans.is_empty() {
+        Line::from("")
+    } else {
+        Line::from(spans)
+    }
 }
 
 fn center_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
