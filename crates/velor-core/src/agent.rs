@@ -51,6 +51,8 @@ pub enum AgentEvent {
         tool: String,
         /// Provider-formatted summary of the invocation.
         detail: String,
+        /// The raw tool input JSON (for rich rendering — e.g. Edit diffs).
+        input: serde_json::Value,
     },
     /// Tool/action execution completed.
     ToolResult {

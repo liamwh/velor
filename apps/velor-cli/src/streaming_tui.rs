@@ -1,7 +1,6 @@
-//! Streaming TUI for `vel auto` — shows agent events with timestamps.
-//!
-//! Inspired by the codex CLI: a clean log view with a bottom key-hints bar,
-//! a modal popup for viewing the prompt (`p`), and crossterm-based input.
+//! Streaming TUI for `vel auto` — multi-line, per-type event rendering with
+//! rendered Edit diffs (git-diff style: red background for removed, green for
+//! added, line numbers on the left).
 
 use std::io;
 use std::time::Duration;
@@ -25,73 +24,76 @@ use tokio_util::sync::CancellationToken;
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
-/// Messages sent from the auto loop to the TUI.
 #[derive(Debug, Clone)]
 pub enum TuiMessage {
-    /// A log entry (tool call, result, text delta, etc.).
     Entry(TuiEntry),
-    /// Update the prompt shown by the `p` modal.
     SetPrompt(String),
 }
 
-/// One entry in the streaming log.
+/// One entry in the streaming log. Rich enough to render multi-line content,
+/// diffs, and tool details.
 #[derive(Debug, Clone)]
 pub struct TuiEntry {
     pub ts: chrono::DateTime<Local>,
-    pub icon: &'static str,
-    pub text: String,
-    pub color: Color,
+    pub kind: EntryKind,
+}
+
+/// The type-specific content of an entry. Each variant knows how to render
+/// itself as multiple ratatui [`Line`]s.
+#[derive(Debug, Clone)]
+pub enum EntryKind {
+    /// Assistant text output.
+    Text(String),
+    /// A tool call started. `input` carries the raw tool args JSON.
+    ToolCall {
+        tool: String,
+        detail: String,
+        input: serde_json::Value,
+    },
+    /// A tool result.
+    ToolResult {
+        detail: String,
+        success: Option<bool>,
+    },
+    /// An error.
+    Error(String),
+    /// A lifecycle/status message.
+    Info(String),
 }
 
 impl TuiEntry {
-    fn new(icon: &'static str, color: Color, text: impl Into<String>) -> Self {
+    fn now(kind: EntryKind) -> Self {
         Self {
             ts: Local::now(),
-            icon,
-            color,
-            text: text.into(),
+            kind,
         }
-    }
-
-    pub fn tool_call(tool: &str, detail: &str) -> Self {
-        Self::new("🔧", Color::Yellow, format!("{tool}: {detail}"))
-    }
-    pub fn tool_result(detail: &str, success: Option<bool>) -> Self {
-        let (icon, c) = if success == Some(false) {
-            ("⚠️", Color::Red)
-        } else {
-            ("✅", Color::Green)
-        };
-        Self::new(icon, c, detail.to_string())
-    }
-    pub fn error(text: impl Into<String>) -> Self {
-        Self::new("❌", Color::Red, text)
-    }
-    pub fn text_delta(text: &str) -> Option<Self> {
-        if text.is_empty() {
-            None
-        } else {
-            Some(Self::new("›", Color::Gray, text.to_string()))
-        }
-    }
-    pub fn info(text: impl Into<String>) -> Self {
-        Self::new("ℹ️", Color::Cyan, text)
     }
 }
 
-/// Converts an [`AgentEvent`] to a [`TuiEntry`].
 pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEntry> {
     use velor_core::agent::AgentEvent;
     match event {
-        AgentEvent::TextDelta { text } => TuiEntry::text_delta(text),
-        AgentEvent::ToolCall { tool, detail } => Some(TuiEntry::tool_call(tool, detail)),
+        AgentEvent::TextDelta { text } if text.is_empty() => None,
+        AgentEvent::TextDelta { text } => Some(TuiEntry::now(EntryKind::Text(text.clone()))),
+        AgentEvent::ToolCall {
+            tool,
+            detail,
+            input,
+        } => Some(TuiEntry::now(EntryKind::ToolCall {
+            tool: tool.clone(),
+            detail: detail.clone(),
+            input: input.clone(),
+        })),
         AgentEvent::ToolResult {
             detail, success, ..
-        } => Some(TuiEntry::tool_result(detail, *success)),
-        AgentEvent::Error { message } => Some(TuiEntry::error(message.clone())),
+        } => Some(TuiEntry::now(EntryKind::ToolResult {
+            detail: detail.clone(),
+            success: success.clone(),
+        })),
+        AgentEvent::Error { message } => Some(TuiEntry::now(EntryKind::Error(message.clone()))),
         AgentEvent::Status { message } if message.starts_with("session: ") => None,
         AgentEvent::Status { message } if message.starts_with("thread started: ") => None,
-        AgentEvent::Status { message } => Some(TuiEntry::info(message.clone())),
+        AgentEvent::Status { message } => Some(TuiEntry::now(EntryKind::Info(message.clone()))),
         AgentEvent::Usage { .. } => None,
     }
 }
@@ -134,7 +136,6 @@ pub async fn run_streaming_tui(
     let mut state = TuiState::new();
 
     loop {
-        // Drain pending messages.
         let mut had_new = false;
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -154,7 +155,6 @@ pub async fn run_streaming_tui(
 
         terminal.draw(|f| render(f, &mut state)).wrap_err("draw")?;
 
-        // Input (100 ms poll tick).
         if event::poll(Duration::from_millis(100))
             .map_err(|e| color_eyre::eyre::eyre!("poll: {e}"))?
         {
@@ -185,7 +185,6 @@ pub async fn run_streaming_tui(
 }
 
 fn handle_key(key: event::KeyEvent, state: &mut TuiState, cancel: &CancellationToken) {
-    // In prompt modal, handle modal-specific keys first.
     if state.show_prompt {
         match key.code {
             KeyCode::Char('p') | KeyCode::Esc | KeyCode::Enter => state.show_prompt = false,
@@ -224,8 +223,8 @@ fn handle_key(key: event::KeyEvent, state: &mut TuiState, cancel: &CancellationT
 
 fn render(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
+    let width = area.width as usize;
 
-    // Split: log area (top) + key-hints bar (bottom 1 line).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(1)])
@@ -233,24 +232,20 @@ fn render(f: &mut Frame, state: &mut TuiState) {
     let log_area = chunks[0];
     let hints_area = chunks[1];
 
-    // Build log lines.
-    let lines: Vec<Line> = state
-        .entries
-        .iter()
-        .map(|e| {
-            let ts = e.ts.format("%H:%M:%S").to_string();
-            Line::from(vec![
-                Span::styled(format!("{ts} │ "), Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} ", e.icon),
-                    Style::default().fg(e.color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(&e.text),
-            ])
-        })
-        .collect();
+    // Build all lines from all entries (each entry may produce multiple lines).
+    let mut all_lines: Vec<Line> = Vec::new();
+    for entry in &state.entries {
+        let ts = entry.ts.format("%H:%M:%S").to_string();
+        let ts_span = Span::styled(format!("{ts} "), Style::default().fg(Color::DarkGray));
+        for line in render_entry(&entry.kind, width) {
+            // Prepend timestamp to the first line of each entry.
+            let mut spans = vec![ts_span.clone()];
+            spans.extend(line.spans);
+            all_lines.push(Line::from(spans));
+        }
+    }
 
-    let total = lines.len() as u16;
+    let total = all_lines.len() as u16;
     let vis_h = log_area.height.saturating_sub(2);
     let skip = if state.scroll_offset > 0 {
         total
@@ -259,7 +254,7 @@ fn render(f: &mut Frame, state: &mut TuiState) {
     } else {
         total.saturating_sub(vis_h)
     };
-    let visible: Vec<Line> = lines.into_iter().skip(skip as usize).collect();
+    let visible: Vec<Line> = all_lines.into_iter().skip(skip as usize).collect();
     let title = format!(
         " vel auto — {} events {} ",
         state.entries.len(),
@@ -269,12 +264,13 @@ fn render(f: &mut Frame, state: &mut TuiState) {
             "live".into()
         }
     );
-    let para = Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title));
+    let para = Paragraph::new(visible)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
     f.render_widget(para, log_area);
 
-    // Key-hints bar.
     let hints = if state.show_prompt {
-        " p/Esc: close  ↑↓: scroll  "
+        " p/Esc: close prompt  ↑↓: scroll prompt "
     } else {
         " p: prompt  ↑↓: scroll  q: quit  Ctrl+C: cancel "
     };
@@ -285,7 +281,6 @@ fn render(f: &mut Frame, state: &mut TuiState) {
     );
     f.render_widget(hints_para, hints_area);
 
-    // Prompt modal overlay.
     if state.show_prompt {
         if let Some(prompt) = &state.prompt {
             render_prompt_modal(f, area, prompt, state.prompt_scroll);
@@ -293,8 +288,177 @@ fn render(f: &mut Frame, state: &mut TuiState) {
     }
 }
 
+/// Renders one entry as multiple [`Line`]s (without timestamp — the caller prepends it).
+fn render_entry<'a>(kind: &'a EntryKind, _width: usize) -> Vec<Line<'a>> {
+    match kind {
+        EntryKind::Text(text) => {
+            vec![Line::from(vec![
+                Span::styled("› ", Style::default().fg(Color::Gray)),
+                Span::styled(text, Style::default().fg(Color::Gray)),
+            ])]
+        }
+
+        EntryKind::ToolCall {
+            tool,
+            detail,
+            input,
+        } => {
+            let mut lines = Vec::new();
+
+            // Header line: 🔧 TOOL: detail
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "🔧 ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    tool,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(": "),
+                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+            ]));
+
+            // For Edit/Write: render a git-diff-style view.
+            if tool == "Edit" || tool == "Write" {
+                lines.extend(render_edit_diff(tool, input));
+            }
+
+            lines
+        }
+
+        EntryKind::ToolResult { detail, success } => {
+            let (icon, color) = if success == &Some(false) {
+                ("⚠️", Color::Red)
+            } else {
+                ("✅", Color::Green)
+            };
+            // Render multi-line: split the detail on newlines.
+            let mut lines = Vec::new();
+            for (i, line) in detail.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{icon} "), Style::default().fg(color)),
+                        Span::styled(
+                            truncate_str(line, 200),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            truncate_str(line, 200),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("{icon} (no output)"),
+                    Style::default().fg(color),
+                )));
+            }
+            lines
+        }
+
+        EntryKind::Error(msg) => {
+            vec![Line::from(vec![
+                Span::styled("❌ ", Style::default().fg(Color::Red)),
+                Span::styled(msg, Style::default().fg(Color::Red)),
+            ])]
+        }
+
+        EntryKind::Info(msg) => {
+            vec![Line::from(vec![
+                Span::styled("ℹ️ ", Style::default().fg(Color::Cyan)),
+                Span::styled(msg, Style::default().fg(Color::Cyan)),
+            ])]
+        }
+    }
+}
+
+/// Renders an Edit/Write tool call's old→new strings as a git-diff-style view.
+fn render_edit_diff<'a>(tool: &'a str, input: &'a serde_json::Value) -> Vec<Line<'a>> {
+    let file = input
+        .get("file_path")
+        .or_else(|| input.get("file_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let old = input
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new = input
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let mut lines = Vec::new();
+
+    // File header (like git diff).
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            if tool == "Write" {
+                format!("--- {file} (new file)")
+            } else {
+                format!("--- {file}")
+            },
+            Style::default().fg(Color::Red),
+        ),
+    ]));
+
+    if tool == "Edit" && !old.is_empty() {
+        for (i, l) in old.lines().enumerate() {
+            lines.push(diff_line(i + 1, l, false));
+        }
+    }
+
+    if !new.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("+++ {file}"), Style::default().fg(Color::Green)),
+        ]));
+        for (i, l) in new.lines().enumerate() {
+            lines.push(diff_line(i + 1, l, true));
+        }
+    }
+
+    lines
+}
+
+/// Renders one diff line with line number, +/- prefix, and colour.
+fn diff_line(line_no: usize, text: &str, added: bool) -> Line {
+    let (prefix, color, bg) = if added {
+        ("+", Color::Green, Color::Rgb(20, 40, 20))
+    } else {
+        ("-", Color::Red, Color::Rgb(40, 20, 20))
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{line_no:>4} "),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(format!("{prefix}{text}"), Style::default().fg(color).bg(bg)),
+    ])
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..s.floor_char_boundary(max)])
+    }
+}
+
 fn render_prompt_modal(f: &mut Frame, area: Rect, prompt: &str, scroll: u16) {
-    // Centered popup: 85% width, 80% height.
     let popup = center_rect(area, 85, 80);
     f.render_widget(Clear, popup);
     let lines: Vec<Line> = prompt.lines().map(|l| Line::from(l.to_string())).collect();
@@ -309,7 +473,6 @@ fn render_prompt_modal(f: &mut Frame, area: Rect, prompt: &str, scroll: u16) {
     f.render_widget(para, popup);
 }
 
-/// Returns a centered rect with the given percentage width/height.
 fn center_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
     let pop_w = area.width.saturating_mul(pct_w) / 100;
     let pop_h = area.height.saturating_mul(pct_h) / 100;

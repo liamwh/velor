@@ -284,7 +284,15 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                                 .unwrap_or("tool")
                                 .to_string();
                             let detail = summarize_tool_input(&name, item.get("input"));
-                            events.push(AgentEvent::ToolCall { tool: name, detail });
+                            let input = item
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            events.push(AgentEvent::ToolCall {
+                                tool: name,
+                                detail,
+                                input,
+                            });
                         }
                         "tool_result" => {
                             let detail = item
@@ -410,7 +418,7 @@ mod tests {
             &mut collected,
         );
         assert!(matches!(events[0], AgentEvent::ToolCall { .. }));
-        if let AgentEvent::ToolCall { tool, detail } = &events[0] {
+        if let AgentEvent::ToolCall { tool, detail, .. } = &events[0] {
             assert_eq!(tool, "Read");
             assert_eq!(detail, "src/lib.rs");
         }

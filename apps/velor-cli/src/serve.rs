@@ -5158,7 +5158,7 @@ fn map_agent_event_to_progress(
             out
         }
         AgentEvent::TextDelta { text } => vec![RunnerProgressEvent::OutputDelta(text)],
-        AgentEvent::ToolCall { tool, detail } => {
+        AgentEvent::ToolCall { tool, detail, .. } => {
             vec![RunnerProgressEvent::Milestone(format!(
                 "tool start: {tool} ({detail})"
             ))]

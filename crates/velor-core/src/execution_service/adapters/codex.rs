@@ -225,6 +225,7 @@ fn parse_codex_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                 events.push(AgentEvent::ToolCall {
                     tool: "command_execution".to_string(),
                     detail: truncate(cmd, 120),
+                    input: serde_json::json!({"command": cmd}),
                 });
             }
         }
