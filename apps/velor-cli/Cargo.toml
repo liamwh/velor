@@ -23,6 +23,7 @@ fs2 = { workspace = true }
 humantime = { workspace = true }
 ratatui = { workspace = true }
 syntect = { workspace = true }
+tui-markdown = { workspace = true }
 reqwest = { workspace = true }
 infer = { workspace = true }
 serde = { workspace = true }
