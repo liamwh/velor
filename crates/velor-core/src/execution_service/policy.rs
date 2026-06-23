@@ -8,10 +8,17 @@
 //! ## Circuit breaker
 //! Only **transient upstream** failures count toward opening the breaker (a local
 //! Velor deadline, a missing executable, auth, or context-too-large must NOT open
-//! it). After `threshold` transient failures within `window`, the breaker opens
-//! and refuses new attempts until `cooldown` elapses, then allows a half-open
-//! probe. Note: an in-memory breaker only helps long-lived processes (e.g.
-//! `vel serve`); isolated CLI invocations gain little, which is documented.
+//! it). The breaker opens when `threshold` transient failures have been recorded
+//! within a sliding `window` **and no success has cleared them since** — a single
+//! success calls [`CircuitBreaker::record_success`], which resets the count to
+//! zero (so the count is effectively "consecutive-within-window", not a pure
+//! rolling count). Once open it refuses attempts until `cooldown` has elapsed
+//! since the most recent failure, after which it is *half-open*: any attempt may
+//! proceed (there is no bounded probe budget — a half-open attempt that succeeds
+//! closes the breaker, one that records a fresh transient failure re-opens it).
+//! State lives in the [`AgentExecutionService`](super::service) instance, so it
+//! persists for the process lifetime: effective for the long-lived `vel serve`,
+//! near-no-op for isolated CLI invocations.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -264,6 +271,49 @@ mod tests {
         assert!(matches!(b.state(t0), CircuitState::Open { .. }));
         let later = t0 + Duration::from_secs(11);
         assert!(matches!(b.state(later), CircuitState::HalfOpen));
+    }
+
+    #[test]
+    fn breaker_failures_expire_outside_window() {
+        // Sliding window: failures older than `window` no longer count.
+        let cfg = CircuitBreakerConfig {
+            threshold: 2,
+            window: Duration::from_secs(60),
+            cooldown: Duration::from_secs(30),
+        };
+        let b = CircuitBreaker::new(cfg);
+        let t0 = Instant::now();
+        b.record_failure(t0);
+        b.record_failure(t0); // 2 within window at t0 -> Open
+        assert!(matches!(b.state(t0), CircuitState::Open { .. }));
+        // Both failures are now > window old; they must not count.
+        let later = t0 + Duration::from_secs(61);
+        assert!(
+            matches!(b.state(later), CircuitState::Closed),
+            "expired failures should not keep the breaker open"
+        );
+    }
+
+    #[test]
+    fn breaker_success_resets_the_window() {
+        // A success clears the count, so threshold-many failures split by a
+        // success do NOT open the breaker (consecutive-within-window semantics).
+        let cfg = CircuitBreakerConfig {
+            threshold: 3,
+            window: Duration::from_secs(60),
+            cooldown: Duration::from_secs(30),
+        };
+        let b = CircuitBreaker::new(cfg);
+        let t0 = Instant::now();
+        b.record_failure(t0);
+        b.record_failure(t0);
+        b.record_success(); // resets
+        b.record_failure(t0);
+        b.record_failure(t0); // only 2 since the success
+        assert!(
+            matches!(b.state(t0), CircuitState::Closed),
+            "success should reset the failure window"
+        );
     }
 
     #[test]
