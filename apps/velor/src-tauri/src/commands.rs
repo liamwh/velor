@@ -790,13 +790,15 @@ async fn apply_agent_event(
                 success: None,
             }),
             AgentEvent::TextDelta { text } => record.append_output(&text),
-            AgentEvent::ToolCall { tool, detail } => record.record_activity(ExecutionActivity {
-                provider: provider.to_string(),
-                kind: ExecutionActivityKind::ToolCall,
-                summary: tool,
-                detail: Some(detail),
-                success: None,
-            }),
+            AgentEvent::ToolCall { tool, detail, .. } => {
+                record.record_activity(ExecutionActivity {
+                    provider: provider.to_string(),
+                    kind: ExecutionActivityKind::ToolCall,
+                    summary: tool,
+                    detail: Some(detail),
+                    success: None,
+                })
+            }
             AgentEvent::ToolResult {
                 tool,
                 detail,

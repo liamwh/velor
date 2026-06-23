@@ -2262,7 +2262,7 @@ async fn execute_with_retry(
                                     print!("{text}");
                                     let _ = std::io::stdout().flush();
                                 }
-                                core::agent::AgentEvent::ToolCall { tool, detail } => {
+                                core::agent::AgentEvent::ToolCall { tool, detail, .. } => {
                                     println!("🔧 {tool}: {detail}");
                                 }
                                 core::agent::AgentEvent::ToolResult {
