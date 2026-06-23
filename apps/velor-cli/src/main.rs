@@ -210,6 +210,10 @@ struct AutoArgs {
     /// Disable notifications for this run.
     #[arg(long)]
     no_notify: bool,
+
+    /// Disable the TUI; print agent output to stdout instead.
+    #[arg(long)]
+    no_tui: bool,
 }
 
 /// Arguments for the `plan` subcommand
@@ -271,6 +275,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "iterations",
     "max-retries",
     "base-backoff-ms",
+    "no-tui",
     "specs-dir",
     "max-iterations",
     "openai-api-key",
@@ -855,6 +860,7 @@ async fn run_interactive_menu(
                     max_retries: None,
                     base_backoff_ms: None,
                     no_notify: false,
+                    no_tui: false,
                 },
                 home_cfg,
                 git_root,
@@ -1352,9 +1358,18 @@ async fn run_auto(
     tracing::info!("rules_set_ref.is_some(): {}", rules_set_ref.is_some());
 
     // Streaming TUI: shows agent events with timestamps in an alternate screen.
-    let (tui_tx, tui_rx) = tokio::sync::mpsc::channel::<streaming_tui::TuiEntry>(256);
+    // When --no-tui, fall back to plain stdout printing (no TUI task).
+    let no_tui = args.no_tui;
+    let (tui_tx, tui_rx) = tokio::sync::mpsc::channel::<streaming_tui::TuiMessage>(256);
     let tui_cancel = cancel_handler.token().clone();
-    let tui_task = tokio::spawn(streaming_tui::run_streaming_tui(tui_rx, tui_cancel));
+    let tui_task = if no_tui {
+        None
+    } else {
+        Some(tokio::spawn(streaming_tui::run_streaming_tui(
+            tui_rx, tui_cancel,
+        )))
+    };
+    let tui_ref = if no_tui { None } else { Some(&tui_tx) };
 
     let result = run_auto_loop(
         &runner,
@@ -1375,13 +1390,15 @@ async fn run_auto(
         &file_cfg.defaults.acp,
         &file_cfg.rules,
         common.append.as_deref(),
-        &tui_tx,
+        tui_ref,
     )
     .await;
 
     // Restore terminal (TUI exits when sender is dropped).
     drop(tui_tx);
-    let _ = tui_task.await;
+    if let Some(task) = tui_task {
+        let _ = task.await;
+    }
 
     // Handle result and send notifications
     match result {
@@ -1753,7 +1770,7 @@ async fn run_auto_loop(
     acp_config: &core::config::AcpConfig,
     rules_config: &core::config::RulesConfig,
     append: Option<&str>,
-    tui_tx: &tokio::sync::mpsc::Sender<streaming_tui::TuiEntry>,
+    tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1856,8 +1873,13 @@ async fn run_auto_loop(
             // Applied every iteration to ensure instructions persist
             let final_prompt = finalize_prompt(&prompt_with_rules, append);
 
-            println!("📋 Prompt:\n{final_prompt}");
-            println!("────────────────────────────────────────");
+            // Show the prompt: TUI modal (press p) or stdout.
+            if let Some(tx) = tui_tx {
+                let _ = tx.try_send(streaming_tui::TuiMessage::SetPrompt(final_prompt.clone()));
+            } else {
+                println!("📋 Prompt:\n{final_prompt}");
+                println!("────────────────────────────────────────");
+            }
 
             // Execute with retry logic
             let retry_result = execute_with_retry(
@@ -2175,7 +2197,7 @@ async fn execute_with_retry(
     timeouts: core::execution_service::supervisor::ProcessTimeouts,
     cwd: &std::path::Path,
     cancel_token: &CancellationToken,
-    tui_tx: &tokio::sync::mpsc::Sender<streaming_tui::TuiEntry>,
+    tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let mut last_floor: Option<std::time::Duration> = None;
@@ -2226,10 +2248,45 @@ async fn execute_with_retry(
                 timeouts.clone(),
                 cancel_token.clone(),
                 {
-                    let tui_tx = tui_tx.clone();
-                    move |event: core::agent::AgentEvent| {
-                        if let Some(entry) = streaming_tui::agent_event_to_tui(&event) {
-                            let _ = tui_tx.try_send(entry);
+                    let tui_tx = tui_tx.map(|tx| tx.clone());
+                    move |event: core::agent::AgentEvent| match &tui_tx {
+                        Some(tx) => {
+                            if let Some(entry) = streaming_tui::agent_event_to_tui(&event) {
+                                let _ = tx.try_send(streaming_tui::TuiMessage::Entry(entry));
+                            }
+                        }
+                        None => {
+                            use std::io::Write;
+                            match &event {
+                                core::agent::AgentEvent::TextDelta { text } => {
+                                    print!("{text}");
+                                    let _ = std::io::stdout().flush();
+                                }
+                                core::agent::AgentEvent::ToolCall { tool, detail } => {
+                                    println!("🔧 {tool}: {detail}");
+                                }
+                                core::agent::AgentEvent::ToolResult {
+                                    detail, success, ..
+                                } => {
+                                    let prefix = if success == &Some(false) {
+                                        "⚠️"
+                                    } else {
+                                        "✅"
+                                    };
+                                    println!("{prefix} {detail}");
+                                }
+                                core::agent::AgentEvent::Status { message } => {
+                                    if !message.starts_with("session: ")
+                                        && !message.starts_with("thread started: ")
+                                    {
+                                        println!("ℹ️ {message}");
+                                    }
+                                }
+                                core::agent::AgentEvent::Error { message } => {
+                                    eprintln!("❌ {message}");
+                                }
+                                core::agent::AgentEvent::Usage { .. } => {}
+                            }
                         }
                     }
                 },
