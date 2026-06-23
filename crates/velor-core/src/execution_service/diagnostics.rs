@@ -217,7 +217,7 @@ impl ReplayManifest {
         prompt_path: &Path,
         env: &BTreeMap<String, String>,
     ) -> std::io::Result<Self> {
-        std::fs::write(prompt_path, prompt)?;
+        write_restricted(prompt_path, prompt)?;
         let arguments = arguments.iter().map(|a| redact_secrets(a, 4096)).collect();
         Ok(Self {
             executable: executable.to_string(),
@@ -249,6 +249,32 @@ impl ReplayManifest {
 fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+/// Writes `bytes` to `path` with owner-only permissions on Unix (0o600) so a
+/// replay prompt file — which may contain secrets — is never world/group-readable.
+/// On non-Unix platforms there is no permission model, so a plain write is used.
+fn write_restricted(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        // Ensure the mode is applied even if the file pre-existed with looser bits.
+        let perms = std::fs::Permissions::from_mode(0o600);
+        f.set_permissions(perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -317,5 +343,33 @@ mod tests {
         assert!(env.contains_key("TERM"));
         // ZAI_API_KEY is NOT in the safe list and must never appear.
         assert!(!env.contains_key("ZAI_API_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_prompt_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt_path = dir.path().join("prompt.txt");
+        let _ = ReplayManifest::build(
+            "glm5",
+            &["-p".into()],
+            None,
+            b"secret-prompt",
+            &prompt_path,
+            &BTreeMap::new(),
+        )
+        .expect("build manifest");
+        let mode = std::fs::metadata(&prompt_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        // Owner read/write only — no group/other bits.
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "prompt file must be owner-only (0o600), got {:o}",
+            mode
+        );
     }
 }
