@@ -26,7 +26,7 @@ ctrlc = "3.4"
 crossterm = "0.28"
 humantime = "2"
 minijinja = { version = "2.3", features = ["debug"] }
-ratatui = "0.29"
+ratatui = "0.30"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 secrecy = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -55,6 +55,7 @@ diffy = "0.4"
 fs2 = "0.4"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
 syntect = "5"
+tui-markdown = "0.3"
 cron = "0.12"
 iana-time-zone = "0.1"
 tempfile = "3"
