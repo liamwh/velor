@@ -1,8 +1,7 @@
 //! Streaming TUI for `vel auto` — shows agent events with timestamps.
 //!
-//! Uses ratatui + crossterm in an alternate screen. Events arrive on an mpsc
-//! channel from the agent's `run_with_events` callback and the auto loop's
-//! lifecycle messages. The TUI auto-scrolls to the latest event.
+//! Inspired by the codex CLI: a clean log view with a bottom key-hints bar,
+//! a modal popup for viewing the prompt (`p`), and crossterm-based input.
 
 use std::io;
 use std::time::Duration;
@@ -17,22 +16,30 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use tokio_util::sync::CancellationToken;
+
+// ── Messages ────────────────────────────────────────────────────────────────
+
+/// Messages sent from the auto loop to the TUI.
+#[derive(Debug, Clone)]
+pub enum TuiMessage {
+    /// A log entry (tool call, result, text delta, etc.).
+    Entry(TuiEntry),
+    /// Update the prompt shown by the `p` modal.
+    SetPrompt(String),
+}
 
 /// One entry in the streaming log.
 #[derive(Debug, Clone)]
 pub struct TuiEntry {
-    /// Wall-clock timestamp.
     pub ts: chrono::DateTime<Local>,
-    /// Short icon/emoji.
     pub icon: &'static str,
-    /// The message text (may be multi-line).
     pub text: String,
-    /// Colour for the icon.
     pub color: Color,
 }
 
@@ -46,32 +53,20 @@ impl TuiEntry {
         }
     }
 
-    /// Info / lifecycle message.
-    pub fn info(text: impl Into<String>) -> Self {
-        Self::new("ℹ️", Color::Cyan, text)
-    }
-
-    /// Tool call started.
     pub fn tool_call(tool: &str, detail: &str) -> Self {
         Self::new("🔧", Color::Yellow, format!("{tool}: {detail}"))
     }
-
-    /// Tool result.
     pub fn tool_result(detail: &str, success: Option<bool>) -> Self {
-        let (icon, color) = if success == Some(false) {
+        let (icon, c) = if success == Some(false) {
             ("⚠️", Color::Red)
         } else {
             ("✅", Color::Green)
         };
-        Self::new(icon, color, detail.to_string())
+        Self::new(icon, c, detail.to_string())
     }
-
-    /// Error message.
     pub fn error(text: impl Into<String>) -> Self {
         Self::new("❌", Color::Red, text)
     }
-
-    /// Text delta (assistant output). Returns `None` if empty.
     pub fn text_delta(text: &str) -> Option<Self> {
         if text.is_empty() {
             None
@@ -79,9 +74,12 @@ impl TuiEntry {
             Some(Self::new("›", Color::Gray, text.to_string()))
         }
     }
+    pub fn info(text: impl Into<String>) -> Self {
+        Self::new("ℹ️", Color::Cyan, text)
+    }
 }
 
-/// Converts an [`AgentEvent`](velor_core::agent::AgentEvent) to a [`TuiEntry`].
+/// Converts an [`AgentEvent`] to a [`TuiEntry`].
 pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEntry> {
     use velor_core::agent::AgentEvent;
     match event {
@@ -91,7 +89,6 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
             detail, success, ..
         } => Some(TuiEntry::tool_result(detail, *success)),
         AgentEvent::Error { message } => Some(TuiEntry::error(message.clone())),
-        // Suppress internal session/thread metadata.
         AgentEvent::Status { message } if message.starts_with("session: ") => None,
         AgentEvent::Status { message } if message.starts_with("thread started: ") => None,
         AgentEvent::Status { message } => Some(TuiEntry::info(message.clone())),
@@ -99,16 +96,34 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
     }
 }
 
-/// Runs the streaming TUI, rendering entries from `rx` until the channel closes
-/// or `cancel` fires. Restores the terminal on exit.
-///
-/// # Errors
-/// Returns an error on terminal setup/teardown failure.
+// ── State ───────────────────────────────────────────────────────────────────
+
+struct TuiState {
+    entries: Vec<TuiEntry>,
+    prompt: Option<String>,
+    show_prompt: bool,
+    prompt_scroll: u16,
+    scroll_offset: u16,
+}
+
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            prompt: None,
+            show_prompt: false,
+            prompt_scroll: 0,
+            scroll_offset: 0,
+        }
+    }
+}
+
+// ── Run loop ────────────────────────────────────────────────────────────────
+
 pub async fn run_streaming_tui(
-    mut rx: tokio::sync::mpsc::Receiver<TuiEntry>,
+    mut rx: tokio::sync::mpsc::Receiver<TuiMessage>,
     cancel: CancellationToken,
 ) -> color_eyre::eyre::Result<Vec<TuiEntry>> {
-    // Setup terminal.
     enable_raw_mode().wrap_err("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).wrap_err("enter alt screen")?;
@@ -116,127 +131,194 @@ pub async fn run_streaming_tui(
     let mut terminal = Terminal::new(backend).wrap_err("create terminal")?;
     terminal.clear()?;
 
-    let mut entries: Vec<TuiEntry> = Vec::new();
-    let mut scroll_offset: u16 = 0;
+    let mut state = TuiState::new();
 
     loop {
-        // Drain pending events (non-blocking).
+        // Drain pending messages.
         let mut had_new = false;
-        while let Ok(entry) = rx.try_recv() {
-            entries.push(entry);
-            had_new = true;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                TuiMessage::Entry(e) => {
+                    state.entries.push(e);
+                    had_new = true;
+                }
+                TuiMessage::SetPrompt(p) => {
+                    state.prompt = Some(p);
+                    state.prompt_scroll = 0;
+                }
+            }
         }
         if had_new {
-            scroll_offset = 0; // auto-scroll to bottom
+            state.scroll_offset = 0;
         }
 
-        // Render.
-        terminal
-            .draw(|f| render(f, &entries, scroll_offset))
-            .wrap_err("draw")?;
+        terminal.draw(|f| render(f, &mut state)).wrap_err("draw")?;
 
-        // Poll for input (100 ms timeout — also acts as render-refresh tick).
+        // Input (100 ms poll tick).
         if event::poll(Duration::from_millis(100))
             .map_err(|e| color_eyre::eyre::eyre!("poll: {e}"))?
         {
             if let Event::Key(key) =
                 event::read().map_err(|e| color_eyre::eyre::eyre!("read: {e}"))?
             {
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        cancel.cancel();
-                        break;
-                    }
-                    KeyCode::Char('q') => {
-                        cancel.cancel();
-                        break;
-                    }
-                    KeyCode::Up => {
-                        scroll_offset = scroll_offset.saturating_add(1);
-                    }
-                    KeyCode::Down => {
-                        scroll_offset = scroll_offset.saturating_sub(1);
-                    }
-                    KeyCode::PageUp => {
-                        scroll_offset = scroll_offset.saturating_add(10);
-                    }
-                    KeyCode::PageDown => {
-                        scroll_offset = scroll_offset.saturating_sub(10);
-                    }
-                    _ => {}
-                }
+                handle_key(key, &mut state, &cancel);
             }
         }
 
-        // Exit when channel closed (sender dropped = run complete) and no more events.
         if rx.is_empty() && rx.is_closed() {
             break;
         }
-
         if cancel.is_cancelled() {
             break;
         }
     }
 
-    // Drain any straggler events.
-    while let Ok(entry) = rx.try_recv() {
-        entries.push(entry);
+    while let Ok(msg) = rx.try_recv() {
+        if let TuiMessage::Entry(e) = msg {
+            state.entries.push(e);
+        }
     }
 
-    // Restore terminal.
     disable_raw_mode().wrap_err("disable raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen).wrap_err("leave alt screen")?;
-
-    Ok(entries)
+    Ok(state.entries)
 }
 
-/// Renders the streaming log.
-fn render(f: &mut Frame, entries: &[TuiEntry], scroll_offset: u16) {
+fn handle_key(key: event::KeyEvent, state: &mut TuiState, cancel: &CancellationToken) {
+    // In prompt modal, handle modal-specific keys first.
+    if state.show_prompt {
+        match key.code {
+            KeyCode::Char('p') | KeyCode::Esc | KeyCode::Enter => state.show_prompt = false,
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.prompt_scroll = state.prompt_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.prompt_scroll = state.prompt_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => state.prompt_scroll = state.prompt_scroll.saturating_add(10),
+            KeyCode::PageUp => state.prompt_scroll = state.prompt_scroll.saturating_sub(10),
+            _ => {}
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            cancel.cancel();
+        }
+        KeyCode::Char('q') => {
+            cancel.cancel();
+        }
+        KeyCode::Char('p') => {
+            state.show_prompt = true;
+            state.prompt_scroll = 0;
+        }
+        KeyCode::Up => state.scroll_offset = state.scroll_offset.saturating_add(1),
+        KeyCode::Down => state.scroll_offset = state.scroll_offset.saturating_sub(1),
+        KeyCode::PageUp => state.scroll_offset = state.scroll_offset.saturating_add(10),
+        KeyCode::PageDown => state.scroll_offset = state.scroll_offset.saturating_sub(10),
+        _ => {}
+    }
+}
+
+// ── Render ──────────────────────────────────────────────────────────────────
+
+fn render(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
 
-    // Build the log lines: each entry → one or more lines (timestamp │ icon text).
-    let mut lines: Vec<Line> = Vec::new();
-    for entry in entries {
-        let ts = entry.ts.format("%H:%M:%S").to_string();
-        let ts_span = Span::styled(format!("{ts} │ "), Style::default().fg(Color::DarkGray));
-        let icon_span = Span::styled(
-            format!("{} ", entry.icon),
-            Style::default()
-                .fg(entry.color)
-                .add_modifier(Modifier::BOLD),
-        );
-        let text_span = Span::raw(&entry.text);
-        lines.push(Line::from(vec![ts_span, icon_span, text_span]));
-    }
+    // Split: log area (top) + key-hints bar (bottom 1 line).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+    let log_area = chunks[0];
+    let hints_area = chunks[1];
 
-    // Calculate the visible window (auto-scroll to bottom unless user scrolled up).
-    let total_lines = lines.len() as u16;
-    let visible_height = area.height.saturating_sub(2); // -2 for border
-    let skip = if scroll_offset > 0 {
-        total_lines
-            .saturating_sub(visible_height)
-            .saturating_sub(scroll_offset)
+    // Build log lines.
+    let lines: Vec<Line> = state
+        .entries
+        .iter()
+        .map(|e| {
+            let ts = e.ts.format("%H:%M:%S").to_string();
+            Line::from(vec![
+                Span::styled(format!("{ts} │ "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} ", e.icon),
+                    Style::default().fg(e.color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&e.text),
+            ])
+        })
+        .collect();
+
+    let total = lines.len() as u16;
+    let vis_h = log_area.height.saturating_sub(2);
+    let skip = if state.scroll_offset > 0 {
+        total
+            .saturating_sub(vis_h)
+            .saturating_sub(state.scroll_offset)
     } else {
-        total_lines.saturating_sub(visible_height)
+        total.saturating_sub(vis_h)
     };
-
     let visible: Vec<Line> = lines.into_iter().skip(skip as usize).collect();
-
     let title = format!(
         " vel auto — {} events {} ",
-        entries.len(),
-        if scroll_offset > 0 {
-            format!("(↑ {} scrolled)", scroll_offset)
+        state.entries.len(),
+        if state.scroll_offset > 0 {
+            format!("(↑ {})", state.scroll_offset)
         } else {
-            "(live)".to_string()
+            "live".into()
         }
     );
+    let para = Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(para, log_area);
 
-    let para = Paragraph::new(visible).scroll((0, 0)).block(
-        ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .title(title),
+    // Key-hints bar.
+    let hints = if state.show_prompt {
+        " p/Esc: close  ↑↓: scroll  "
+    } else {
+        " p: prompt  ↑↓: scroll  q: quit  Ctrl+C: cancel "
+    };
+    let hints_para = Paragraph::new(hints).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
     );
+    f.render_widget(hints_para, hints_area);
 
-    f.render_widget(para, area);
+    // Prompt modal overlay.
+    if state.show_prompt {
+        if let Some(prompt) = &state.prompt {
+            render_prompt_modal(f, area, prompt, state.prompt_scroll);
+        }
+    }
+}
+
+fn render_prompt_modal(f: &mut Frame, area: Rect, prompt: &str, scroll: u16) {
+    // Centered popup: 85% width, 80% height.
+    let popup = center_rect(area, 85, 80);
+    f.render_widget(Clear, popup);
+    let lines: Vec<Line> = prompt.lines().map(|l| Line::from(l.to_string())).collect();
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 📋 Prompt (p/Esc to close) "),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(para, popup);
+}
+
+/// Returns a centered rect with the given percentage width/height.
+fn center_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
+    let pop_w = area.width.saturating_mul(pct_w) / 100;
+    let pop_h = area.height.saturating_mul(pct_h) / 100;
+    let x = area.x + (area.width.saturating_sub(pop_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(pop_h)) / 2;
+    Rect {
+        x,
+        y,
+        width: pop_w,
+        height: pop_h,
+    }
 }
