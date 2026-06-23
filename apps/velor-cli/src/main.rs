@@ -2198,18 +2198,49 @@ async fn execute_with_retry(
         }
 
         match runner
-            .run(
+            .run_with_events(
                 binary,
                 permission_mode,
                 prompt,
                 prompt_name,
                 cwd,
+                &[],
                 timeouts.clone(),
                 cancel_token.clone(),
+                |event: core::agent::AgentEvent| {
+                    use std::io::Write;
+                    match event {
+                        core::agent::AgentEvent::TextDelta { text } => {
+                            print!("{text}");
+                            let _ = std::io::stdout().flush();
+                        }
+                        core::agent::AgentEvent::ToolCall { tool, detail } => {
+                            println!("🔧 {tool}: {detail}");
+                        }
+                        core::agent::AgentEvent::ToolResult {
+                            detail, success, ..
+                        } => {
+                            let prefix = if success == Some(false) {
+                                "⚠️"
+                            } else {
+                                "✅"
+                            };
+                            println!("{prefix} {detail}");
+                        }
+                        core::agent::AgentEvent::Status { message } => {
+                            println!("ℹ️ {message}");
+                        }
+                        core::agent::AgentEvent::Error { message } => {
+                            eprintln!("❌ {message}");
+                        }
+                        core::agent::AgentEvent::Usage { .. } => {}
+                    }
+                },
             )
             .await
         {
             Ok(result) => {
+                println!(); // newline after streamed text
                 if attempt > 1 {
                     println!("✅ Retry {attempt} succeeded for iteration {iteration}");
                 }
