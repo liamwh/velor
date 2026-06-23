@@ -5137,22 +5137,22 @@ fn map_agent_event_to_progress(
     match event {
         AgentEvent::Status { message } => {
             let mut out = Vec::new();
-            if let Some(id) = message.strip_prefix("thread started: ") {
-                if matches!(kind, RunnerKind::Codex) {
-                    let handle = RunnerSessionHandle::Codex {
-                        session_id: id.to_string(),
-                    };
-                    *session = Some(handle.clone());
-                    out.push(RunnerProgressEvent::SessionBound { session: handle });
-                }
-            } else if let Some(id) = message.strip_prefix("session: ") {
-                if matches!(kind, RunnerKind::Claude) {
-                    let handle = RunnerSessionHandle::Claude {
-                        session_id: id.to_string(),
-                    };
-                    *session = Some(handle.clone());
-                    out.push(RunnerProgressEvent::SessionBound { session: handle });
-                }
+            if let Some(id) = message.strip_prefix("thread started: ")
+                && matches!(kind, RunnerKind::Codex)
+            {
+                let handle = RunnerSessionHandle::Codex {
+                    session_id: id.to_string(),
+                };
+                *session = Some(handle.clone());
+                out.push(RunnerProgressEvent::SessionBound { session: handle });
+            } else if let Some(id) = message.strip_prefix("session: ")
+                && matches!(kind, RunnerKind::Claude)
+            {
+                let handle = RunnerSessionHandle::Claude {
+                    session_id: id.to_string(),
+                };
+                *session = Some(handle.clone());
+                out.push(RunnerProgressEvent::SessionBound { session: handle });
             }
             out.push(RunnerProgressEvent::Status(message));
             out
