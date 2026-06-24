@@ -16,6 +16,7 @@ mod cancellation;
 mod completion;
 mod plan;
 mod projects;
+mod run_logger;
 mod serve;
 mod streaming_tui;
 mod tui;
@@ -722,11 +723,13 @@ async fn run_automations(
 
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
-    // Initialize tracing subscriber for logging
+    // Initialize tracing subscriber for logging.
+    // Suppress noisy library warnings (tui_markdown HTML-not-supported spam).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+                .add_directive(tracing::Level::INFO.into())
+                .add_directive("tui_markdown=error".parse().unwrap_or_default()),
         )
         .init();
 
@@ -1357,6 +1360,9 @@ async fn run_auto(
     let rules_set_ref = rules_set.as_ref();
     tracing::info!("rules_set_ref.is_some(): {}", rules_set_ref.is_some());
 
+    // Structured JSONL run logger.
+    let logger = std::sync::Arc::new(run_logger::RunLogger::new(&git_root, &prompt_name));
+
     // Streaming TUI: shows agent events with timestamps in an alternate screen.
     // When --no-tui, fall back to plain stdout printing (no TUI task).
     let no_tui = args.no_tui;
@@ -1391,6 +1397,7 @@ async fn run_auto(
         &file_cfg.rules,
         common.append.as_deref(),
         tui_ref,
+        &logger,
     )
     .await;
 
@@ -1398,6 +1405,16 @@ async fn run_auto(
     drop(tui_tx);
     if let Some(task) = tui_task {
         let _ = task.await;
+    }
+
+    // Log final outcome.
+    match &result {
+        Ok(r) => logger.log_outcome(
+            &format!("{:?}", r.status),
+            r.iterations_completed,
+            r.duration.as_secs(),
+        ),
+        Err(_) => logger.log_outcome("error", 0, 0),
     }
 
     // Handle result and send notifications
@@ -1750,7 +1767,7 @@ async fn run_auto_iteration_with_session(
 ///
 /// Returns an error if a Claude invocation fails after all retries.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(level = "debug", ret)]
+#[tracing::instrument(level = "debug", ret, skip(template_str, base_vars, logger))]
 async fn run_auto_loop(
     runner: &AgentRunner,
     binary: &str,
@@ -1771,6 +1788,7 @@ async fn run_auto_loop(
     rules_config: &core::config::RulesConfig,
     append: Option<&str>,
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+    logger: &std::sync::Arc<run_logger::RunLogger>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -1895,6 +1913,7 @@ async fn run_auto_loop(
                 cwd,
                 cancel_handler.token(),
                 tui_tx,
+                logger,
             )
             .await;
 
@@ -2183,7 +2202,7 @@ struct AutoLoopResult {
 /// Returns `RetryError::Permanent` for non-retryable errors.
 /// Returns `RetryError::Retryable` when all retries are exhausted.
 /// Returns `RetryError::TimeoutExceeded` when the absolute timeout is exceeded.
-#[tracing::instrument(level = "debug", ret, err, fields(runner = ?runner))]
+#[tracing::instrument(level = "debug", ret, err, skip(runner, prompt, logger))]
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_retry(
     runner: &AgentRunner,
@@ -2198,6 +2217,7 @@ async fn execute_with_retry(
     cwd: &std::path::Path,
     cancel_token: &CancellationToken,
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+    logger: &std::sync::Arc<run_logger::RunLogger>,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let mut last_floor: Option<std::time::Duration> = None;
@@ -2249,43 +2269,47 @@ async fn execute_with_retry(
                 cancel_token.clone(),
                 {
                     let tui_tx = tui_tx.map(|tx| tx.clone());
-                    move |event: core::agent::AgentEvent| match &tui_tx {
-                        Some(tx) => {
-                            if let Some(entry) = streaming_tui::agent_event_to_tui(&event) {
-                                let _ = tx.try_send(streaming_tui::TuiMessage::Entry(entry));
+                    let logger = std::sync::Arc::clone(logger);
+                    move |event: core::agent::AgentEvent| {
+                        logger.log_agent_event(&event);
+                        match &tui_tx {
+                            Some(tx) => {
+                                if let Some(entry) = streaming_tui::agent_event_to_tui(&event) {
+                                    let _ = tx.try_send(streaming_tui::TuiMessage::Entry(entry));
+                                }
                             }
-                        }
-                        None => {
-                            use std::io::Write;
-                            match &event {
-                                core::agent::AgentEvent::TextDelta { text } => {
-                                    print!("{text}");
-                                    let _ = std::io::stdout().flush();
-                                }
-                                core::agent::AgentEvent::ToolCall { tool, detail, .. } => {
-                                    println!("🔧 {tool}: {detail}");
-                                }
-                                core::agent::AgentEvent::ToolResult {
-                                    detail, success, ..
-                                } => {
-                                    let prefix = if success == &Some(false) {
-                                        "⚠️"
-                                    } else {
-                                        "✅"
-                                    };
-                                    println!("{prefix} {detail}");
-                                }
-                                core::agent::AgentEvent::Status { message } => {
-                                    if !message.starts_with("session: ")
-                                        && !message.starts_with("thread started: ")
-                                    {
-                                        println!("ℹ️ {message}");
+                            None => {
+                                use std::io::Write;
+                                match &event {
+                                    core::agent::AgentEvent::TextDelta { text } => {
+                                        print!("{text}");
+                                        let _ = std::io::stdout().flush();
                                     }
+                                    core::agent::AgentEvent::ToolCall { tool, detail, .. } => {
+                                        println!("🔧 {tool}: {detail}");
+                                    }
+                                    core::agent::AgentEvent::ToolResult {
+                                        detail, success, ..
+                                    } => {
+                                        let prefix = if success == &Some(false) {
+                                            "⚠️"
+                                        } else {
+                                            "✅"
+                                        };
+                                        println!("{prefix} {detail}");
+                                    }
+                                    core::agent::AgentEvent::Status { message } => {
+                                        if !message.starts_with("session: ")
+                                            && !message.starts_with("thread started: ")
+                                        {
+                                            println!("ℹ️ {message}");
+                                        }
+                                    }
+                                    core::agent::AgentEvent::Error { message } => {
+                                        eprintln!("❌ {message}");
+                                    }
+                                    core::agent::AgentEvent::Usage { .. } => {}
                                 }
-                                core::agent::AgentEvent::Error { message } => {
-                                    eprintln!("❌ {message}");
-                                }
-                                core::agent::AgentEvent::Usage { .. } => {}
                             }
                         }
                     }
@@ -2310,12 +2334,20 @@ async fn execute_with_retry(
                 // structurally, not by string matching.
                 if !e.retryability().is_retryable() {
                     tracing::error!("permanent error detected on iteration {iteration}: {e}");
+                    logger.log_permanent_failure(attempt, &e.to_string());
                     return Err(RetryError::Permanent(e.to_string()));
                 }
 
                 tracing::warn!(
                     "retryable error on iteration {iteration}, attempt {attempt}/{}: {e}",
                     config.max_retries
+                );
+                logger.log_retry(
+                    attempt,
+                    config.max_retries,
+                    0.0,
+                    &e.to_string(),
+                    &format!("{:?}", e.retryability()),
                 );
             }
         }

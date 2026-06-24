@@ -211,10 +211,12 @@ impl ProviderErrorKind {
             Self::ConnectionReset => Retryability::Retryable {
                 floor: Some(Duration::from_secs(2)),
             },
-            Self::Authentication
-            | Self::ContextTooLarge
-            | Self::InvalidConfiguration
-            | Self::Other => Retryability::Permanent,
+            Self::Authentication => Retryability::Retryable {
+                floor: Some(Duration::from_secs(30)),
+            },
+            Self::ContextTooLarge | Self::InvalidConfiguration | Self::Other => {
+                Retryability::Permanent
+            }
         }
     }
 }
@@ -280,6 +282,12 @@ impl ProviderError {
 
     /// Returns the retryability for this provider failure, honouring any
     /// parsed `Retry-After`.
+    ///
+    /// Note: authentication errors are retryable with a long floor (30 s) — a
+    /// transiently expired key, a temporarily down auth endpoint, or a rotating
+    /// credential may all resolve if retried. The caller's `absolute_timeout_ms`
+    /// bounds how long retries continue. Only context-too-large and invalid
+    /// configuration are truly permanent (retrying won't change the outcome).
     #[must_use]
     pub fn retryability(&self) -> Retryability {
         match self {
@@ -292,9 +300,11 @@ impl ProviderError {
             Self::ConnectionReset => Retryability::Retryable {
                 floor: Some(Duration::from_secs(2)),
             },
-            Self::Authentication | Self::ContextTooLarge | Self::InvalidConfiguration => {
-                Retryability::Permanent
-            }
+            // Auth is retryable: keys can be renewed, auth endpoints can recover.
+            Self::Authentication => Retryability::Retryable {
+                floor: Some(Duration::from_secs(30)),
+            },
+            Self::ContextTooLarge | Self::InvalidConfiguration => Retryability::Permanent,
             Self::Other { retryability, .. } => *retryability,
         }
     }

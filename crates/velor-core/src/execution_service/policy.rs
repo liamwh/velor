@@ -205,6 +205,7 @@ pub fn is_transient_upstream(err: &AgentExecutionError) -> bool {
         ProviderErrorKind::Overloaded
             | ProviderErrorKind::RateLimited
             | ProviderErrorKind::ConnectionReset
+            | ProviderErrorKind::Authentication
     )
 }
 
