@@ -1405,7 +1405,8 @@ async fn run_auto(
     )
     .await;
 
-    // Restore terminal (TUI exits when sender is dropped).
+    // Signal the TUI that the run is complete, then wait for it to exit.
+    let _ = tui_tx.try_send(streaming_tui::TuiMessage::RunComplete);
     drop(tui_tx);
     if let Some(task) = tui_task {
         let _ = task.await;
