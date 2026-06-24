@@ -37,6 +37,8 @@ pub enum TuiMessage {
     Entry(TuiEntry),
     SetPrompt(String),
     SetLogPath(String),
+    /// Signals the entire auto loop is done — the TUI should exit.
+    RunComplete,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +319,15 @@ pub async fn run_streaming_tui(
                 TuiMessage::SetLogPath(p) => {
                     state.log_path = Some(p);
                 }
+                TuiMessage::RunComplete => {
+                    // The auto loop is done — drain remaining events and exit.
+                    while let Ok(msg) = rx.try_recv() {
+                        if let TuiMessage::Entry(e) = msg {
+                            state.entries.push(e);
+                        }
+                    }
+                    break;
+                }
             }
         }
         if had_new {
@@ -354,9 +365,11 @@ pub async fn run_streaming_tui(
             }
         }
 
-        if rx.is_empty() && rx.is_closed() {
-            break;
-        }
+        // Do NOT check is_closed() here — between iterations, the per-attempt
+        // sender clone is dropped but the original sender in run_auto is still
+        // alive. is_closed() can briefly return true, causing a premature exit
+        // after the first iteration. The TUI exits via RunComplete (sent after
+        // the auto loop finishes) or via cancel (Ctrl+C / 'q').
         if cancel.is_cancelled() {
             break;
         }
