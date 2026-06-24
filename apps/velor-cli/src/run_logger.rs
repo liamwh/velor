@@ -22,6 +22,7 @@ const LOG_DIR_NAME: &str = "logs";
 pub struct RunLogger {
     file: Mutex<Option<std::fs::File>>,
     run_id: String,
+    path: std::path::PathBuf,
 }
 
 #[derive(Serialize)]
@@ -57,6 +58,7 @@ impl RunLogger {
         let logger = Self {
             file: Mutex::new(file),
             run_id: run_id.clone(),
+            path: path.clone(),
         };
 
         logger.log(
@@ -185,6 +187,12 @@ impl RunLogger {
                 "error": truncate(error, 2000),
             }),
         );
+    }
+
+    /// Returns the path to the log file.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// Logs the final outcome.

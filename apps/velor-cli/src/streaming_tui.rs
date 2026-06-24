@@ -36,6 +36,7 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 pub enum TuiMessage {
     Entry(TuiEntry),
     SetPrompt(String),
+    SetLogPath(String),
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,8 @@ pub struct TuiEntry {
 #[derive(Debug, Clone)]
 pub enum EntryKind {
     Text(String),
+    /// Thinking/reasoning token output (prefixed with 💭 by the adapter).
+    Thinking(String),
     ToolCall {
         tool: String,
         detail: String,
@@ -78,6 +81,9 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
     use velor_core::agent::AgentEvent;
     match event {
         AgentEvent::TextDelta { text } if text.is_empty() => None,
+        AgentEvent::TextDelta { text } if text.starts_with("💭 ") => {
+            Some(TuiEntry::now(EntryKind::Thinking(text[3..].to_string())))
+        }
         AgentEvent::TextDelta { text } => Some(TuiEntry::now(EntryKind::Text(text.clone()))),
         AgentEvent::ToolCall {
             tool,
@@ -115,11 +121,14 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
 struct TuiState {
     entries: Vec<TuiEntry>,
     prompt: Option<String>,
+    log_path: Option<String>,
     show_prompt: bool,
     prompt_scroll: u16,
     scroll_offset: u16,
     spinner_idx: usize,
     spinner_verb: &'static str,
+    show_thinking: bool,
+    open_log: bool,
     // Token usage (latest).
     input_tokens: u64,
     output_tokens: u64,
@@ -131,11 +140,14 @@ impl TuiState {
         Self {
             entries: Vec::new(),
             prompt: None,
+            log_path: None,
             show_prompt: false,
             prompt_scroll: 0,
             scroll_offset: 0,
             spinner_idx: 0,
             spinner_verb: "starting",
+            show_thinking: true,
+            open_log: false,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
@@ -270,6 +282,10 @@ pub async fn run_streaming_tui(
                             state.spinner_verb = "generating";
                             set_title("vel auto — generating");
                         }
+                        EntryKind::Thinking(_) => {
+                            state.spinner_verb = "reasoning";
+                            set_title("vel auto — reasoning");
+                        }
                         EntryKind::Error(_) => {
                             state.spinner_verb = "error";
                             set_title("vel auto — error");
@@ -298,6 +314,9 @@ pub async fn run_streaming_tui(
                     state.prompt = Some(p);
                     state.prompt_scroll = 0;
                 }
+                TuiMessage::SetLogPath(p) => {
+                    state.log_path = Some(p);
+                }
             }
         }
         if had_new {
@@ -315,6 +334,23 @@ pub async fn run_streaming_tui(
                 event::read().map_err(|e| color_eyre::eyre::eyre!("read: {e}"))?
             {
                 handle_key(key, &mut state, &cancel);
+            }
+        }
+
+        // Open log file in pager if requested.
+        if state.open_log {
+            state.open_log = false;
+            if let Some(path) = &state.log_path {
+                // Suspend TUI: leave alt screen + disable raw mode.
+                disable_raw_mode().ok();
+                execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+                // Open pager.
+                let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+                let _ = std::process::Command::new(&pager).arg(path).status();
+                // Resume TUI: re-enter alt screen + enable raw mode.
+                enable_raw_mode().ok();
+                execute!(terminal.backend_mut(), EnterAlternateScreen).ok();
+                terminal.clear().ok();
             }
         }
 
@@ -369,6 +405,13 @@ fn handle_key(key: event::KeyEvent, state: &mut TuiState, cancel: &CancellationT
             state.show_prompt = true;
             state.prompt_scroll = 0;
         }
+        KeyCode::Char('t') => {
+            state.show_thinking = !state.show_thinking;
+        }
+        KeyCode::Char('l') => {
+            // Open log file — handled via flag below.
+            state.open_log = true;
+        }
         KeyCode::Up => state.scroll_offset = state.scroll_offset.saturating_add(1),
         KeyCode::Down => state.scroll_offset = state.scroll_offset.saturating_sub(1),
         KeyCode::PageUp => state.scroll_offset = state.scroll_offset.saturating_add(10),
@@ -400,6 +443,10 @@ fn render(f: &mut Frame, state: &mut TuiState, syntax: &Syntax) {
     // Build all lines from all entries.
     let mut all_lines: Vec<Line> = Vec::new();
     for entry in &state.entries {
+        // Skip thinking entries when toggled off.
+        if !state.show_thinking && matches!(entry.kind, EntryKind::Thinking(_)) {
+            continue;
+        }
         let ts = entry.ts.format("%H:%M:%S").to_string();
         let ts_span = Span::styled(format!("{ts} "), Style::default().fg(Color::DarkGray));
         for line in render_entry(&entry.kind, width, syntax) {
@@ -462,7 +509,7 @@ fn render(f: &mut Frame, state: &mut TuiState, syntax: &Syntax) {
     f.render_widget(Paragraph::new(spinner_line), spinner_area);
 
     // Key-hints bar with styled spans.
-    let hints = if state.show_prompt {
+    let hints: Vec<Span> = if state.show_prompt {
         vec![
             Span::styled(
                 "p/Esc",
@@ -488,6 +535,24 @@ fn render(f: &mut Frame, state: &mut TuiState, syntax: &Syntax) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" prompt  "),
+            Span::styled(
+                "t",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(if state.show_thinking {
+                " thinking✓  "
+            } else {
+                " thinking✗  "
+            }),
+            Span::styled(
+                "l",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" log  "),
             Span::styled(
                 "↑↓",
                 Style::default()
@@ -540,6 +605,23 @@ fn render_entry<'a>(kind: &'a EntryKind, _width: usize, syntax: &'a Syntax) -> V
             vec![Line::from(vec![
                 Span::styled("› ", Style::default().fg(Color::Gray)),
                 Span::styled(text, Style::default().fg(Color::Gray)),
+            ])]
+        }
+
+        EntryKind::Thinking(text) => {
+            vec![Line::from(vec![
+                Span::styled(
+                    "💭 ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
             ])]
         }
 

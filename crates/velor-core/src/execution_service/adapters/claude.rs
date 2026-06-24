@@ -233,7 +233,17 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
     let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match event_type {
         "content_block_delta" => {
-            if let Some(text) = value
+            // Check for thinking delta first (delta.type == "thinking_delta").
+            if let Some(thinking) = value
+                .get("delta")
+                .and_then(|d| d.get("thinking"))
+                .and_then(|t| t.as_str())
+                && !thinking.is_empty()
+            {
+                events.push(AgentEvent::TextDelta {
+                    text: format!("💭 {thinking}"),
+                });
+            } else if let Some(text) = value
                 .get("delta")
                 .and_then(|d| d.get("text"))
                 .and_then(|t| t.as_str())
