@@ -100,11 +100,12 @@ impl RunLogger {
     pub fn log_agent_event(&self, event: &velor_core::agent::AgentEvent) {
         use velor_core::agent::AgentEvent;
         match event {
+            AgentEvent::TextDelta { text } if text.is_empty() => {}
+            AgentEvent::TextDelta { text } if text.starts_with("💭 ") => {
+                self.log("thinking", json!({ "text": truncate(&text[3..], 2000) }));
+            }
             AgentEvent::TextDelta { text } => {
-                self.log(
-                    "text",
-                    json!({ "delta_chars": text.len(), "preview": truncate(text, 500) }),
-                );
+                self.log("text", json!({ "text": truncate(text, 2000) }));
             }
             AgentEvent::ToolCall {
                 tool,
@@ -129,16 +130,21 @@ impl RunLogger {
                     "tool_result",
                     json!({
                         "tool": tool,
-                        "detail": truncate(detail, 2000),
+                        "detail": truncate(detail, 4000),
                         "success": success,
                     }),
                 );
             }
+            // Suppress internal session/thread metadata — it's noisy and not
+            // useful in the log (Claude Code emits dozens of system events per
+            // turn, all with the same session ID).
+            AgentEvent::Status { message } if message.starts_with("session: ") => {}
+            AgentEvent::Status { message } if message.starts_with("thread started: ") => {}
             AgentEvent::Status { message } => {
                 self.log("status", json!({ "message": message }));
             }
             AgentEvent::Error { message } => {
-                self.log("error", json!({ "message": message }));
+                self.log("error", json!({ "message": truncate(message, 2000) }));
             }
             AgentEvent::Usage {
                 input_tokens,
