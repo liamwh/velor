@@ -1367,6 +1367,10 @@ async fn run_auto(
     // When --no-tui, fall back to plain stdout printing (no TUI task).
     let no_tui = args.no_tui;
     let (tui_tx, tui_rx) = tokio::sync::mpsc::channel::<streaming_tui::TuiMessage>(256);
+    // Tell the TUI the log file path (for the 'l' key).
+    let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetLogPath(
+        logger.path().to_string_lossy().to_string(),
+    ));
     let tui_cancel = cancel_handler.token().clone();
     let tui_task = if no_tui {
         None
@@ -1406,6 +1410,9 @@ async fn run_auto(
     if let Some(task) = tui_task {
         let _ = task.await;
     }
+
+    // Print the log file path so the user can find it.
+    println!("📄 Log file: {}", logger.path().display());
 
     // Log final outcome.
     match &result {
