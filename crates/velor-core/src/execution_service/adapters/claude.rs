@@ -7,7 +7,8 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentEvent, AgentRunResult};
@@ -20,9 +21,19 @@ use crate::execution_service::output::Termination;
 use crate::execution_service::supervisor::{
     ProcessEvent, ProcessInput, ProcessInputCommand, ProcessSpec, ProcessTimeouts, RunningProcess,
 };
+use crate::file_edit::{
+    DEFAULT_MAX_DIFF_LINES, FileEdit, FileEditKind, compute_file_edit, infer_syntax,
+};
 
 /// Maximum length of a single stream-json frame (line) before it is rejected.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Backstop grace for the streaming path: how long to wait for the subprocess to
+/// exit on its own after we close stdin (EOF) following the `result` frame.
+/// Claude Code normally exits promptly on that EOF, but if it ever lingers we
+/// finalise from the already-observed turn output and tear the process down, so a
+/// completed turn can never wedge the iteration indefinitely.
+const STREAM_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Parameters for one Claude subprocess invocation.
 #[derive(Debug, Clone)]
@@ -207,7 +218,13 @@ impl AgentAdapter for ClaudeSubprocessAdapter {
             None
         };
 
-        let result = run_claude_stream(process, sink, command_sender.as_ref()).await;
+        let result = run_claude_stream(
+            process,
+            sink,
+            command_sender.as_ref(),
+            &self.params.working_directory,
+        )
+        .await;
         // The process is finished; stop the forwarding task promptly so it cannot
         // outlive the execution.
         if let Some(handle) = forward_handle {
@@ -313,11 +330,16 @@ async fn run_claude_stream(
     mut process: RunningProcess,
     sink: &mut dyn AgentEventSink,
     streaming_close: Option<&tokio::sync::mpsc::Sender<ProcessInputCommand>>,
+    cwd: &Path,
 ) -> Result<AgentRunResult, AgentExecutionError> {
     let mut decoder = LineDecoder::new(MAX_FRAME_BYTES);
     let mut collected = String::new();
     let mut structured_error: Option<String> = None;
     let mut close_sent = false;
+    // Pre-edit snapshots for first-class edit tools, captured when the tool_use
+    // is observed (before the edit lands) and diffed against the post-edit file
+    // when the tool result arrives. See [`process_event`].
+    let mut pending_edits: Vec<(String, ReadState)> = Vec::new();
 
     while let Some(event) = process.next_event().await {
         match event {
@@ -330,16 +352,18 @@ async fn run_claude_stream(
                         saw_result = true;
                     }
                     for agent_event in parse_claude_line(&text, &mut collected) {
-                        if structured_error.is_none()
-                            && let AgentEvent::Error { message } = &agent_event
+                        if let Some(msg) =
+                            process_event(sink, cwd, &mut pending_edits, agent_event).await?
+                            && structured_error.is_none()
                         {
-                            structured_error = Some(message.clone());
+                            structured_error = Some(msg);
                         }
-                        emit_event(sink, agent_event).await?;
                     }
                 }
-                // The turn is complete: close stdin so Claude exits instead of
-                // waiting indefinitely for more steering input.
+                // The turn is complete: send EOF so the subprocess exits, then
+                // stop reading and finalise. Claude Code exits promptly on this
+                // EOF; finalising from the observed result frame (rather than
+                // waiting for exit inside the loop) also bounds any lingering.
                 if saw_result
                     && !close_sent
                     && let Some(tx) = streaming_close
@@ -351,6 +375,7 @@ async fn run_claude_stream(
                         })
                         .await;
                     close_sent = true;
+                    break;
                 }
             }
             ProcessEvent::Stderr(_) => {
@@ -368,17 +393,56 @@ async fn run_claude_stream(
     if let Some(remainder) = decoder.flush_remainder()? {
         let text = String::from_utf8_lossy(&remainder);
         for agent_event in parse_claude_line(&text, &mut collected) {
-            if structured_error.is_none()
-                && let AgentEvent::Error { message } = &agent_event
+            if let Some(msg) = process_event(sink, cwd, &mut pending_edits, agent_event).await?
+                && structured_error.is_none()
             {
-                structured_error = Some(message.clone());
+                structured_error = Some(msg);
             }
-            emit_event(sink, agent_event).await?;
         }
     }
 
+    // Best-effort: emit diffs for any edits whose result frame we never observed
+    // (e.g. the process ended mid-turn). Reads the final on-disk state.
+    drain_pending_edits(cwd, &mut pending_edits, sink).await?;
+
+    // One-shot path (`close_sent` stays false): the loop ended because the
+    // process exited naturally, so collect the real exit status. Streaming path
+    // (`close_sent`): we broke out after the result frame + EOF; finalise
+    // without requiring the subprocess to exit.
+    if close_sent {
+        return finalize_streaming(process, collected, structured_error, STREAM_EXIT_GRACE).await;
+    }
     let output = process.complete().await?;
     map_outcome(output, collected, structured_error, ProviderKind::Claude)
+}
+
+/// Finalises a streaming run whose turn already completed (the `result` frame
+/// was observed and EOF was sent).
+///
+/// The subprocess normally exits promptly on that EOF; we race that natural exit
+/// against a short grace so a completed turn can never wedge the iteration. If it
+/// exits within the grace its real status is classified as usual; if it ever
+/// lingers, the process group is cancelled (reaped by the detached supervisor)
+/// and the run succeeds from the already-collected turn output — the `result`
+/// frame proved the turn done.
+async fn finalize_streaming(
+    process: RunningProcess,
+    collected: String,
+    structured_error: Option<String>,
+    grace: std::time::Duration,
+) -> Result<AgentRunResult, AgentExecutionError> {
+    let cancellation = process.cancellation().clone();
+    match tokio::time::timeout(grace, process.complete()).await {
+        Ok(Ok(output)) => map_outcome(output, collected, structured_error, ProviderKind::Claude),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            // Lingered past grace: tear the group down. The supervisor task is
+            // detached (its completion future was dropped) but still reaps the
+            // child because we cancel its token.
+            cancellation.cancel();
+            Ok(AgentRunResult { stdout: collected })
+        }
+    }
 }
 
 /// Emits an event to the sink, mapping a closed sink to a cancellation.
@@ -389,6 +453,153 @@ async fn emit_event(
     sink.emit(event)
         .await
         .map_err(|_| AgentExecutionError::Cancelled)
+}
+
+// ── File-edit capture ───────────────────────────────────────────────────────
+//
+// The Claude subprocess executes its own tools; Velor only sees the stream-json
+// event stream. To show the *real* resulting edit (not the agent's claimed
+// patch) we snapshot a file's contents when its `tool_use` is observed — before
+// the edit lands — and diff it against the post-edit contents once the matching
+// `tool_result` arrives (by which point the edit is on disk). Only first-class
+// edit tools (Edit/Write/MultiEdit/NotebookEdit) are observed; shell-driven file
+// mutations via Bash are not reliably observable and are intentionally excluded.
+
+/// On-disk state of a file at a capture point.
+enum ReadState {
+    /// The file did not exist.
+    Missing,
+    /// The file existed with these bytes.
+    Bytes(Vec<u8>),
+    /// The file existed but could not be read (e.g. a permission error).
+    Unreadable(String),
+}
+
+/// Processes one parsed agent event: snapshots pre-edit contents for edit-tool
+/// calls, emits the real `FileEdit` diff when a tool result arrives, then emits
+/// the event itself. Returns the message if `event` is an [`AgentEvent::Error`]
+/// so the caller can track the structured error.
+async fn process_event(
+    sink: &mut dyn AgentEventSink,
+    cwd: &Path,
+    pending: &mut Vec<(String, ReadState)>,
+    event: AgentEvent,
+) -> Result<Option<String>, AgentExecutionError> {
+    let err_msg = match &event {
+        AgentEvent::Error { message } => Some(message.clone()),
+        _ => None,
+    };
+    // Snapshot the pre-edit state when a first-class edit tool is invoked. The
+    // tool has not executed yet (its result has not been emitted).
+    if let AgentEvent::ToolCall { tool, input, .. } = &event
+        && let Some(path) = edit_target_path(tool, input)
+    {
+        let state = read_file_state(cwd, &path).await;
+        note_pending(pending, path, state);
+    }
+    // A tool result means the preceding edit(s) have landed on disk: read the
+    // resulting state, compute the real diff, and emit it before the result so
+    // the diff appears between the tool call and its result.
+    if matches!(event, AgentEvent::ToolResult { .. }) {
+        drain_pending_edits(cwd, pending, sink).await?;
+    }
+    emit_event(sink, event).await?;
+    Ok(err_msg)
+}
+
+/// Records a pre-edit snapshot, preserving insertion order and ignoring
+/// duplicate paths within a single in-flight batch (one diff per file).
+fn note_pending(pending: &mut Vec<(String, ReadState)>, path: String, state: ReadState) {
+    if !pending.iter().any(|(p, _)| p == &path) {
+        pending.push((path, state));
+    }
+}
+
+/// Emits a [`AgentEvent::FileEdit`] for each pending edit, reading the post-edit
+/// file state and computing the diff. No-op (and cheap) when nothing is pending.
+async fn drain_pending_edits(
+    cwd: &Path,
+    pending: &mut Vec<(String, ReadState)>,
+    sink: &mut dyn AgentEventSink,
+) -> Result<(), AgentExecutionError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let drained = std::mem::take(pending);
+    for (path, pre) in drained {
+        if let Some(edit) = build_edit(cwd, &path, pre).await {
+            emit_event(sink, AgentEvent::FileEdit { edit }).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds the [`FileEdit`] for one path from its pre-edit state and the current
+/// post-edit state. Returns `None` when the edit made no effective change.
+async fn build_edit(cwd: &Path, path: &str, pre: ReadState) -> Option<FileEdit> {
+    let pre_bytes: Option<Vec<u8>> = match pre {
+        ReadState::Bytes(bytes) => Some(bytes),
+        ReadState::Missing => None,
+        ReadState::Unreadable(ref reason) => {
+            return Some(capture_failed(path, reason.clone()));
+        }
+    };
+    match read_file_state(cwd, path).await {
+        ReadState::Unreadable(reason) => Some(capture_failed(path, reason)),
+        ReadState::Missing => {
+            compute_file_edit(path, pre_bytes.as_deref(), None, DEFAULT_MAX_DIFF_LINES)
+        }
+        ReadState::Bytes(post) => compute_file_edit(
+            path,
+            pre_bytes.as_deref(),
+            Some(&post),
+            DEFAULT_MAX_DIFF_LINES,
+        ),
+    }
+}
+
+/// Reads the on-disk state of `path` resolved against `cwd`. Absolute paths
+/// override `cwd` (as `PathBuf::join` does).
+async fn read_file_state(cwd: &Path, path: &str) -> ReadState {
+    let resolved = cwd.join(path);
+    match tokio::fs::read(&resolved).await {
+        Ok(bytes) => ReadState::Bytes(bytes),
+        Err(err) if err.kind() == ErrorKind::NotFound => ReadState::Missing,
+        Err(err) => ReadState::Unreadable(err.to_string()),
+    }
+}
+
+/// A [`FileEdit`] recording that the real before/after state could not be
+/// captured, so the transcript surfaces the failure rather than silently
+/// presenting the agent's claimed patch as the result.
+fn capture_failed(path: &str, reason: String) -> FileEdit {
+    FileEdit {
+        path: path.to_string(),
+        syntax: infer_syntax(path),
+        kind: FileEditKind::CaptureFailed { reason },
+        hunks: Vec::new(),
+        omitted_lines: 0,
+    }
+}
+
+/// The target file path for a first-class edit tool's input, if any.
+fn edit_target_path(tool: &str, input: &serde_json::Value) -> Option<String> {
+    if !is_file_edit_tool(tool) {
+        return None;
+    }
+    input
+        .get("file_path")
+        .or_else(|| input.get("file_name"))
+        .or_else(|| input.get("notebook_path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether `tool` is a first-class file-edit tool whose filesystem result Velor
+/// can observe by reading the file before and after the result arrives.
+fn is_file_edit_tool(tool: &str) -> bool {
+    matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
 }
 
 /// Maps a finished [`crate::execution_service::output::ProcessOutput`] to a
@@ -482,6 +693,16 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
             }
         }
         "assistant" | "user" => {
+            // Only assistant text is agent output: `collected` feeds
+            // completion-token detection and the notification preview. User
+            // frames — the prompt replayed back by `--replay-user-messages`
+            // and steering echoes — are surfaced for display but must never be
+            // collected. Every prompt quotes the completion token as an
+            // instruction to the agent, so replaying it into `collected` would
+            // make `contains(complete_token)` true on every iteration and trip a
+            // false completion after two iterations, regardless of what the
+            // agent actually produced.
+            let is_assistant = event_type == "assistant";
             if let Some(content) = value
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -494,7 +715,9 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                             if let Some(text) = item.get("text").and_then(|t| t.as_str())
                                 && !text.is_empty()
                             {
-                                collected.push_str(text);
+                                if is_assistant {
+                                    collected.push_str(text);
+                                }
                                 events.push(AgentEvent::TextDelta {
                                     text: text.to_string(),
                                 });
@@ -681,6 +904,43 @@ mod tests {
     }
 
     #[test]
+    fn user_frame_text_is_not_collected() {
+        // A replayed user message — the prompt, which quotes the completion
+        // token as an instruction — must NOT be collected into assistant
+        // output. Otherwise `contains(complete_token)` matches the prompt on
+        // every iteration and fires a false completion after two iterations.
+        let mut collected = String::new();
+        let events = parse_claude_line(
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"If done, output exactly: <promise>COMPLETE</promise>"}]}}"#,
+            &mut collected,
+        );
+        assert!(
+            collected.is_empty(),
+            "user text must not be collected, got: {collected}"
+        );
+        // It is still surfaced for display (the transcript shows steering/prompt
+        // echoes); only the collection buffer is protected.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TextDelta { .. })),
+            "user text should still emit a TextDelta for display"
+        );
+    }
+
+    #[test]
+    fn assistant_frame_text_is_collected() {
+        // Genuine assistant output — including the completion token when the
+        // agent actually emits it — IS collected so completion detection works.
+        let mut collected = String::new();
+        let _ = parse_claude_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"<promise>COMPLETE</promise>"}]}}"#,
+            &mut collected,
+        );
+        assert_eq!(collected, "<promise>COMPLETE</promise>");
+    }
+
+    #[test]
     fn truncate_str_respects_char_boundary() {
         let s = "héllo world 😀👏"; // mixed multibyte
         let t = truncate_str(s, 5);
@@ -734,5 +994,205 @@ mod adapter_tests {
             }
             other => panic!("expected Provider overload, got: {other:?}"),
         }
+    }
+
+    /// A streaming subprocess that loiters past the grace (the shape of Claude
+    /// Code lingering after `end_turn`, ignoring stdin EOF) is force-finalised:
+    /// success from the collected output, promptly, with no hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finalize_streaming_force_finalises_a_loitering_process() {
+        use crate::execution_service::supervisor::spawn;
+
+        let spec = ProcessSpec::builder("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .input(ProcessInput::Streaming {
+                initial: Bytes::from_static(b""),
+            })
+            .timeouts(ProcessTimeouts {
+                total: Some(Duration::from_secs(30)),
+                termination_grace: Duration::from_secs(2),
+                ..Default::default()
+            })
+            .build();
+        let cancel = CancellationToken::new();
+        let proc = spawn(spec, cancel).await.expect("spawn");
+
+        let started = std::time::Instant::now();
+        let result = finalize_streaming(
+            proc,
+            "captured output".to_string(),
+            None,
+            Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "force-finalise should be prompt, took {elapsed:?}"
+        );
+        match result {
+            Ok(run) => assert_eq!(run.stdout, "captured output"),
+            other => panic!("expected Ok from loitering process, got {other:?}"),
+        }
+    }
+
+    /// A streaming subprocess that exits within the grace yields its real
+    /// (successful) exit status — the common path when the provider does exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finalize_streaming_uses_real_exit_when_process_exits() {
+        use crate::execution_service::supervisor::spawn;
+
+        let spec = ProcessSpec::builder("sh")
+            .arg("-c")
+            .arg("true")
+            .input(ProcessInput::Streaming {
+                initial: Bytes::from_static(b""),
+            })
+            .timeouts(ProcessTimeouts {
+                total: Some(Duration::from_secs(10)),
+                termination_grace: Duration::from_secs(2),
+                ..Default::default()
+            })
+            .build();
+        let cancel = CancellationToken::new();
+        let proc = spawn(spec, cancel).await.expect("spawn");
+
+        let result = finalize_streaming(
+            proc,
+            "captured output".to_string(),
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        match result {
+            Ok(run) => assert_eq!(run.stdout, "captured output"),
+            other => panic!("expected Ok from cleanly-exiting process, got {other:?}"),
+        }
+    }
+
+    // ── File-edit capture ───────────────────────────────────────────────────
+
+    #[test]
+    fn detects_first_class_edit_tools() {
+        assert!(is_file_edit_tool("Edit"));
+        assert!(is_file_edit_tool("Write"));
+        assert!(is_file_edit_tool("MultiEdit"));
+        assert!(is_file_edit_tool("NotebookEdit"));
+        assert!(!is_file_edit_tool("Read"));
+        assert!(!is_file_edit_tool("Bash"));
+        assert!(!is_file_edit_tool("Grep"));
+        assert!(!is_file_edit_tool("todo"));
+    }
+
+    #[test]
+    fn edit_target_path_reads_file_path_or_notebook_path() {
+        let file_input = serde_json::json!({"file_path": "src/lib.rs"});
+        assert_eq!(
+            edit_target_path("Edit", &file_input).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            edit_target_path("Write", &file_input).as_deref(),
+            Some("src/lib.rs")
+        );
+
+        // NotebookEdit carries notebook_path instead.
+        let nb_input = serde_json::json!({"notebook_path": "nb.ipynb"});
+        assert_eq!(
+            edit_target_path("NotebookEdit", &nb_input).as_deref(),
+            Some("nb.ipynb")
+        );
+
+        // Non-edit tools never report a target even with a file_path.
+        let read_input = serde_json::json!({"file_path": "src/lib.rs"});
+        assert!(edit_target_path("Read", &read_input).is_none());
+
+        // Empty path is ignored.
+        let empty = serde_json::json!({"file_path": ""});
+        assert!(edit_target_path("Edit", &empty).is_none());
+    }
+
+    #[tokio::test]
+    async fn build_edit_reports_real_modified_diff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let path = "src/lib.rs";
+        let file = cwd.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "fn main() {}\n").expect("write pre");
+
+        // Pre-edit snapshot captured the original contents.
+        let pre = read_file_state(cwd, path).await;
+        // The agent then edits the file on disk.
+        std::fs::write(&file, "fn main() { todo!() }\n").expect("write post");
+
+        let edit = build_edit(cwd, path, pre)
+            .await
+            .expect("a real change produces an edit");
+        assert_eq!(edit.path, path);
+        assert!(matches!(
+            edit.kind,
+            crate::file_edit::FileEditKind::Modified
+        ));
+        assert!(!edit.hunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_edit_reports_creation_and_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let path = "new.txt";
+
+        // File did not exist before, exists after → created.
+        let pre = ReadState::Missing;
+        std::fs::write(cwd.join(path), "hello\n").expect("write");
+        let created = build_edit(cwd, path, pre).await.expect("created edit");
+        assert!(matches!(
+            created.kind,
+            crate::file_edit::FileEditKind::Created
+        ));
+
+        // File existed before, gone after → deleted.
+        std::fs::remove_file(cwd.join(path)).expect("remove");
+        let deleted = build_edit(cwd, path, ReadState::Bytes(b"hello\n".to_vec()))
+            .await
+            .expect("deleted edit");
+        assert!(matches!(
+            deleted.kind,
+            crate::file_edit::FileEditKind::Deleted
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_edit_emits_nothing_for_no_effective_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let path = "same.txt";
+        std::fs::write(cwd.join(path), "unchanged\n").expect("write");
+        let pre = ReadState::Bytes(b"unchanged\n".to_vec());
+        // File unchanged → no edit.
+        assert!(build_edit(cwd, path, pre).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_edit_reports_capture_failure_when_post_read_fails() {
+        // Pre existed but post read fails (unreadable): surface a capture-failed
+        // entry rather than silently presenting a successful-looking edit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let path = "guarded.txt";
+        let edit = build_edit(cwd, path, ReadState::Unreadable("denied".to_string()))
+            .await
+            .expect("capture failure is reported");
+        assert!(matches!(
+            edit.kind,
+            crate::file_edit::FileEditKind::CaptureFailed { .. }
+        ));
+        assert!(edit.hunks.is_empty());
     }
 }

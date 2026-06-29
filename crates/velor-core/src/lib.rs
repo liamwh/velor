@@ -13,6 +13,7 @@
 //! - [`agent`] - Agent runner interface for subprocess and ACP protocols
 //! - [`config`] - Configuration file loading and management
 //! - [`execution`] - Execution state machine for tracking agent runs
+//! - [`file_edit`] - Structured file-edit transcript events with line-based diffs
 //! - [`git`] - Git repository discovery utilities
 //! - [`notification`] - Notification system (Telegram, macOS)
 //! - [`retry`] - Crash resilience and retry logic
@@ -29,6 +30,7 @@ pub mod agent;
 pub mod config;
 pub mod execution;
 pub mod execution_service;
+pub mod file_edit;
 pub mod git;
 pub mod notification;
 pub mod prompts;
@@ -48,6 +50,7 @@ pub use execution::{
     ExecutionActivity, ExecutionActivityKind, ExecutionConfig, ExecutionEvent, ExecutionId,
     ExecutionMetrics, ExecutionRecord, ExecutionState,
 };
+pub use file_edit::{DiffLine, FileEdit, FileEditKind, FileHunk, LineKind, SyntaxKind};
 pub use notification::{
     MacOSNotifier, NotificationPayload, Notifier, RunStatus, TelegramNotifier, build_notifiers,
     format_macos_message, format_telegram_message, send_notifications, should_notify,

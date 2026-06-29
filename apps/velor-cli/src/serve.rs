@@ -5172,6 +5172,14 @@ fn map_agent_event_to_progress(
                 "tool result: {detail}"
             ))]
         }
+        AgentEvent::FileEdit { edit } => {
+            vec![RunnerProgressEvent::Milestone(format!(
+                "edited {} ({} line{})",
+                edit.path,
+                edit.diff_line_count(),
+                if edit.diff_line_count() == 1 { "" } else { "s" }
+            ))]
+        }
         AgentEvent::Usage { .. } => Vec::new(),
         AgentEvent::Error { message } => vec![RunnerProgressEvent::Error(message)],
     }

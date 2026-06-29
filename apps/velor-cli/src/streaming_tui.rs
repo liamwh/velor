@@ -30,15 +30,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
+use syntect::highlighting::{FontStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
-use syntect::util::as_24_bit_terminal_escaped;
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui_transcript::{
     self, LiveEntry, RowMeter, ScrollState, Transcript, TuiLimits, Viewport,
 };
+use velor_core::file_edit::{DiffLine, FileEdit, FileEditKind, FileHunk, LineKind};
 
 // The entry model lives in `tui_transcript`; re-exported for callers (main.rs).
 pub use crate::tui_transcript::{EntryKind, TuiEntry};
@@ -182,6 +182,9 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
             detail: detail.clone(),
             success: *success,
         })),
+        AgentEvent::FileEdit { edit } => {
+            Some(TuiEntry::now(EntryKind::FileEdit(Box::new(edit.clone()))))
+        }
         AgentEvent::Error { message } => Some(TuiEntry::now(EntryKind::Error(message.clone()))),
         AgentEvent::Status { message } if message.starts_with("session: ") => None,
         AgentEvent::Status { message } if message.starts_with("thread started: ") => None,
@@ -922,7 +925,15 @@ fn build_layout(
     syntax: &Syntax,
 ) -> Vec<Line<'static>> {
     let content_lines = render_entry(kind, width as usize, syntax);
-    let no_timestamp = matches!(kind, EntryKind::IterationDivider { .. });
+    // Dividers read as a clean full-width rule; file edits render their own
+    // gutter and must skip the timestamp so wrapped rows align under the source.
+    let no_timestamp = matches!(
+        kind,
+        EntryKind::IterationDivider { .. } | EntryKind::FileEdit(_)
+    );
+    // File-edit lines carry a gutter; their wrapped continuation rows indent by
+    // the gutter width so they align beneath the source, not the line number.
+    let hang = file_edit_hang(kind);
     let ts_span = Span::styled(
         ts.format("%H:%M:%S ").to_string(),
         Style::default().fg(Color::DarkGray),
@@ -935,7 +946,7 @@ fn build_layout(
             spans.push(ts_span.clone());
         }
         spans.extend(line.spans);
-        rows.extend(wrap_spans(&spans, w));
+        rows.extend(wrap_spans_indented(&spans, w, hang));
     }
     if rows.is_empty() {
         rows.push(Line::default());
@@ -943,10 +954,16 @@ fn build_layout(
     rows
 }
 
-/// Greedily wraps a sequence of styled spans to `width` display columns, never
-/// splitting a character. Empty input yields one empty line.
-fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
+/// Greedily wraps styled spans to `width` columns with an optional hanging
+/// indent of `hang` columns: the first row of each call is laid out as-is (so a
+/// file-edit line's leading gutter sits at column 0), and every wrapped
+/// continuation row is prefixed with `hang` spaces so it aligns beneath the
+/// source text rather than beneath the gutter. Empty input yields one empty
+/// line; `hang` of 0 gives plain wrapping.
+fn wrap_spans_indented(spans: &[Span<'static>], width: usize, hang: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
+    let indent_w = hang.min(width.saturating_sub(1));
+    let indent = Span::raw(" ".repeat(indent_w));
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w: usize = 0;
@@ -961,6 +978,11 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
                 flush_span_buf(&mut buf, &mut buf_w, &mut cur, &mut cur_w, style);
                 out.push(Line::from(std::mem::take(&mut cur)));
                 cur_w = 0;
+                // Continuation row: reserve the hanging indent up front.
+                if indent_w > 0 {
+                    cur.push(indent.clone());
+                    cur_w = indent_w;
+                }
             }
             buf.push(ch);
             buf_w += cw;
@@ -1004,7 +1026,10 @@ impl Syntax {
         }
     }
 
-    /// Highlights a line of code, returning owned styled ratatui spans.
+    /// Highlights one source line into owned ratatui spans, mapping syntect's
+    /// per-token foreground directly to `Color::Rgb` (no ANSI escapes). The
+    /// syntax set and theme are loaded once per [`LayoutCache`] and reused, so
+    /// this never rebuilds them.
     fn highlight_line(&self, syntax_name: &str, line: &str) -> Vec<Span<'static>> {
         let syntax = self
             .set
@@ -1013,57 +1038,38 @@ impl Syntax {
             .unwrap_or_else(|| self.set.find_syntax_plain_text());
         let mut h = HighlightLines::new(syntax, &self.theme);
         let regions = h.highlight_line(line, &self.set).unwrap_or_default();
-        let escaped = as_24_bit_terminal_escaped(&regions[..], false);
-
-        // ratatui doesn't natively consume ANSI escapes, so strip them and rely
-        // on the diff +/- prefix for colour. A proper ANSI→Color integration is
-        // future work.
-        let plain = strip_ansi(&escaped);
-        vec![Span::raw(plain)]
+        regions
+            .iter()
+            .map(|(style, text)| {
+                Span::styled((*text).to_string(), syntect_style_to_ratatui(*style))
+            })
+            .collect()
     }
 }
 
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c == 'm' {
-                        break;
-                    }
-                }
-            }
-        } else {
-            out.push(c);
-        }
+/// Converts a syntect [`syntect::highlighting::Style`] into a ratatui
+/// [`Style`], preserving foreground colour and bold/italic/underline. A default
+/// (unspecified) foreground maps to no foreground so the terminal default shows.
+fn syntect_style_to_ratatui(style: syntect::highlighting::Style) -> Style {
+    let mut out = Style::default();
+    let fg = style.foreground;
+    if fg.a != 0 {
+        out = out.fg(Color::Rgb(fg.r, fg.g, fg.b));
+    }
+    let mut mods = Modifier::empty();
+    if style.font_style.contains(FontStyle::BOLD) {
+        mods |= Modifier::BOLD;
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        mods |= Modifier::ITALIC;
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        mods |= Modifier::UNDERLINED;
+    }
+    if !mods.is_empty() {
+        out = out.add_modifier(mods);
     }
     out
-}
-
-fn syntax_for_file(path: &str) -> &str {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    match ext {
-        "rs" => "rs",
-        "py" => "py",
-        "js" | "mjs" | "ts" | "tsx" | "jsx" => "js",
-        "go" => "go",
-        "java" => "java",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
-        "sh" | "bash" => "sh",
-        "toml" => "toml",
-        "json" => "json",
-        "yaml" | "yml" => "yaml",
-        "md" => "md",
-        "html" => "html",
-        "css" => "css",
-        "sql" => "sql",
-        "dockerfile" => "dockerfile",
-        _ => "txt",
-    }
 }
 
 fn expand_tabs(s: &str) -> String {
@@ -1093,6 +1099,12 @@ pub async fn run_streaming_tui(
     let mut state = TuiState::new(limits);
     state.steering_tx = steering_tx;
     set_title("vel auto — starting");
+
+    // `RunComplete` ends the run. Tracked as a flag and checked after a final
+    // render rather than via a bare `break` in the message-drain loop: that
+    // `break` only exited the inner `while let Ok(...)` drain, never the outer
+    // run loop, so the TUI hung forever after a run finished (until ^C×2).
+    let mut run_complete = false;
 
     loop {
         while let Ok(msg) = rx.try_recv() {
@@ -1144,6 +1156,9 @@ pub async fn run_streaming_tui(
                             }
                         }
                         EntryKind::Info(_) => {}
+                        // File edits render their own header/hunks; the surrounding
+                        // ToolCall/ToolResult already drove the spinner verb.
+                        EntryKind::FileEdit(_) => {}
                         // Dividers are visual separators; they carry no spinner
                         // verb or usage payload.
                         EntryKind::IterationDivider { .. } => {}
@@ -1203,7 +1218,7 @@ pub async fn run_streaming_tui(
                             state.transcript.ingest(e);
                         }
                     }
-                    break;
+                    run_complete = true;
                 }
             }
         }
@@ -1215,6 +1230,13 @@ pub async fn run_streaming_tui(
         terminal
             .draw(|f| render(f, &mut state, &cancel_handler))
             .wrap_err("draw")?;
+
+        // Run is done: exit after this final render. Skipping the input poll
+        // below avoids blocking ~100 ms for a keystroke we will not act on, so
+        // the TUI tears down promptly when the auto loop finishes.
+        if run_complete {
+            break;
+        }
 
         if event::poll(Duration::from_millis(100))
             .map_err(|e| color_eyre::eyre::eyre!("poll: {e}"))?
@@ -1781,13 +1803,11 @@ fn render_entry(kind: &EntryKind, _width: usize, syntax: &Syntax) -> Vec<Line<'s
 
         EntryKind::Usage { .. } => Vec::new(),
 
-        EntryKind::ToolCall {
-            tool,
-            detail,
-            input,
-        } => {
-            let mut lines = Vec::new();
-            lines.push(Line::from(vec![
+        EntryKind::ToolCall { tool, detail, .. } => {
+            // The header line only — for edit tools the real before/after diff
+            // arrives as a separate `FileEdit` entry (computed from the
+            // filesystem), so we never render the agent's claimed patch here.
+            vec![Line::from(vec![
                 Span::styled(
                     "🔧 ",
                     Style::default()
@@ -1802,13 +1822,7 @@ fn render_entry(kind: &EntryKind, _width: usize, syntax: &Syntax) -> Vec<Line<'s
                 ),
                 Span::raw(": "),
                 Span::styled(detail.clone(), Style::default().fg(Color::DarkGray)),
-            ]));
-
-            if tool == "Edit" || tool == "Write" {
-                lines.extend(render_edit_diff(tool, input, syntax));
-            }
-
-            lines
+            ])]
         }
 
         EntryKind::ToolResult { detail, success } => {
@@ -1869,6 +1883,8 @@ fn render_entry(kind: &EntryKind, _width: usize, syntax: &Syntax) -> Vec<Line<'s
         EntryKind::IterationDivider { number, maximum } => {
             vec![render_iteration_divider(*number, *maximum, _width)]
         }
+
+        EntryKind::FileEdit(edit) => render_file_edit(edit, _width, syntax),
     }
 }
 
@@ -1900,120 +1916,189 @@ fn render_iteration_divider(number: u32, maximum: Option<u32>, width: usize) -> 
     ])
 }
 
-// ── Diff rendering ──────────────────────────────────────────────────────────
+// ── File-edit rendering ─────────────────────────────────────────────────────
 
-fn render_edit_diff(tool: &str, input: &serde_json::Value, syntax: &Syntax) -> Vec<Line<'static>> {
-    let file = input
-        .get("file_path")
-        .or_else(|| input.get("file_name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let old = input
-        .get("old_string")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let new = input
-        .get("new_string")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let syn_name = syntax_for_file(file);
+/// The display width of a file-edit line's gutter: the sign column, spacing,
+/// the line number, and the separator. Shared by [`render_diff_line`] (which
+/// lays it out) and [`file_edit_hang`] (which sizes the hanging indent so
+/// wrapped rows align beneath the source).
+fn gutter_width(num_width: usize) -> usize {
+    num_width + 6
+}
 
+/// The hanging-indent width for a `FileEdit` entry's wrapped rows, or `0` for
+/// any other entry kind. Sourced from the edit's widest line number so it always
+/// matches the gutter [`render_diff_line`] emits.
+fn file_edit_hang(kind: &EntryKind) -> usize {
+    match kind {
+        EntryKind::FileEdit(edit) => gutter_width(line_number_width(edit)),
+        _ => 0,
+    }
+}
+
+/// Widest line-number digit count across the edit's hunks (minimum 1).
+fn line_number_width(edit: &FileEdit) -> usize {
+    let max = edit
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .flat_map(|l| l.old_no.into_iter().chain(l.new_no))
+        .map(|n| n.to_string().len())
+        .max()
+        .unwrap_or(1);
+    max.max(1)
+}
+
+/// Renders a structured [`FileEdit`] to logical (not yet wrapped) lines: a
+/// header carrying the path and kind, then — for text edits — gutter-prefixed
+/// diff lines with syntax highlighting and diff styling. Binary and
+/// capture-failed edits render a concise note instead of hunks. Wrapping +
+/// hanging-indent alignment is applied later in [`build_layout`].
+fn render_file_edit(edit: &FileEdit, _width: usize, syntax: &Syntax) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    lines.push(Line::from(vec![
-        Span::raw("  "),
+    // Header: icon + path (kind-coloured) + optional status suffix.
+    let (path_color, suffix) = header_style(&edit.kind);
+    let mut header = vec![
         Span::styled(
-            if tool == "Write" {
-                format!("--- {file} (new file)")
-            } else {
-                format!("--- {file}")
-            },
-            Style::default().fg(Color::Red),
+            "✎ ".to_string(),
+            Style::default().fg(path_color).add_modifier(Modifier::BOLD),
         ),
-    ]));
-
-    if tool == "Edit" && !old.is_empty() {
-        let old_expanded = expand_tabs(old);
-        let new_expanded = expand_tabs(new);
-        let old_lines: Vec<&str> = old_expanded.lines().collect();
-        let new_lines: Vec<&str> = new_expanded.lines().collect();
-
-        let mut old_set = std::collections::HashSet::new();
-        for l in &new_lines {
-            old_set.insert(*l);
-        }
-        let mut new_set = std::collections::HashSet::new();
-        for l in &old_lines {
-            new_set.insert(*l);
-        }
-
-        for (i, l) in old_lines.iter().enumerate() {
-            if !new_set.contains(*l) {
-                lines.push(diff_line_simple(i + 1, l, false, syn_name, syntax));
-            } else {
-                lines.push(diff_line_simple(i + 1, l, true, syn_name, syntax));
-            }
-        }
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("+++ {file}"), Style::default().fg(Color::Green)),
-        ]));
-        for (i, l) in new_lines.iter().enumerate() {
-            if !old_set.contains(*l) {
-                lines.push(diff_line_simple(i + 1, l, true, syn_name, syntax));
-            }
-        }
+        Span::styled(
+            edit.path.clone(),
+            Style::default().fg(path_color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(s) = suffix {
+        header.push(Span::styled(
+            format!("  {s}"),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
+    lines.push(Line::from(header));
 
-    if tool == "Write" && !new.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("+++ {file}"), Style::default().fg(Color::Green)),
-        ]));
-        for (i, l) in expand_tabs(new).lines().enumerate() {
-            let highlighted = syntax.highlight_line(syn_name, &expand_tabs(l));
-            let mut spans = vec![
+    match &edit.kind {
+        FileEditKind::CaptureFailed { reason } => {
+            lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("{:>4} ", i + 1),
-                    Style::default().fg(Color::DarkGray),
+                    format!("⚠ could not capture edit: {reason}"),
+                    Style::default().fg(Color::Yellow),
                 ),
-                Span::styled("+", Style::default().fg(Color::Green)),
-            ];
-            spans.extend(highlighted);
-            lines.push(Line::from(spans));
+            ]));
+        }
+        FileEditKind::Binary => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "binary file changed (contents not shown)",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+        FileEditKind::Modified | FileEditKind::Created | FileEditKind::Deleted => {
+            let hint = edit.syntax.syntect_hint();
+            let num_width = line_number_width(edit);
+            for (i, hunk) in edit.hunks.iter().enumerate() {
+                if i > 0
+                    && let Some(gap) = inter_hunk_gap(edit.hunks.get(i - 1), hunk)
+                {
+                    lines.push(dim_line(format!("  ⋯ {gap} lines ⋯")));
+                }
+                for dl in &hunk.lines {
+                    lines.push(render_diff_line(dl, num_width, hint, syntax));
+                }
+            }
+            if edit.omitted_lines > 0 {
+                lines.push(dim_line(format!(
+                    "  ⋯ {} lines omitted — full diff is in the run log ⋯",
+                    edit.omitted_lines
+                )));
+            }
         }
     }
 
     lines
 }
 
-fn diff_line_simple(
-    line_no: usize,
-    text: &str,
-    added: bool,
-    syn_name: &str,
-    syntax: &Syntax,
-) -> Line<'static> {
-    let (prefix, color, bg) = if added {
-        ("+", Color::Green, Color::Rgb(20, 40, 20))
-    } else {
-        ("-", Color::Red, Color::Rgb(40, 20, 20))
+/// `(path colour, optional status suffix)` for the file-edit header.
+fn header_style(kind: &FileEditKind) -> (Color, Option<&'static str>) {
+    match kind {
+        FileEditKind::Created => (Color::Green, Some("new file")),
+        FileEditKind::Deleted => (Color::Red, Some("deleted")),
+        FileEditKind::Binary => (Color::Magenta, Some("binary")),
+        FileEditKind::CaptureFailed { .. } => (Color::Yellow, Some("capture failed")),
+        FileEditKind::Modified => (Color::Cyan, None),
+    }
+}
+
+/// Renders one diff line: a stable gutter (sign + line number + separator)
+/// followed by syntax-highlighted source. Style precedence — selection/focus is
+/// not applicable in the transcript, so: diff treatment (sign colour + line
+/// background tint) overrides, then syntax token foreground, then default. Added
+/// and removed lines keep their syntax foreground but gain a background tint so
+/// they stay distinguishable; context lines keep syntax foreground only.
+fn render_diff_line(dl: &DiffLine, num_width: usize, hint: &str, syntax: &Syntax) -> Line<'static> {
+    let (sign, sign_color, tint) = match dl.kind {
+        LineKind::Context => (" ", Color::DarkGray, None),
+        LineKind::Addition => ("+", Color::Green, Some(Color::Rgb(20, 40, 20))),
+        LineKind::Removal => ("-", Color::Red, Some(Color::Rgb(40, 20, 20))),
+    };
+    // Removals show the old number; additions/context show the new number.
+    let lineno = dl.new_no.or(dl.old_no);
+    let lineno_str = match lineno {
+        Some(n) => format!("{n:>num_width$}"),
+        None => " ".repeat(num_width),
     };
 
-    let highlighted = syntax.highlight_line(syn_name, text);
+    let mut source = syntax.highlight_line(hint, &expand_tabs(&dl.text));
+    if let Some(bg) = tint {
+        source = source
+            .into_iter()
+            .map(|s| Span::styled(s.content, s.style.bg(bg)))
+            .collect();
+    }
 
-    let mut spans = vec![
-        Span::raw("  "),
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw(" "),
         Span::styled(
-            format!("{line_no:>4} "),
-            Style::default().fg(Color::DarkGray),
+            sign.to_string(),
+            Style::default().fg(sign_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(prefix.to_string(), Style::default().fg(color).bg(bg)),
+        Span::raw(" "),
+        Span::styled(lineno_str, Style::default().fg(Color::DarkGray)),
+        Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray)),
     ];
-    spans.extend(highlighted);
-
+    spans.extend(source);
     Line::from(spans)
+}
+
+/// Number of source lines skipped between two consecutive hunks (for the gap
+/// marker), preferring old-file line numbers and falling back to new-file.
+fn inter_hunk_gap(prev: Option<&FileHunk>, next: &FileHunk) -> Option<u64> {
+    let prev = prev?;
+    let prev_last = prev.lines.iter().rev().find_map(line_no_for_gap)?;
+    let next_first = next.lines.iter().find_map(line_no_for_gap)?;
+    if next_first > prev_last {
+        Some(u64::try_from(next_first - prev_last - 1).unwrap_or(0))
+    } else {
+        None
+    }
+}
+
+/// The line number used for gap math: old number if present, else new number.
+fn line_no_for_gap(l: &DiffLine) -> Option<usize> {
+    l.old_no.or(l.new_no)
+}
+
+/// A dim, full-span line used for inter-hunk gaps and truncation markers.
+fn dim_line(text: String) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        text,
+        Style::default().fg(Color::DarkGray),
+    )])
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -2536,5 +2621,143 @@ mod render_tests {
         state.g_deadline = Some(Instant::now() - Duration::from_millis(1));
         state.tick_g_chord();
         assert!(!state.pending_g, "pending g cancelled after timeout");
+    }
+
+    // ── File-edit rendering ─────────────────────────────────────────────────
+
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans.iter().flat_map(|s| s.content.chars()).collect()
+    }
+
+    fn one_line_replacement_edit() -> velor_core::file_edit::FileEdit {
+        velor_core::file_edit::compute_file_edit(
+            "src/lib.rs",
+            Some(b"fn one() {}\nfn two() {}\nfn three() {}\n"),
+            Some(b"fn one() {}\nfn TWO() {}\nfn three() {}\n"),
+            velor_core::file_edit::DEFAULT_MAX_DIFF_LINES,
+        )
+        .expect("a real change produces an edit")
+    }
+
+    #[test]
+    fn file_edit_layout_has_gutter_syntax_and_diff_styles() {
+        let syntax = Syntax::new();
+        let kind = EntryKind::FileEdit(Box::new(one_line_replacement_edit()));
+        let rows = build_layout(&kind, Local::now(), 80, &syntax);
+        assert!(!rows.is_empty());
+
+        // Flatten spans, checking for ANSI escapes and gathering evidence of
+        // diff styling + syntax colouring.
+        let mut text = String::new();
+        let mut has_addition_bg = false;
+        let mut has_removal_bg = false;
+        let mut has_syntax_fg = false;
+        let mut has_plus_sign = false;
+        let mut has_minus_sign = false;
+        for line in &rows {
+            for span in &line.spans {
+                text.push_str(&span.content);
+                let style = span.style;
+                if style.bg == Some(Color::Rgb(20, 40, 20)) {
+                    has_addition_bg = true;
+                }
+                if style.bg == Some(Color::Rgb(40, 20, 20)) {
+                    has_removal_bg = true;
+                }
+                if matches!(style.fg, Some(Color::Rgb(..))) {
+                    has_syntax_fg = true;
+                }
+                if span.content == "+" && style.fg == Some(Color::Green) {
+                    has_plus_sign = true;
+                }
+                if span.content == "-" && style.fg == Some(Color::Red) {
+                    has_minus_sign = true;
+                }
+            }
+        }
+        assert!(!text.contains('\x1b'), "no ANSI escapes embedded in spans");
+        assert!(text.contains("│"), "gutter separator present");
+        assert!(has_plus_sign, "added lines carry a green + gutter marker");
+        assert!(has_minus_sign, "removed lines carry a red - gutter marker");
+        assert!(
+            has_addition_bg,
+            "added line source keeps syntax fg with a green background tint"
+        );
+        assert!(
+            has_removal_bg,
+            "removed line source keeps syntax fg with a red background tint"
+        );
+        assert!(has_syntax_fg, "syntax highlighting produced coloured spans");
+    }
+
+    #[test]
+    fn file_edit_wrapped_continuation_aligns_under_source() {
+        let syntax = Syntax::new();
+        // A created file with one very long line so it wraps at a narrow width.
+        let long = format!("fn long() {{ /* {} */ }}", "x".repeat(200));
+        let edit = velor_core::file_edit::compute_file_edit(
+            "src/lib.rs",
+            None,
+            Some(long.as_bytes()),
+            velor_core::file_edit::DEFAULT_MAX_DIFF_LINES,
+        )
+        .expect("created edit");
+        let kind = EntryKind::FileEdit(Box::new(edit));
+        let rows = build_layout(&kind, Local::now(), 40, &syntax);
+
+        // rows[0] = header; rows[1] = first (guttered) row of the added line;
+        // rows[2..] = wrapped continuation rows.
+        assert!(
+            rows.len() > 2,
+            "a long line must wrap to multiple rows, got {}",
+            rows.len()
+        );
+        // The guttered row begins with the gutter " + 1 │ " (width 7 for a
+        // 1-digit line number: space + sign + space + num + " │ ").
+        let first = row_text(&rows[1]);
+        assert!(
+            first.starts_with(" + 1 │ "),
+            "first source row begins with the gutter, got {first:?}"
+        );
+        // The continuation row is indented by the gutter width (7 columns) so it
+        // aligns beneath the source, not beneath the line number/marker.
+        let cont = row_text(&rows[2]);
+        assert!(
+            cont.starts_with("       "),
+            "wrapped continuation is indented to the source column, got {cont:?}"
+        );
+    }
+
+    #[test]
+    fn file_edit_renders_in_buffer_without_ansi() {
+        let mut state = TuiState::new(TuiLimits::default());
+        state
+            .transcript
+            .ingest(TuiEntry::now(EntryKind::FileEdit(Box::new(
+                one_line_replacement_edit(),
+            ))));
+
+        let cancel_handler = handler();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, &mut state, &cancel_handler))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+
+        // Gather every rendered cell so we can assert on the whole frame.
+        let mut all = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                all.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            !all.contains('\x1b'),
+            "rendered transcript must contain no ANSI escape sequences"
+        );
+        assert!(all.contains("src/lib.rs"), "file path header is rendered");
+        assert!(all.contains('+'), "addition marker is rendered");
+        assert!(all.contains('-'), "removal marker is rendered");
     }
 }

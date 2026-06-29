@@ -33,6 +33,9 @@ globset = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 
+# File-edit transcript diffing (line-based, 3-context unified hunks).
+diffy = { workspace = true }
+
 # Prompt discovery dependencies
 dirs = { workspace = true }
 thiserror = { workspace = true }

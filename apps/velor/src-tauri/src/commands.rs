@@ -817,6 +817,18 @@ async fn apply_agent_event(
                 detail: Some(detail),
                 success,
             }),
+            AgentEvent::FileEdit { edit } => record.record_activity(ExecutionActivity {
+                provider: provider.to_string(),
+                kind: ExecutionActivityKind::ToolCall,
+                summary: "file edit".to_string(),
+                detail: Some(format!(
+                    "{} ({} line{})",
+                    edit.path,
+                    edit.diff_line_count(),
+                    if edit.diff_line_count() == 1 { "" } else { "s" }
+                )),
+                success: None,
+            }),
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
