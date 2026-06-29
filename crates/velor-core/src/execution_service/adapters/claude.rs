@@ -186,10 +186,15 @@ impl AgentAdapter for ClaudeSubprocessAdapter {
             crate::execution_service::supervisor::spawn(spec, self.params.cancellation.clone())
                 .await?;
 
+        // The supervisor's streaming-stdin command sender. Present only for the
+        // streaming path; reused both to forward steering and to close stdin when
+        // the turn completes.
+        let command_sender = process.input_sender();
+
         // Spawn the steering-forwarding task only for the streaming path, and only
         // when both a writable command sender and a steering receiver exist.
         let forward_handle = if steering {
-            match (process.input_sender(), live_input) {
+            match (command_sender.clone(), live_input) {
                 (Some(command_tx), Some(live_rx)) => Some(tokio::spawn(forward_steering(
                     live_rx,
                     command_tx,
@@ -202,7 +207,7 @@ impl AgentAdapter for ClaudeSubprocessAdapter {
             None
         };
 
-        let result = run_claude_stream(process, sink).await;
+        let result = run_claude_stream(process, sink, command_sender.as_ref()).await;
         // The process is finished; stop the forwarding task promptly so it cannot
         // outlive the execution.
         if let Some(handle) = forward_handle {
@@ -296,20 +301,34 @@ async fn forward_steering(
 
 /// Drives a running Claude subprocess: decodes stdout frames, emits events,
 /// then classifies the final output.
+///
+/// `streaming_close` is `Some` for the live-steering path. In Claude Code's
+/// stream-json `--print` mode the process does **not** exit when a turn reaches
+/// `end_turn` — it keeps stdin open waiting for more messages. So once the
+/// `result` (end_turn) frame is observed we deliberately close stdin (EOF) so
+/// the process exits cleanly and the iteration completes. Any mid-turn steering
+/// is incorporated *before* that result, so this never cuts off an in-flight
+/// steer.
 async fn run_claude_stream(
     mut process: RunningProcess,
     sink: &mut dyn AgentEventSink,
+    streaming_close: Option<&tokio::sync::mpsc::Sender<ProcessInputCommand>>,
 ) -> Result<AgentRunResult, AgentExecutionError> {
     let mut decoder = LineDecoder::new(MAX_FRAME_BYTES);
     let mut collected = String::new();
     let mut structured_error: Option<String> = None;
+    let mut close_sent = false;
 
     while let Some(event) = process.next_event().await {
         match event {
             ProcessEvent::Stdout(chunk) => {
                 let lines = decoder.push(&chunk.bytes)?;
+                let mut saw_result = false;
                 for line in lines {
                     let text = String::from_utf8_lossy(&line);
+                    if streaming_close.is_some() && frame_is_result(&text) {
+                        saw_result = true;
+                    }
                     for agent_event in parse_claude_line(&text, &mut collected) {
                         if structured_error.is_none()
                             && let AgentEvent::Error { message } = &agent_event
@@ -318,6 +337,20 @@ async fn run_claude_stream(
                         }
                         emit_event(sink, agent_event).await?;
                     }
+                }
+                // The turn is complete: close stdin so Claude exits instead of
+                // waiting indefinitely for more steering input.
+                if saw_result
+                    && !close_sent
+                    && let Some(tx) = streaming_close
+                {
+                    let (ack, _r) = tokio::sync::oneshot::channel();
+                    let _ = tx
+                        .send(ProcessInputCommand::Close {
+                            acknowledgement: ack,
+                        })
+                        .await;
+                    close_sent = true;
                 }
             }
             ProcessEvent::Stderr(_) => {
@@ -389,6 +422,15 @@ pub(super) fn map_outcome(
         }
         Termination::Cancelled => Err(AgentExecutionError::Cancelled),
     }
+}
+
+/// Cheap check: is this stream-json line the terminal `result` (end_turn) frame?
+/// Used by the streaming path to know when to close stdin.
+fn frame_is_result(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return false;
+    };
+    value.get("type").and_then(|v| v.as_str()) == Some("result")
 }
 
 /// Parses one Claude stream-json line into zero or more [`AgentEvent`]s and
@@ -643,6 +685,23 @@ mod tests {
         let s = "héllo world 😀👏"; // mixed multibyte
         let t = truncate_str(s, 5);
         assert!(t.is_char_boundary(t.len()));
+    }
+
+    #[test]
+    fn frame_is_result_detects_end_turn() {
+        // The terminal `result` frame — what the streaming path closes stdin on.
+        assert!(frame_is_result(
+            r#"{"type":"result","subtype":"success","is_error":false}"#
+        ));
+        // Other frame types must NOT trigger the close.
+        assert!(!frame_is_result(r#"{"type":"assistant","message":{}}"#));
+        assert!(!frame_is_result(r#"{"type":"user","message":{}}"#));
+        assert!(!frame_is_result(
+            r#"{"type":"content_block_delta","delta":{}}"#
+        ));
+        // Non-JSON / partial lines are not results (and must not panic).
+        assert!(!frame_is_result("not json"));
+        assert!(!frame_is_result(""));
     }
 }
 
