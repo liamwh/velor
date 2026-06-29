@@ -101,11 +101,12 @@ impl RunLogger {
         use velor_core::agent::AgentEvent;
         match event {
             AgentEvent::TextDelta { text } if text.is_empty() => {}
-            AgentEvent::TextDelta { text } if text.starts_with("💭 ") => {
-                self.log("thinking", json!({ "text": truncate(&text[3..], 2000) }));
-            }
             AgentEvent::TextDelta { text } => {
                 self.log("text", json!({ "text": truncate(text, 2000) }));
+            }
+            AgentEvent::Thinking { text } if text.is_empty() => {}
+            AgentEvent::Thinking { text } => {
+                self.log("thinking", json!({ "text": truncate(text, 2000) }));
             }
             AgentEvent::ToolCall {
                 tool,
@@ -202,16 +203,29 @@ impl RunLogger {
     }
 
     /// Logs the final outcome.
-    pub fn log_outcome(&self, status: &str, iterations: u32, duration_secs: u64) {
-        self.log(
-            "lifecycle",
-            json!({
-                "event": "run_finished",
-                "status": status,
-                "iterations_completed": iterations,
-                "duration_secs": duration_secs,
-            }),
-        );
+    ///
+    /// `reason` is an optional short, lowercase label describing *why* the run
+    /// stopped (e.g. `"completed"`, `"force_cancelled"`, `"stop_after_iteration"`).
+    /// Recording it makes a run's exit self-diagnosing from the log alone.
+    pub fn log_outcome(
+        &self,
+        status: &str,
+        reason: Option<&str>,
+        iterations: u32,
+        duration_secs: u64,
+    ) {
+        let mut data = json!({
+            "event": "run_finished",
+            "status": status,
+            "iterations_completed": iterations,
+            "duration_secs": duration_secs,
+        });
+        if let Some(obj) = data.as_object_mut()
+            && let Some(reason) = reason
+        {
+            obj.insert("reason".to_string(), json!(reason));
+        }
+        self.log("lifecycle", data);
     }
 }
 

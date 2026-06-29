@@ -133,7 +133,9 @@ impl AgentAdapter for CodexSubprocessAdapter {
     async fn execute(
         &mut self,
         sink: &mut dyn AgentEventSink,
+        _live_input: Option<tokio::sync::mpsc::Receiver<crate::agent::AgentInput>>,
     ) -> Result<AgentRunResult, AgentExecutionError> {
+        let _ = _live_input; // Codex does not support live steering.
         let spec = self.build_spec();
         let process: RunningProcess =
             crate::execution_service::supervisor::spawn(spec, self.params.cancellation.clone())
@@ -168,7 +170,11 @@ async fn run_codex_stream(
                     }
                 }
             }
-            ProcessEvent::Stderr(_) | ProcessEvent::StdinWritten | ProcessEvent::Exited => {}
+            ProcessEvent::Stderr(_)
+            | ProcessEvent::StdinWritten
+            | ProcessEvent::StdinInitialised
+            | ProcessEvent::StdinWriteFailed(_)
+            | ProcessEvent::Exited => {}
         }
     }
 
@@ -236,6 +242,20 @@ fn parse_codex_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                         collected.push_str(text);
                         events.push(AgentEvent::TextDelta {
+                            text: text.to_string(),
+                        });
+                    }
+                } else if item_type == "reasoning" {
+                    // Codex surfaces model reasoning as an `item.completed` with
+                    // type "reasoning"; emit it as thinking so consumers can
+                    // toggle its visibility.
+                    if let Some(text) = item
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| item.get("summary").and_then(|t| t.as_str()))
+                        && !text.is_empty()
+                    {
+                        events.push(AgentEvent::Thinking {
                             text: text.to_string(),
                         });
                     }

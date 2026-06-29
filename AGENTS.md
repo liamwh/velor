@@ -73,3 +73,6 @@ The CLI spawns the configured binary (default: `claude-glm`) with:
 
 ### UI and Design
 - Bun instead of npm
+
+### Way-of-working
+After finishing work on a branch that isn't main, commit and run `just install` to install the new version locally on this machine.

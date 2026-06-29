@@ -790,6 +790,13 @@ async fn apply_agent_event(
                 success: None,
             }),
             AgentEvent::TextDelta { text } => record.append_output(&text),
+            AgentEvent::Thinking { text } => record.record_activity(ExecutionActivity {
+                provider: provider.to_string(),
+                kind: ExecutionActivityKind::Status,
+                summary: "thinking".to_string(),
+                detail: Some(text),
+                success: None,
+            }),
             AgentEvent::ToolCall { tool, detail, .. } => {
                 record.record_activity(ExecutionActivity {
                     provider: provider.to_string(),

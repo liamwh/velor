@@ -11,6 +11,7 @@
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{AcpConfig, AgentProvider, CodexConfig, Protocol};
@@ -45,6 +46,12 @@ pub enum AgentEvent {
         /// Text delta payload.
         text: String,
     },
+    /// Incremental model thinking/reasoning output (kept separate from
+    /// [`AgentEvent::TextDelta`] so consumers can show or hide it on demand).
+    Thinking {
+        /// Reasoning token delta payload.
+        text: String,
+    },
     /// Tool/action execution started.
     ToolCall {
         /// Tool/action name.
@@ -76,6 +83,49 @@ pub enum AgentEvent {
     Error {
         /// Error detail.
         message: String,
+    },
+}
+
+/// The delivery state of a one-shot live-steering message, tracked from
+/// acceptance through acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringDelivery {
+    /// Accepted by Vel's controller (not yet written).
+    Queued,
+    /// Written and flushed to the agent's stdin pipe.
+    Written,
+    /// A matching replayed-user-message frame was observed from the agent.
+    Acknowledged,
+    /// No writable active live-input session exists.
+    Unavailable,
+    /// The pipe write succeeded, but the process failed before acknowledgement.
+    DeliveryUnknown,
+}
+
+/// Error returned when a live-steering [`AgentInput`] could not be delivered.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AgentInputError {
+    /// Live steering was unavailable for the given [`crate::execution_service::error::LiveSteeringUnavailableReason`].
+    #[error("live steering unavailable: {reason}")]
+    Unavailable {
+        /// Why steering was unavailable.
+        #[from]
+        reason: crate::execution_service::error::LiveSteeringUnavailableReason,
+    },
+}
+
+/// Typed runtime input delivered to an active agent session. Lives on the
+/// agent-runner side; adapters forward these to the supervisor's streaming stdin.
+#[derive(Debug)]
+pub enum AgentInput {
+    /// A one-shot user message steering the active session. The acknowledgement
+    /// resolves with the message's [`SteeringDelivery`] (or an
+    /// [`AgentInputError`] if it could not be delivered).
+    UserMessage {
+        /// The steering text.
+        text: crate::execution_service::adapters::claude_stream::SteeringText,
+        /// Resolves once the message's delivery state is known.
+        acknowledgement: oneshot::Sender<Result<SteeringDelivery, AgentInputError>>,
     },
 }
 
@@ -148,6 +198,7 @@ impl AgentRunner {
         images: &[PathBuf],
         timeouts: ProcessTimeouts,
         cancellation: CancellationToken,
+        enable_live_steering: bool,
     ) -> AgentProfile {
         match self {
             Self::ClaudeSubprocess => AgentProfile::Claude(ClaudeParams {
@@ -161,6 +212,7 @@ impl AgentRunner {
                 extra_env: Vec::new(),
                 timeouts,
                 cancellation,
+                enable_live_steering,
             }),
             Self::Codex(config) => AgentProfile::Codex(CodexParams {
                 binary: binary.to_string(),
@@ -215,6 +267,7 @@ impl AgentRunner {
             &[],
             timeouts,
             cancellation,
+            false,
         );
         let execution = shared_service().execute(profile).await?;
         let report = execution.complete().await?;
@@ -255,6 +308,7 @@ impl AgentRunner {
             images,
             timeouts,
             cancellation,
+            false,
         );
         let mut execution = shared_service().execute(profile).await?;
         while let Some(event) = execution.next_event().await {
@@ -262,6 +316,130 @@ impl AgentRunner {
         }
         let report = execution.complete().await?;
         Ok(report.result)
+    }
+
+    /// Runs the agent with streaming events *and* live steering.
+    ///
+    /// Like [`Self::run_with_events`], but also drains `steering` for
+    /// [`AgentInput`] commands and forwards each to the active execution's input
+    /// sender while the execution is live (status `Ready`). Steering is forwarded
+    /// only while the run is active; once it finishes, the loop drains remaining
+    /// events to completion and returns. The existing [`Self::run_with_events`]
+    /// is left intact for non-interactive callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentExecutionError`] if provider execution fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_with_events_and_steering<F>(
+        &self,
+        binary: &str,
+        permission_mode: &str,
+        prompt: &str,
+        prompt_name: &str,
+        cwd: &Path,
+        images: &[PathBuf],
+        timeouts: ProcessTimeouts,
+        cancellation: CancellationToken,
+        steering: &mut Option<tokio::sync::mpsc::Receiver<AgentInput>>,
+        mut on_event: F,
+    ) -> Result<AgentRunResult, AgentExecutionError>
+    where
+        F: FnMut(AgentEvent) + Send,
+    {
+        // Enable the streaming path only when a steering receiver is wired in;
+        // otherwise this behaves like the plain event path. The receiver is
+        // borrowed (not consumed) so a retry driver can reuse it across attempts.
+        let enable_live_steering = steering.is_some();
+        let profile = self.build_profile(
+            binary,
+            permission_mode,
+            prompt,
+            prompt_name,
+            cwd,
+            images,
+            timeouts,
+            cancellation.clone(),
+            enable_live_steering,
+        );
+        let mut execution = shared_service().execute(profile).await?;
+        let capabilities = execution.capabilities();
+        let input_tx = execution.input_sender();
+        let mut steering_open = steering.is_some();
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = cancellation.cancelled() => {
+                    let report = execution.cancel().await?;
+                    return Ok(report.result);
+                }
+
+                // Forward a steering command only while the run is live and the
+                // adapter advertises live steering. When the execution finishes
+                // (next_event returns None) we stop accepting new steering.
+                input = async {
+                    match steering.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                }, if steering_open && capabilities.live_steering => {
+                    match input {
+                        Some(agent_input) => {
+                            // Relay on a separate task so a slow/full input
+                            // channel can never stall the event-drain loop.
+                            let tx = input_tx.clone();
+                            tokio::spawn(async move {
+                                relay_steering(agent_input, tx).await;
+                            });
+                        }
+                        // Steering sender dropped or never provided: stop polling.
+                        None => steering_open = false,
+                    }
+                }
+
+                event = execution.next_event() => match event {
+                    Some(e) => on_event(e),
+                    None => {
+                        let report = execution.complete().await?;
+                        return Ok(report.result);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// Relays one steering [`AgentInput`] to the active execution's input sender.
+/// On success the adapter resolves the input's acknowledgement with its delivery
+/// state; if delivery is impossible (no sender, or the writer has gone away) the
+/// acknowledgement is resolved here as unavailable, so the caller always observes
+/// an explicit outcome rather than a dropped command.
+async fn relay_steering(input: AgentInput, sender: Option<tokio::sync::mpsc::Sender<AgentInput>>) {
+    use crate::execution_service::error::LiveSteeringUnavailableReason;
+    match sender {
+        Some(tx) => match tx.send(input).await {
+            Ok(()) => {} // the adapter resolves the acknowledgement.
+            Err(err) => {
+                // The writer is gone (process closing/terminated). Recover the
+                // input and resolve its acknowledgement ourselves.
+                let AgentInput::UserMessage {
+                    acknowledgement, ..
+                } = err.0;
+                let _ = acknowledgement.send(Err(AgentInputError::Unavailable {
+                    reason: LiveSteeringUnavailableReason::StdinClosed,
+                }));
+            }
+        },
+        None => {
+            let AgentInput::UserMessage {
+                acknowledgement, ..
+            } = input;
+            let _ = acknowledgement.send(Err(AgentInputError::Unavailable {
+                reason: LiveSteeringUnavailableReason::Inactive,
+            }));
+        }
     }
 }
 
@@ -365,5 +543,62 @@ mod tests {
         let runner = AgentRunner::ClaudeSubprocess;
         let debug_str = format!("{runner:?}");
         assert!(debug_str.contains("ClaudeSubprocess"));
+    }
+
+    #[tokio::test]
+    async fn relay_resolves_inactive_when_no_sender() {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let input = AgentInput::UserMessage {
+            text: crate::execution_service::adapters::claude_stream::SteeringText::new("hi")
+                .unwrap(),
+            acknowledgement: ack_tx,
+        };
+        relay_steering(input, None).await;
+        let result = ack_rx.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(AgentInputError::Unavailable {
+                reason: crate::execution_service::error::LiveSteeringUnavailableReason::Inactive
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_resolves_stdin_closed_when_writer_dropped() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<AgentInput>(1);
+        drop(rx); // the adapter's receiver is gone → send fails
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let input = AgentInput::UserMessage {
+            text: crate::execution_service::adapters::claude_stream::SteeringText::new("hi")
+                .unwrap(),
+            acknowledgement: ack_tx,
+        };
+        relay_steering(input, Some(tx)).await;
+        let result = ack_rx.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(AgentInputError::Unavailable {
+                reason: crate::execution_service::error::LiveSteeringUnavailableReason::StdinClosed
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_when_channel_open_without_resolving_ack() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentInput>(1);
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        let input = AgentInput::UserMessage {
+            text: crate::execution_service::adapters::claude_stream::SteeringText::new("hi")
+                .unwrap(),
+            acknowledgement: ack_tx,
+        };
+        relay_steering(input, Some(tx)).await;
+        // The input reaches the receiver; the relay does not resolve the ack on
+        // success (the adapter owns that).
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AgentInput::UserMessage { .. }
+        ));
+        assert!(ack_rx.try_recv().is_err());
     }
 }

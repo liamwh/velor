@@ -13,6 +13,7 @@
 
 pub mod adapter;
 pub mod adapters;
+pub mod capabilities;
 pub mod classify;
 pub mod diagnostics;
 pub mod error;

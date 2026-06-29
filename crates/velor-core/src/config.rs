@@ -494,6 +494,40 @@ pub struct FileConfig {
     pub automations: AutomationsConfig,
 }
 
+/// Bounds for the streaming TUI's *live* transcript. The complete transcript
+/// always remains in the durable run log; these only cap in-memory retention and
+/// per-entry rendering so long sessions don't grow without bound. All fields are
+/// optional; an absent field falls back to a built-in, validated default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TuiConfig {
+    /// Maximum retained semantic entries in the live view.
+    #[serde(default)]
+    pub max_transcript_entries: Option<usize>,
+
+    /// Maximum retained bytes across all live entries.
+    #[serde(default)]
+    pub max_transcript_bytes: Option<usize>,
+
+    /// Maximum live lines retained for a single tool result / diff entry (head +
+    /// tail kept, middle folded — full content stays in the run log).
+    #[serde(default)]
+    pub max_entry_lines: Option<usize>,
+}
+
+impl TuiConfig {
+    /// Merges two TUI configs, with `overlay` taking precedence on `Some` values.
+    #[must_use]
+    pub fn merge(self, overlay: Self) -> Self {
+        Self {
+            max_transcript_entries: overlay
+                .max_transcript_entries
+                .or(self.max_transcript_entries),
+            max_transcript_bytes: overlay.max_transcript_bytes.or(self.max_transcript_bytes),
+            max_entry_lines: overlay.max_entry_lines.or(self.max_entry_lines),
+        }
+    }
+}
+
 /// Default values that can be overridden by CLI arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Defaults {
@@ -573,6 +607,10 @@ pub struct Defaults {
     /// Codex-specific configuration (only used when provider = "codex").
     #[serde(default)]
     pub codex: CodexConfig,
+
+    /// Bounds for the streaming TUI live transcript.
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 /// Default value for the binary field.
@@ -685,6 +723,8 @@ impl Defaults {
             acp: overlay.acp,
             // For codex, overlay takes precedence
             codex: overlay.codex,
+            // TUI bounds: per-field overlay-wins.
+            tui: self.tui.merge(overlay.tui),
         }
     }
 }

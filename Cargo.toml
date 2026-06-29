@@ -56,6 +56,7 @@ fs2 = "0.4"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
 syntect = "5"
 tui-markdown = "0.3"
+unicode-width = "0.2"
 cron = "0.12"
 iana-time-zone = "0.1"
 tempfile = "3"
