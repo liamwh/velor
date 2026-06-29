@@ -36,6 +36,10 @@ pub enum EntryKind {
         detail: String,
         success: Option<bool>,
     },
+    /// A captured file edit: the real before/after diff for a file the agent
+    /// modified (syntax-highlighted when rendered). Boxed to keep the enum small;
+    /// the [`velor_core::file_edit::FileEdit`] is framework-agnostic.
+    FileEdit(Box<velor_core::file_edit::FileEdit>),
     /// An error event (routed to the errors modal, kept out of the main log).
     Error(String),
     /// A lifecycle/status line.
@@ -427,6 +431,7 @@ fn approx_bytes(kind: &EntryKind) -> usize {
             s.len()
         }
         EntryKind::ToolResult { detail, .. } => detail.len(),
+        EntryKind::FileEdit(edit) => edit.approx_byte_size(),
         EntryKind::ToolCall {
             tool,
             detail,
@@ -445,6 +450,11 @@ fn logical_line_count(kind: &EntryKind) -> u64 {
     match kind {
         EntryKind::Text(s) | EntryKind::Thinking(s) => line_count(s),
         EntryKind::ToolResult { detail, .. } => line_count(detail),
+        EntryKind::FileEdit(edit) => {
+            // Header + diff lines + one row per inter-hunk gap (estimate).
+            1u64.saturating_add(u64::try_from(edit.diff_line_count()).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(edit.hunks.len()).unwrap_or(u64::MAX))
+        }
         EntryKind::ToolCall {
             tool: _,
             detail,

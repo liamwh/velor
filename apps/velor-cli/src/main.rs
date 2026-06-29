@@ -1470,6 +1470,8 @@ async fn run_auto(
     if let Some(tp) = &tracing_log_path {
         println!("📜 Tracing log: {}", tp.display());
     }
+    // Identify the exact build (version + git commit) that produced this output.
+    println!("🏷️  Version: {VERSION}");
 
     // Log final outcome.
     match &result {
@@ -2652,6 +2654,14 @@ async fn execute_with_retry(
                                             "✅"
                                         };
                                         println!("{prefix} {detail}");
+                                    }
+                                    core::agent::AgentEvent::FileEdit { edit } => {
+                                        println!(
+                                            "✎ {} ({} line{})",
+                                            edit.path,
+                                            edit.diff_line_count(),
+                                            if edit.diff_line_count() == 1 { "" } else { "s" }
+                                        );
                                     }
                                     core::agent::AgentEvent::Status { message } => {
                                         if !message.starts_with("session: ")

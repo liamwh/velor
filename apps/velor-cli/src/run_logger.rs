@@ -136,6 +136,14 @@ impl RunLogger {
                     }),
                 );
             }
+            AgentEvent::FileEdit { edit } => {
+                // The structured edit (path, syntax, kind, hunks) is serialised
+                // verbatim; it is already size-bounded by the domain truncation.
+                self.log(
+                    "file_edit",
+                    serde_json::to_value(edit).unwrap_or(json!(null)),
+                );
+            }
             // Suppress internal session/thread metadata — it's noisy and not
             // useful in the log (Claude Code emits dozens of system events per
             // turn, all with the same session ID).

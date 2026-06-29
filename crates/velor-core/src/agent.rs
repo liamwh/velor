@@ -70,6 +70,14 @@ pub enum AgentEvent {
         /// Whether the tool execution succeeded if known.
         success: Option<bool>,
     },
+    /// A captured file edit — the real before/after diff for a file the agent
+    /// modified, computed from the filesystem (not the agent's claimed patch).
+    /// Emitted alongside the corresponding [`AgentEvent::ToolCall`] /
+    /// [`AgentEvent::ToolResult`] for first-class edit tools.
+    FileEdit {
+        /// The structured edit (path, syntax, hunks, kind).
+        edit: crate::file_edit::FileEdit,
+    },
     /// Token usage update if available.
     Usage {
         /// Input token count.
