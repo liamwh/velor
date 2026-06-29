@@ -13,10 +13,12 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{AgentEvent, AgentRunResult};
 use crate::execution_service::adapter::{AgentAdapter, AgentEventSink, LineDecoder};
 use crate::execution_service::classify::{ClassifiedProvider, ProviderKind, classify_output};
-use crate::execution_service::error::{AgentExecutionError, ProcessError, UnsuccessfulExit};
+use crate::execution_service::error::{
+    AgentExecutionError, LiveSteeringUnavailableReason, ProcessError, UnsuccessfulExit,
+};
 use crate::execution_service::output::Termination;
 use crate::execution_service::supervisor::{
-    ProcessEvent, ProcessInput, ProcessSpec, ProcessTimeouts, RunningProcess,
+    ProcessEvent, ProcessInput, ProcessInputCommand, ProcessSpec, ProcessTimeouts, RunningProcess,
 };
 
 /// Maximum length of a single stream-json frame (line) before it is rejected.
@@ -45,6 +47,11 @@ pub struct ClaudeParams {
     pub timeouts: ProcessTimeouts,
     /// Cancellation token for this attempt.
     pub cancellation: CancellationToken,
+    /// Whether to enable the live-steering streaming path. Configuration only —
+    /// runtime input channels are passed to the adapter separately, never stored
+    /// here. When `false`, the adapter uses the one-shot `--input-format text`
+    /// path exactly as before.
+    pub enable_live_steering: bool,
 }
 
 impl ClaudeParams {
@@ -62,6 +69,7 @@ impl ClaudeParams {
             extra_env: Vec::new(),
             timeouts: ProcessTimeouts::default(),
             cancellation: CancellationToken::new(),
+            enable_live_steering: false,
         }
     }
 }
@@ -78,23 +86,40 @@ impl ClaudeSubprocessAdapter {
         Self { params }
     }
 
-    /// Builds the process specification for the supervisor.
-    fn build_spec(&self) -> ProcessSpec {
+    /// Builds the process specification for the supervisor. `input` selects the
+    /// delivery mode: [`ProcessInput::Streaming`] for the live-steering path,
+    /// [`ProcessInput::Bytes`] for the one-shot path.
+    fn build_spec(&self, input: ProcessInput) -> ProcessSpec {
         let mut builder = ProcessSpec::builder(&self.params.binary)
             .arg("--permission-mode")
             .arg(self.params.permission_mode.clone())
             .arg("--dangerously-skip-permissions")
-            .arg("-p")
             .arg("--verbose")
-            .arg("--input-format")
-            .arg("text")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--include-partial-messages")
             .cwd(self.params.working_directory.clone())
-            .input(ProcessInput::Bytes(self.params.prompt.clone()))
+            .input(input)
             .timeouts(self.params.timeouts.clone())
             .capture_bytes(64 * 1024);
+
+        if self.params.enable_live_steering {
+            // Streaming path: no positional prompt; the initial frame (and all
+            // later steering) travel over stream-json stdin.
+            builder = builder
+                .arg("--print")
+                .arg("--input-format")
+                .arg("stream-json")
+                .arg("--output-format")
+                .arg("stream-json")
+                .arg("--replay-user-messages");
+        } else {
+            // One-shot path: text input, then EOF. Unchanged behaviour.
+            builder = builder
+                .arg("-p")
+                .arg("--input-format")
+                .arg("text")
+                .arg("--output-format")
+                .arg("stream-json")
+                .arg("--include-partial-messages");
+        }
 
         if let Some(model) = &self.params.model {
             builder = builder.arg("--model").arg(model.clone());
@@ -110,6 +135,25 @@ impl ClaudeSubprocessAdapter {
         }
         builder.build()
     }
+
+    /// Frames the prompt as the streaming initial user message. Only fails if the
+    /// prompt is empty/whitespace or serde cannot encode it (effectively never).
+    fn frame_initial(&self) -> Result<Bytes, AgentExecutionError> {
+        let prompt_str = std::str::from_utf8(&self.params.prompt).map_err(|_| {
+            AgentExecutionError::LiveSteeringUnavailable {
+                reason: LiveSteeringUnavailableReason::ProtocolRejected,
+            }
+        })?;
+        let text = crate::execution_service::adapters::claude_stream::SteeringText::new(prompt_str)
+            .map_err(|_| AgentExecutionError::LiveSteeringUnavailable {
+                reason: LiveSteeringUnavailableReason::ProtocolRejected,
+            })?;
+        crate::execution_service::adapters::claude_stream::frame_user_message(&text).map_err(|_| {
+            AgentExecutionError::LiveSteeringUnavailable {
+                reason: LiveSteeringUnavailableReason::ProtocolRejected,
+            }
+        })
+    }
 }
 
 #[async_trait(?Send)]
@@ -117,12 +161,136 @@ impl AgentAdapter for ClaudeSubprocessAdapter {
     async fn execute(
         &mut self,
         sink: &mut dyn AgentEventSink,
+        live_input: Option<tokio::sync::mpsc::Receiver<crate::agent::AgentInput>>,
     ) -> Result<AgentRunResult, AgentExecutionError> {
-        let spec = self.build_spec();
+        // Select the delivery mode and build the spec. The streaming path frames
+        // the prompt as the initial user message and carries the steering
+        // receiver through; the one-shot path passes raw bytes and closes stdin
+        // (no steering), dropping any receiver it was handed.
+        let (spec, steering, live_input) = if self.params.enable_live_steering {
+            let initial = self.frame_initial()?;
+            (
+                self.build_spec(ProcessInput::Streaming { initial }),
+                true,
+                live_input,
+            )
+        } else {
+            (
+                self.build_spec(ProcessInput::Bytes(self.params.prompt.clone())),
+                false,
+                None,
+            )
+        };
+
         let process: RunningProcess =
             crate::execution_service::supervisor::spawn(spec, self.params.cancellation.clone())
                 .await?;
-        run_claude_stream(process, sink).await
+
+        // Spawn the steering-forwarding task only for the streaming path, and only
+        // when both a writable command sender and a steering receiver exist.
+        let forward_handle = if steering {
+            match (process.input_sender(), live_input) {
+                (Some(command_tx), Some(live_rx)) => Some(tokio::spawn(forward_steering(
+                    live_rx,
+                    command_tx,
+                    self.params.cancellation.clone(),
+                ))),
+                // Nothing to forward: drop whichever half is present.
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let result = run_claude_stream(process, sink).await;
+        // The process is finished; stop the forwarding task promptly so it cannot
+        // outlive the execution.
+        if let Some(handle) = forward_handle {
+            handle.abort();
+        }
+        result
+    }
+}
+
+/// Forwards typed live-steering [`AgentInput`]s to the supervisor's streaming
+/// stdin as framed Claude user messages, acknowledging each with its delivery
+/// state. Stops when the steering receiver closes, the supervisor's writer goes
+/// away, or the attempt is cancelled. Never closes stdin itself — only the
+/// deliberate execution shutdown does.
+async fn forward_steering(
+    mut live_input: tokio::sync::mpsc::Receiver<crate::agent::AgentInput>,
+    command_tx: tokio::sync::mpsc::Sender<ProcessInputCommand>,
+    cancel: CancellationToken,
+) {
+    use crate::agent::{AgentInput, AgentInputError, SteeringDelivery};
+    use crate::execution_service::adapters::claude_stream::{SteeringText, frame_user_message};
+    use crate::execution_service::error::LiveSteeringUnavailableReason;
+
+    loop {
+        let input = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            input = live_input.recv() => match input {
+                Some(i) => i,
+                None => return, // steering sender dropped
+            },
+        };
+        let AgentInput::UserMessage {
+            text,
+            acknowledgement,
+        } = input;
+        let ack = deliver(&command_tx, &text, &cancel).await;
+        // If the consumer dropped their acknowledgement receiver, the send fails
+        // harmlessly.
+        let _ = acknowledgement.send(ack);
+    }
+
+    async fn deliver(
+        command_tx: &tokio::sync::mpsc::Sender<ProcessInputCommand>,
+        text: &SteeringText,
+        cancel: &CancellationToken,
+    ) -> Result<SteeringDelivery, AgentInputError> {
+        let frame = frame_user_message(text).map_err(|_| AgentInputError::Unavailable {
+            reason: LiveSteeringUnavailableReason::ProtocolRejected,
+        })?;
+        let (write_ack, write_rx) = tokio::sync::oneshot::channel();
+        let send = command_tx.send(ProcessInputCommand::Write {
+            bytes: frame,
+            acknowledgement: write_ack,
+        });
+        tokio::pin!(send);
+        let sent = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AgentInputError::Unavailable {
+                reason: LiveSteeringUnavailableReason::WriteFailed,
+            }),
+            s = &mut send => s,
+        };
+        if sent.is_err() {
+            // The supervisor's writer has gone away (process closing/terminated).
+            return Err(AgentInputError::Unavailable {
+                reason: LiveSteeringUnavailableReason::StdinClosed,
+            });
+        }
+        let result = match write_rx.await {
+            Ok(r) => r,
+            Err(_) => {
+                // Writer dropped without acknowledging: the bytes may or may not
+                // have landed before it went away.
+                return Ok(SteeringDelivery::DeliveryUnknown);
+            }
+        };
+        match result {
+            Ok(()) => Ok(SteeringDelivery::Written),
+            Err(super::super::supervisor::ProcessInputWriteError::Closed) => {
+                Err(AgentInputError::Unavailable {
+                    reason: LiveSteeringUnavailableReason::StdinClosed,
+                })
+            }
+            Err(_) => Err(AgentInputError::Unavailable {
+                reason: LiveSteeringUnavailableReason::WriteFailed,
+            }),
+        }
     }
 }
 
@@ -156,7 +324,10 @@ async fn run_claude_stream(
                 // Captured by the supervisor for classification; not streamed as
                 // AgentEvents (stderr is diagnostic, not protocol output).
             }
-            ProcessEvent::StdinWritten | ProcessEvent::Exited => {}
+            ProcessEvent::StdinWritten
+            | ProcessEvent::StdinInitialised
+            | ProcessEvent::StdinWriteFailed(_)
+            | ProcessEvent::Exited => {}
         }
     }
 
@@ -240,8 +411,8 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                 .and_then(|t| t.as_str())
                 && !thinking.is_empty()
             {
-                events.push(AgentEvent::TextDelta {
-                    text: format!("💭 {thinking}"),
+                events.push(AgentEvent::Thinking {
+                    text: thinking.to_string(),
                 });
             } else if let Some(text) = value
                 .get("delta")
@@ -418,6 +589,21 @@ mod tests {
         );
         assert_eq!(collected, "hello");
         assert!(matches!(events[0], AgentEvent::TextDelta { .. }));
+    }
+
+    #[test]
+    fn parses_thinking_delta_as_thinking_event() {
+        let mut collected = String::new();
+        let events = parse_claude_line(
+            r#"{"type":"content_block_delta","delta":{"thinking":"reasoning here"}}"#,
+            &mut collected,
+        );
+        // Thinking must NOT be collected into assistant output.
+        assert!(collected.is_empty());
+        assert!(matches!(events[0], AgentEvent::Thinking { .. }));
+        if let AgentEvent::Thinking { text } = &events[0] {
+            assert_eq!(text, "reasoning here");
+        }
     }
 
     #[test]

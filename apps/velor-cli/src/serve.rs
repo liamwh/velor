@@ -5068,6 +5068,7 @@ async fn run_claude_like_profile(
             ..std::default::Default::default()
         },
         cancellation: tokio_util::sync::CancellationToken::new(),
+        enable_live_steering: false,
     };
     run_profile_via_service(
         velor_core::execution_service::service::AgentProfile::Claude(params),
@@ -5158,6 +5159,9 @@ fn map_agent_event_to_progress(
             out
         }
         AgentEvent::TextDelta { text } => vec![RunnerProgressEvent::OutputDelta(text)],
+        AgentEvent::Thinking { text } => {
+            vec![RunnerProgressEvent::OutputDelta(format!("💭 {text}"))]
+        }
         AgentEvent::ToolCall { tool, detail, .. } => {
             vec![RunnerProgressEvent::Milestone(format!(
                 "tool start: {tool} ({detail})"

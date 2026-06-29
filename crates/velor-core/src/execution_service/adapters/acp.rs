@@ -54,7 +54,9 @@ impl AgentAdapter for AcpAdapter {
     async fn execute(
         &mut self,
         sink: &mut dyn AgentEventSink,
+        _live_input: Option<tokio::sync::mpsc::Receiver<crate::agent::AgentInput>>,
     ) -> Result<AgentRunResult, AgentExecutionError> {
+        let _ = _live_input; // ACP does not support live steering.
         let result = tokio::select! {
             biased;
             r = crate::acp::run_acp(

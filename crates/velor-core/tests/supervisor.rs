@@ -374,7 +374,8 @@ async fn claude_adapter_end_to_end_streams_and_classifies() {
     params.extra_args = vec!["success".to_string()];
     let mut adapter = ClaudeSubprocessAdapter::new(params);
     let mut sink = CollectSink { events: Vec::new() };
-    let outcome = tokio::time::timeout(Duration::from_secs(15), adapter.execute(&mut sink)).await;
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(15), adapter.execute(&mut sink, None)).await;
     match outcome {
         Ok(Ok(result)) => {
             assert!(result.stdout.contains("done"), "stdout: {}", result.stdout);

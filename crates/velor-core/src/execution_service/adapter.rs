@@ -6,7 +6,9 @@
 //! [`crate::execution_service::supervisor`] never sees lines.
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
+use crate::agent::AgentInput;
 use crate::execution_service::error::AgentProtocolError;
 
 /// A sink for adapter-emitted [`AgentEvent`]s.
@@ -37,12 +39,17 @@ pub struct AgentSinkError;
 pub trait AgentAdapter {
     /// Runs one invocation, emitting events to `sink` and returning the result.
     ///
+    /// `live_input` carries the runtime steering-input receiver for adapters that
+    /// support live steering; it is `None` for non-steering-capable adapters or
+    /// executions. The receiver is runtime state, separate from adapter config.
+    ///
     /// # Errors
     /// Returns [`crate::execution_service::error::AgentExecutionError`] on any
     /// failure (process, protocol, provider, unsuccessful exit, cancellation).
     async fn execute(
         &mut self,
         sink: &mut dyn AgentEventSink,
+        live_input: Option<mpsc::Receiver<AgentInput>>,
     ) -> Result<crate::agent::AgentRunResult, crate::execution_service::error::AgentExecutionError>;
 }
 

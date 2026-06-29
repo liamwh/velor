@@ -70,6 +70,47 @@ impl AgentProfile {
             Self::Acp(p) => &p.binary,
         }
     }
+
+    /// Returns the static capabilities advertised by this profile. Claude reports
+    /// live steering only when its streaming path is enabled; Codex and ACP do
+    /// not support live steering.
+    #[must_use]
+    pub fn capabilities(&self) -> crate::execution_service::capabilities::AgentCapabilities {
+        use crate::execution_service::capabilities::AgentCapabilities;
+        match self {
+            Self::Claude(p) => {
+                if p.enable_live_steering {
+                    AgentCapabilities::with_live_steering()
+                } else {
+                    AgentCapabilities::none()
+                }
+            }
+            Self::Codex(_) | Self::Acp(_) => AgentCapabilities::none(),
+        }
+    }
+
+    /// Returns a new profile with the cancellation token replaced.
+    ///
+    /// Used by [`AgentExecutionService::execute`] to swap in a child token so
+    /// that a single execution's cleanup cannot cancel the caller's parent
+    /// token.
+    #[must_use]
+    pub fn with_cancellation(self, cancellation: CancellationToken) -> Self {
+        match self {
+            Self::Claude(mut p) => {
+                p.cancellation = cancellation;
+                Self::Claude(p)
+            }
+            Self::Codex(mut p) => {
+                p.cancellation = cancellation;
+                Self::Codex(p)
+            }
+            Self::Acp(mut p) => {
+                p.cancellation = cancellation;
+                Self::Acp(p)
+            }
+        }
+    }
 }
 
 /// Builds the concrete adapter for a profile (on the worker's `LocalSet`).
@@ -103,12 +144,55 @@ pub struct AgentExecution {
     events: Option<mpsc::Receiver<AgentEvent>>,
     completion: Option<oneshot::Receiver<Result<AgentRunReport, AgentExecutionError>>>,
     cancellation: CancellationToken,
+    capabilities: crate::execution_service::capabilities::AgentCapabilities,
+    /// Sender for live-steering input, `Some` only for live-steering-capable
+    /// executions. The paired receiver is delivered to the adapter on the worker.
+    input_sender: Option<mpsc::Sender<crate::agent::AgentInput>>,
 }
 
 impl AgentExecution {
     /// Receives the next event, or `None` when the run has finished.
     pub async fn next_event(&mut self) -> Option<AgentEvent> {
         self.events.as_mut()?.recv().await
+    }
+
+    /// Returns the static capabilities advertised by this execution's profile.
+    #[must_use]
+    pub fn capabilities(&self) -> crate::execution_service::capabilities::AgentCapabilities {
+        self.capabilities
+    }
+
+    /// Returns a cloned sender for live-steering input, or `None` when the
+    /// execution does not support live steering. A successful channel send here
+    /// only means Vel accepted the command — not that the agent received it; the
+    /// command's acknowledgement carries the authoritative delivery state.
+    #[must_use]
+    pub fn input_sender(&self) -> Option<mpsc::Sender<crate::agent::AgentInput>> {
+        self.input_sender.clone()
+    }
+
+    /// Returns the current live-steering availability for this execution.
+    ///
+    /// `Unsupported` when the profile has no live steering; `Ready` while a
+    /// writable input sender exists and the run has not yet completed;
+    /// `Closing` once the completion has been consumed (the run is finishing);
+    /// `Inactive` otherwise.
+    #[must_use]
+    pub fn live_steering_status(
+        &self,
+    ) -> crate::execution_service::capabilities::LiveSteeringStatus {
+        use crate::execution_service::capabilities::LiveSteeringStatus;
+        if !self.capabilities.live_steering {
+            return LiveSteeringStatus::Unsupported;
+        }
+        if self.completion.is_none() {
+            return LiveSteeringStatus::Closing;
+        }
+        if self.input_sender.is_some() {
+            LiveSteeringStatus::Ready
+        } else {
+            LiveSteeringStatus::Inactive
+        }
     }
 
     /// Waits for the run to finish and returns its report.
@@ -157,6 +241,9 @@ struct WorkerJob {
     event_tx: mpsc::Sender<AgentEvent>,
     result_tx: oneshot::Sender<Result<AgentRunReport, AgentExecutionError>>,
     scope: Option<Arc<ScopeState>>,
+    /// Runtime live-steering receiver, delivered to the adapter. `None` for
+    /// non-steering-capable executions.
+    live_input: Option<mpsc::Receiver<crate::agent::AgentInput>>,
 }
 
 /// Per-scope policy state: a concurrency limit and a circuit breaker, keyed by
@@ -248,7 +335,15 @@ impl AgentExecutionService {
         &self,
         profile: AgentProfile,
     ) -> Result<AgentExecution, AgentExecutionError> {
-        let cancellation = profile.cancellation().clone();
+        // Derive a child token so that `AgentExecution`'s `Drop` (which cancels
+        // to reap an abandoned subprocess) only cancels this single execution,
+        // NOT the caller's parent token. The child is still cancelled when the
+        // parent fires (Ctrl+C×2), so cancellation still propagates downward.
+        let parent = profile.cancellation().clone();
+        let cancellation = parent.child_token();
+        // Replace the profile's token with the child so the adapter/supervisor
+        // observes the child (not the parent).
+        let profile = profile.with_cancellation(cancellation.clone());
         let scope_key = profile.binary().to_string();
         let scope = self.scope_state(&scope_key);
         // Circuit-breaker gate: refuse fast if the upstream is saturated.
@@ -260,11 +355,22 @@ impl AgentExecutionService {
         }
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
         let (result_tx, result_rx) = oneshot::channel();
+        // For live-steering-capable profiles, create the steering channel: the
+        // receiver travels to the adapter on the worker, the sender stays on the
+        // handle so callers can submit [`crate::agent::AgentInput`] commands.
+        let capabilities = profile.capabilities();
+        let (input_tx, input_rx) = if capabilities.live_steering {
+            let (tx, rx) = mpsc::channel::<crate::agent::AgentInput>(16);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let job = WorkerJob {
             profile,
             event_tx,
             result_tx,
             scope: Some(scope),
+            live_input: input_rx,
         };
         if self.job_tx.send(job).await.is_err() {
             return Err(AgentExecutionError::Cancelled);
@@ -273,6 +379,8 @@ impl AgentExecutionService {
             events: Some(event_rx),
             completion: Some(result_rx),
             cancellation,
+            capabilities,
+            input_sender: input_tx,
         })
     }
 }
@@ -320,6 +428,7 @@ async fn run_one_job(job: WorkerJob) {
         event_tx,
         result_tx,
         scope,
+        live_input,
     } = job;
     // Acquire the per-scope concurrency permit (held for the run; released on drop)
     // so overlapping runs against the same provider are bounded.
@@ -329,7 +438,7 @@ async fn run_one_job(job: WorkerJob) {
     };
     let mut adapter = build_adapter(profile);
     let mut sink = ChannelSink { tx: event_tx };
-    let result = adapter.execute(&mut sink).await;
+    let result = adapter.execute(&mut sink, live_input).await;
     // Update the circuit breaker: success closes it; only transient upstream
     // failures count toward opening it.
     if let Some(s) = &scope {
@@ -363,5 +472,43 @@ impl AgentEventSink for ChannelSink {
         // CancellationToken. This keeps the adapter running to completion.
         let _ = self.tx.try_send(event);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution_service::adapters::claude::ClaudeParams;
+
+    #[test]
+    fn with_cancellation_replaces_token() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        let profile = AgentProfile::Claude(ClaudeParams::new(
+            "claude",
+            bytes::Bytes::new(),
+            std::path::PathBuf::from("/tmp"),
+        ));
+        let profile = profile.with_cancellation(child);
+        // The profile's token should now be the child, not the default token.
+        assert!(profile.cancellation().is_cancelled() == parent.is_cancelled());
+        // Cancelling the child must NOT cancel the parent.
+        profile.cancellation().cancel();
+        assert!(!parent.is_cancelled());
+    }
+
+    #[test]
+    fn child_token_propagates_parent_cancellation() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        let profile = AgentProfile::Claude(ClaudeParams::new(
+            "claude",
+            bytes::Bytes::new(),
+            std::path::PathBuf::from("/tmp"),
+        ));
+        let profile = profile.with_cancellation(child);
+        // Cancelling the parent MUST cancel the child (downward propagation).
+        parent.cancel();
+        assert!(profile.cancellation().is_cancelled());
     }
 }

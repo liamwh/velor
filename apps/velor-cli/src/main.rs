@@ -19,7 +19,9 @@ mod projects;
 mod run_logger;
 mod serve;
 mod streaming_tui;
+mod tracing_setup;
 mod tui;
+mod tui_transcript;
 mod vault;
 
 // Re-export from velor-core
@@ -724,14 +726,9 @@ async fn run_automations(
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
     // Initialize tracing subscriber for logging.
-    // Suppress noisy library warnings (tui_markdown HTML-not-supported spam).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
-                .add_directive("tui_markdown=error".parse().unwrap_or_default()),
-        )
-        .init();
+    // Output goes to stderr by default; while the TUI is active it is switched
+    // to a file (see `tracing_setup`) so logs don't corrupt the alternate screen.
+    tracing_setup::install();
 
     // Install color-eyre for better error reports
     color_eyre::install()?;
@@ -1367,19 +1364,74 @@ async fn run_auto(
     // When --no-tui, fall back to plain stdout printing (no TUI task).
     let no_tui = args.no_tui;
     let (tui_tx, tui_rx) = tokio::sync::mpsc::channel::<streaming_tui::TuiMessage>(256);
+    // The reverse channel: steering commands flow from the TUI to the run loop.
+    let (steering_cmd_tx, steering_cmd_rx) =
+        tokio::sync::mpsc::channel::<streaming_tui::TuiSteeringCommand>(16);
     // Tell the TUI the log file path (for the 'l' key).
     let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetLogPath(
         logger.path().to_string_lossy().to_string(),
     ));
+    // Initial live-steering availability + the seeded persistent append.
+    {
+        use velor_core::execution_service::capabilities::LiveSteeringStatus;
+        let status = if runner.is_subprocess() {
+            LiveSteeringStatus::Inactive
+        } else {
+            LiveSteeringStatus::Unsupported
+        };
+        let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetLiveSteeringStatus(status));
+        let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetPersistentAppend(
+            velor_core::execution_service::adapters::claude_stream::PersistentAppend::new(
+                common.append.clone().unwrap_or_default(),
+            ),
+        ));
+    }
+
+    // While the TUI owns the alternate screen, tracing output on stderr would
+    // corrupt the display (e.g. retry/auth `WARN`/`ERROR` lines bleeding over
+    // the box border). Route it to a sibling `<run>.tracing.log` instead.
+    let tracing_log_path = if no_tui {
+        None
+    } else {
+        match tracing_setup::redirect_to_file(logger.path()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    "could not redirect tracing to a log file ({e}); \
+                     stderr may be corrupted by the TUI"
+                );
+                None
+            }
+        }
+    };
+
     let tui_cancel = cancel_handler.token().clone();
+    // Build bounded-live-transcript limits from config (validated/clamped).
+    let tui_limits = tui_transcript::TuiLimits::from_options(
+        file_cfg.defaults.tui.max_transcript_entries,
+        file_cfg.defaults.tui.max_transcript_bytes,
+        file_cfg.defaults.tui.max_entry_lines,
+    );
     let tui_task = if no_tui {
         None
     } else {
         Some(tokio::spawn(streaming_tui::run_streaming_tui(
-            tui_rx, tui_cancel,
+            tui_rx,
+            Some(steering_cmd_tx),
+            tui_cancel,
+            cancel_handler.clone(),
+            tui_limits,
         )))
     };
     let tui_ref = if no_tui { None } else { Some(&tui_tx) };
+    // The controller owns the steering-command receiver only when a TUI runs.
+    let tui_command_rx = if no_tui {
+        // No TUI → nobody sends commands; drop the receiver.
+        drop(steering_cmd_rx);
+        None
+    } else {
+        Some(steering_cmd_rx)
+    };
 
     let result = run_auto_loop(
         &runner,
@@ -1401,6 +1453,7 @@ async fn run_auto(
         &file_cfg.rules,
         common.append.as_deref(),
         tui_ref,
+        tui_command_rx,
         &logger,
     )
     .await;
@@ -1412,17 +1465,21 @@ async fn run_auto(
         let _ = task.await;
     }
 
-    // Print the log file path so the user can find it.
+    // Print the log file paths so the user can find them.
     println!("📄 Log file: {}", logger.path().display());
+    if let Some(tp) = &tracing_log_path {
+        println!("📜 Tracing log: {}", tp.display());
+    }
 
     // Log final outcome.
     match &result {
         Ok(r) => logger.log_outcome(
             &format!("{:?}", r.status),
+            Some(r.stop_reason.as_str()),
             r.iterations_completed,
             r.duration.as_secs(),
         ),
-        Err(_) => logger.log_outcome("error", 0, 0),
+        Err(_) => logger.log_outcome("error", Some("failed"), 0, 0),
     }
 
     // Handle result and send notifications
@@ -1774,6 +1831,173 @@ async fn run_auto_iteration_with_session(
 /// # Errors
 ///
 /// Returns an error if a Claude invocation fails after all retries.
+/// Sends one live steering message to the active iteration's steering channel
+/// and returns its delivery outcome.
+async fn send_live_once(
+    tx: &tokio::sync::mpsc::Sender<core::agent::AgentInput>,
+    text: core::execution_service::adapters::claude_stream::SteeringText,
+    tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+) -> streaming_tui::SteeringOutcome {
+    use core::execution_service::capabilities::LiveSteeringStatus;
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let input = core::agent::AgentInput::UserMessage {
+        text,
+        acknowledgement: ack_tx,
+    };
+    if tx.send(input).await.is_err() {
+        return streaming_tui::SteeringOutcome::Unavailable {
+            status: LiveSteeringStatus::Inactive,
+        };
+    }
+    match ack_rx.await {
+        Ok(Ok(delivery)) => {
+            if let Some(t) = tui_tx {
+                let _ = t.try_send(streaming_tui::TuiMessage::SteeringDeliveryUpdated(delivery));
+            }
+            streaming_tui::SteeringOutcome::Sent { delivery }
+        }
+        Ok(Err(_)) | Err(_) => streaming_tui::SteeringOutcome::Unavailable {
+            status: LiveSteeringStatus::Closing,
+        },
+    }
+}
+
+/// Processes one steering command from the TUI against the current controller
+/// state: forwards `c` to the active session (if any), and updates the
+/// persistent append for `a` (optionally sending it live). Always resolves the
+/// command's acknowledgement with an explicit outcome.
+#[allow(clippy::too_many_arguments)]
+async fn handle_steering_command(
+    cmd: streaming_tui::TuiSteeringCommand,
+    persistent_append: &mut Option<
+        core::execution_service::adapters::claude_stream::PersistentAppend,
+    >,
+    iter_steer_tx: Option<&tokio::sync::mpsc::Sender<core::agent::AgentInput>>,
+    live_capable: bool,
+    tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+) {
+    use core::execution_service::adapters::claude_stream::SteeringText;
+    use core::execution_service::capabilities::LiveSteeringStatus;
+    use streaming_tui::{AppendOutcome, SteeringOutcome};
+
+    let idle_status = if live_capable {
+        LiveSteeringStatus::Inactive
+    } else {
+        LiveSteeringStatus::Unsupported
+    };
+
+    match cmd {
+        streaming_tui::TuiSteeringCommand::SendOnce {
+            text,
+            acknowledgement,
+        } => {
+            let outcome = match (live_capable, iter_steer_tx) {
+                (true, Some(tx)) => send_live_once(tx, text, tui_tx).await,
+                _ => SteeringOutcome::Unavailable {
+                    status: idle_status,
+                },
+            };
+            let _ = acknowledgement.send(Ok(outcome));
+        }
+        streaming_tui::TuiSteeringCommand::ReplacePersistent {
+            append,
+            send_live_when_available,
+            acknowledgement,
+        } => {
+            let cleared = append.is_none();
+            // Update the single append cell first; a failed live send must not
+            // undo a successful append update.
+            *persistent_append = append.clone();
+            if let Some(t) = tui_tx {
+                let _ = t.try_send(streaming_tui::TuiMessage::SetPersistentAppend(append));
+            }
+            let outcome = if send_live_when_available && live_capable && iter_steer_tx.is_some() {
+                let live = persistent_append
+                    .as_ref()
+                    .and_then(|a| SteeringText::new(a.as_str()).ok())
+                    .map(|text| {
+                        let tx = iter_steer_tx.unwrap();
+                        async move { send_live_once(tx, text, tui_tx).await }
+                    });
+                match live {
+                    Some(fut) => match fut.await {
+                        SteeringOutcome::Sent { delivery } => {
+                            if cleared {
+                                AppendOutcome::ClearedAndSent { delivery }
+                            } else {
+                                AppendOutcome::UpdatedAndSent { delivery }
+                            }
+                        }
+                        SteeringOutcome::Unavailable { status } => {
+                            if cleared {
+                                AppendOutcome::ClearedOnly { status }
+                            } else {
+                                AppendOutcome::UpdatedOnly { status }
+                            }
+                        }
+                    },
+                    None => append_only(cleared, idle_status),
+                }
+            } else {
+                append_only(cleared, idle_status)
+            };
+            let _ = acknowledgement.send(Ok(outcome));
+        }
+    }
+}
+
+fn append_only(
+    cleared: bool,
+    status: core::execution_service::capabilities::LiveSteeringStatus,
+) -> streaming_tui::AppendOutcome {
+    use streaming_tui::AppendOutcome;
+    if cleared {
+        AppendOutcome::ClearedOnly { status }
+    } else {
+        AppendOutcome::UpdatedOnly { status }
+    }
+}
+
+/// Runs an iteration future while concurrently processing steering commands
+/// from the TUI. When `iter_steer_tx` is `Some`, `c`/`a` messages are forwarded
+/// to the active session; otherwise they resolve as unavailable. The iteration
+/// future is polled to completion regardless.
+async fn steer_during<F: std::future::Future>(
+    iter_fut: F,
+    iter_steer_tx: Option<tokio::sync::mpsc::Sender<core::agent::AgentInput>>,
+    tui_command_rx: &mut Option<tokio::sync::mpsc::Receiver<streaming_tui::TuiSteeringCommand>>,
+    persistent_append: &mut Option<
+        core::execution_service::adapters::claude_stream::PersistentAppend,
+    >,
+    live_capable: bool,
+    tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+) -> F::Output {
+    tokio::pin!(iter_fut);
+    let mut commands_open = tui_command_rx.is_some();
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut iter_fut => return out,
+            cmd = async {
+                match tui_command_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => None,
+                }
+            }, if commands_open => match cmd {
+                Some(cmd) => handle_steering_command(
+                    cmd,
+                    persistent_append,
+                    iter_steer_tx.as_ref(),
+                    live_capable,
+                    tui_tx,
+                )
+                .await,
+                None => commands_open = false,
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(level = "debug", ret, skip(template_str, base_vars, logger))]
 async fn run_auto_loop(
@@ -1796,6 +2020,7 @@ async fn run_auto_loop(
     rules_config: &core::config::RulesConfig,
     append: Option<&str>,
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+    tui_command_rx: Option<tokio::sync::mpsc::Receiver<streaming_tui::TuiSteeringCommand>>,
     logger: &std::sync::Arc<run_logger::RunLogger>,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
@@ -1803,6 +2028,15 @@ async fn run_auto_loop(
     let mut history = ConversationHistory::new();
     let mut final_output = String::new();
     let mut previous_iteration_completed = false;
+    // The single controller-owned persistent-append cell, seeded from --append.
+    let mut persistent_append: Option<
+        velor_core::execution_service::adapters::claude_stream::PersistentAppend,
+    > = velor_core::execution_service::adapters::claude_stream::PersistentAppend::new(
+        append.unwrap_or(""),
+    );
+    // Live steering is only supported by the Claude subprocess adapter.
+    let live_capable = runner.is_subprocess();
+    let mut tui_command_rx = tui_command_rx;
 
     // Create persistent RulesState across iterations for glob-based rule tracking
     let rules_state = Arc::new(Mutex::new(RulesState::new()));
@@ -1814,6 +2048,7 @@ async fn run_auto_loop(
             println!("\n🛑 Force quit by user (Ctrl+C twice)");
             return Ok(AutoLoopResult {
                 status: RunStatus::Cancelled,
+                stop_reason: StopReason::ForceCancelled,
                 iterations_completed: current_iteration - 1,
                 max_iterations: iterations,
                 duration: start_time.elapsed(),
@@ -1821,12 +2056,21 @@ async fn run_auto_loop(
             });
         }
 
-        // Check for graceful shutdown request - stop after this iteration completes
-        let should_stop_after_this = cancel_handler.graceful_shutdown_requested();
+        // Check for a stop-after-iteration request (the `s` key in the TUI).
+        let should_stop_after_this = cancel_handler.stop_after_iteration_requested();
 
-        println!("🔁 Iteration {current_iteration}/{iterations}");
+        // Surface the iteration counter to the TUI status line (or stdout when
+        // running without a TUI).
+        if let Some(tx) = tui_tx {
+            let _ = tx.try_send(streaming_tui::TuiMessage::SetIteration {
+                current: current_iteration,
+                total: iterations,
+            });
+        } else {
+            println!("🔁 Iteration {current_iteration}/{iterations}");
+        }
         if should_stop_after_this {
-            println!("⚠️  Stopping after this iteration (graceful shutdown requested)");
+            println!("⚠️  Stopping after this iteration (stop requested via `s` key)");
         }
         println!("────────────────────────────────────────");
 
@@ -1855,17 +2099,27 @@ async fn run_auto_loop(
 
         // Execute iteration with appropriate mode
         let iteration_output = if use_acp_session {
-            // ACP mode with rules enabled: use multi-turn session
-            match run_auto_iteration_acp(
-                binary,
-                acp_config,
-                &rendered_prompt,
-                rules_set.unwrap(), // Safe to unwrap because we checked use_acp_session
-                &rules_state,
-                rules_config,
-                current_iteration,
-                cwd,
-                append,
+            // ACP mode with rules enabled: use multi-turn session. ACP does not
+            // support live steering, so commands resolve as unavailable, but the
+            // persistent append can still be edited while the iteration runs.
+            let append_snapshot = persistent_append.as_ref().map(|a| a.as_str().to_string());
+            match steer_during(
+                run_auto_iteration_acp(
+                    binary,
+                    acp_config,
+                    &rendered_prompt,
+                    rules_set.unwrap(), // Safe to unwrap because we checked use_acp_session
+                    &rules_state,
+                    rules_config,
+                    current_iteration,
+                    cwd,
+                    append_snapshot.as_deref(),
+                ),
+                None, // ACP has no steering input channel.
+                &mut tui_command_rx,
+                &mut persistent_append,
+                live_capable,
+                tui_tx,
             )
             .await
             {
@@ -1895,9 +2149,10 @@ async fn run_auto_loop(
                 rendered_prompt.clone()
             };
 
-            // Finalise prompt with user instructions (--append)
-            // Applied every iteration to ensure instructions persist
-            let final_prompt = finalize_prompt(&prompt_with_rules, append);
+            // Finalise prompt with the current persistent-append snapshot. Applied
+            // every iteration so the append persists until replaced or cleared.
+            let append_snapshot = persistent_append.as_ref().map(|a| a.as_str());
+            let final_prompt = finalize_prompt(&prompt_with_rules, append_snapshot);
 
             // Show the prompt: TUI modal (press p) or stdout.
             if let Some(tx) = tui_tx {
@@ -1907,23 +2162,59 @@ async fn run_auto_loop(
                 println!("────────────────────────────────────────");
             }
 
-            // Execute with retry logic
-            let retry_result = execute_with_retry(
-                runner,
-                binary,
-                permission_mode,
-                &final_prompt,
-                prompt_name,
-                current_iteration,
-                retry_config,
-                backoff_policy,
-                timeouts.clone(),
-                cwd,
-                cancel_handler.token(),
+            // One steering channel for this iteration's attempts (reused across
+            // retries). The controller forwards `c`/`a` commands into it while
+            // the iteration runs. The streaming path is enabled only when a TUI
+            // is connected AND the adapter supports steering — otherwise the
+            // proven one-shot text path is used (e.g. `--no-tui`).
+            let steering_enabled = live_capable && tui_command_rx.is_some();
+            let (iter_steer_tx, mut iter_steer_rx) = if steering_enabled {
+                let (tx, rx) = tokio::sync::mpsc::channel::<core::agent::AgentInput>(16);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            if steering_enabled {
+                if let Some(tx) = tui_tx {
+                    let _ = tx.try_send(streaming_tui::TuiMessage::SetLiveSteeringStatus(
+                        core::execution_service::capabilities::LiveSteeringStatus::Ready,
+                    ));
+                }
+            }
+
+            // Execute with retry logic, processing steering commands concurrently.
+            let retry_result = steer_during(
+                execute_with_retry(
+                    runner,
+                    binary,
+                    permission_mode,
+                    &final_prompt,
+                    prompt_name,
+                    current_iteration,
+                    retry_config,
+                    backoff_policy,
+                    timeouts.clone(),
+                    cwd,
+                    cancel_handler.token(),
+                    tui_tx,
+                    &mut iter_steer_rx,
+                    logger,
+                ),
+                iter_steer_tx,
+                &mut tui_command_rx,
+                &mut persistent_append,
+                live_capable,
                 tui_tx,
-                logger,
             )
             .await;
+
+            if steering_enabled {
+                if let Some(tx) = tui_tx {
+                    let _ = tx.try_send(streaming_tui::TuiMessage::SetLiveSteeringStatus(
+                        core::execution_service::capabilities::LiveSteeringStatus::Inactive,
+                    ));
+                }
+            }
 
             match retry_result {
                 Ok(result) => result.stdout,
@@ -1941,6 +2232,7 @@ async fn run_auto_loop(
                     println!("\n🛑 Cancelled by user during iteration {current_iteration}");
                     return Ok(AutoLoopResult {
                         status: RunStatus::Cancelled,
+                        stop_reason: StopReason::Cancelled,
                         iterations_completed: current_iteration - 1,
                         max_iterations: iterations,
                         duration: start_time.elapsed(),
@@ -1984,6 +2276,7 @@ async fn run_auto_loop(
                 println!("✅ Completion token seen in consecutive iterations, exiting.");
                 return Ok(AutoLoopResult {
                     status: RunStatus::Completed,
+                    stop_reason: StopReason::Completed,
                     iterations_completed: current_iteration,
                     max_iterations: iterations,
                     duration: start_time.elapsed(),
@@ -1999,17 +2292,29 @@ async fn run_auto_loop(
             previous_iteration_completed = false;
         }
 
-        // Check if graceful shutdown was requested - stop after current iteration
-        let should_stop_after_this = cancel_handler.graceful_shutdown_requested();
+        // Check if a stop-after-iteration was requested (the `s` key in the TUI).
+        let should_stop_after_this = cancel_handler.stop_after_iteration_requested();
         if should_stop_after_this {
-            println!("✅ Graceful shutdown: stopping after iteration {current_iteration}");
+            println!("✅ Stop requested: stopping after iteration {current_iteration}");
+            cancel_handler.clear_stop_after_iteration();
             return Ok(AutoLoopResult {
                 status: RunStatus::Cancelled,
+                stop_reason: StopReason::StopAfterIteration,
                 iterations_completed: current_iteration,
                 max_iterations: iterations,
                 duration: start_time.elapsed(),
                 output: final_output,
             });
+        }
+
+        // Between iterations: process any queued steering commands with no active
+        // session. `c` resolves as unavailable (no session to steer); `a` still
+        // updates the persistent append (folded into the next iteration's prompt).
+        if let Some(rx) = tui_command_rx.as_mut() {
+            while let Ok(cmd) = rx.try_recv() {
+                handle_steering_command(cmd, &mut persistent_append, None, live_capable, tui_tx)
+                    .await;
+            }
         }
 
         current_iteration += 1;
@@ -2018,6 +2323,7 @@ async fn run_auto_loop(
     // Ran all iterations without completion token
     Ok(AutoLoopResult {
         status: RunStatus::MaxIterationsReached,
+        stop_reason: StopReason::MaxIterationsReached,
         iterations_completed: current_iteration - 1,
         max_iterations: iterations,
         duration: start_time.elapsed(),
@@ -2188,11 +2494,45 @@ async fn select_intelligent_rules_acp(
     Ok(selected)
 }
 
+/// Why the auto loop stopped.
+///
+/// Recorded in the lifecycle log so a run's exit is self-diagnosing — you can
+/// tell whether the agent completed, was force-cancelled, stopped on request,
+/// or hit the iteration cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// Completion token seen in two consecutive iterations.
+    Completed,
+    /// Iteration cap reached without completion.
+    MaxIterationsReached,
+    /// `s` key / explicit request: stop after the current iteration finished.
+    StopAfterIteration,
+    /// Ctrl+C pressed twice: immediate abort.
+    ForceCancelled,
+    /// Iteration was cancelled mid-flight.
+    Cancelled,
+}
+
+impl StopReason {
+    /// Returns a stable, lowercase machine-readable label for logging.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::MaxIterationsReached => "max_iterations_reached",
+            Self::StopAfterIteration => "stop_after_iteration",
+            Self::ForceCancelled => "force_cancelled",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// Result of running the auto loop.
 #[derive(Debug)]
 struct AutoLoopResult {
     /// Final status of the run.
     status: RunStatus,
+    /// Why the loop stopped.
+    stop_reason: StopReason,
     /// Number of iterations completed.
     iterations_completed: u32,
     /// Maximum iterations allowed.
@@ -2225,6 +2565,7 @@ async fn execute_with_retry(
     cwd: &std::path::Path,
     cancel_token: &CancellationToken,
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+    steering: &mut Option<tokio::sync::mpsc::Receiver<core::agent::AgentInput>>,
     logger: &std::sync::Arc<run_logger::RunLogger>,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
@@ -2266,7 +2607,7 @@ async fn execute_with_retry(
         }
 
         match runner
-            .run_with_events(
+            .run_with_events_and_steering(
                 binary,
                 permission_mode,
                 prompt,
@@ -2275,6 +2616,7 @@ async fn execute_with_retry(
                 &[],
                 timeouts.clone(),
                 cancel_token.clone(),
+                steering,
                 {
                     let tui_tx = tui_tx.map(|tx| tx.clone());
                     let logger = std::sync::Arc::clone(logger);
@@ -2292,6 +2634,11 @@ async fn execute_with_retry(
                                     core::agent::AgentEvent::TextDelta { text } => {
                                         print!("{text}");
                                         let _ = std::io::stdout().flush();
+                                    }
+                                    core::agent::AgentEvent::Thinking { text } => {
+                                        // Reasoning — prefix with 💭 to distinguish
+                                        // from assistant text on stdout.
+                                        println!("💭 {text}");
                                     }
                                     core::agent::AgentEvent::ToolCall { tool, detail, .. } => {
                                         println!("🔧 {tool}: {detail}");

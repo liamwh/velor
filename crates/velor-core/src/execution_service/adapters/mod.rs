@@ -6,9 +6,12 @@
 //!
 //! - [`claude`] — Claude Code (and GLM/Z.ai Claude-compatible wrappers) via
 //!   `stream-json` over a subprocess.
+//! - [`claude_stream`] — the internal Claude `stream-json` framing/parsing
+//!   module (one place that knows the protocol; the supervisor stays JSON-blind).
 //! - [`codex`] — Codex `codex exec --json`.
 //! - [`acp`] — Agent Client Protocol over stdio (driven on a dedicated worker).
 
 pub mod acp;
 pub mod claude;
+pub mod claude_stream;
 pub mod codex;

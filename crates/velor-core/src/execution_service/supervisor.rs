@@ -35,7 +35,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +51,18 @@ pub enum ProcessInput {
     Null,
     /// Write these bytes, then close stdin to signal end-of-file.
     Bytes(Bytes),
+    /// Keep stdin open for the life of the process. The `initial` frame is
+    /// written and flushed up front (and acknowledged via
+    /// [`ProcessEvent::StdinInitialised`]); further frames are sent on demand
+    /// through the supervisor's command channel (see [`ProcessInputCommand`]).
+    ///
+    /// Only an explicit [`ProcessInputCommand::Close`] — sent by the central
+    /// input-controller shutdown path — closes stdin. Dropping command senders
+    /// does not by itself close it.
+    Streaming {
+        /// The first frame written to the child's stdin.
+        initial: Bytes,
+    },
 }
 
 impl ProcessInput {
@@ -59,7 +71,7 @@ impl ProcessInput {
     pub fn as_bytes(&self) -> Option<&Bytes> {
         match self {
             Self::Bytes(b) => Some(b),
-            Self::Inherit | Self::Null => None,
+            Self::Inherit | Self::Null | Self::Streaming { .. } => None,
         }
     }
 }
@@ -199,6 +211,87 @@ impl ProcessSpecBuilder {
     }
 }
 
+/// Commands sent to the supervisor's long-lived stdin writer when a process is
+/// spawned with [`ProcessInput::Streaming`]. Each carries an acknowledgement
+/// that resolves only once the bytes have been written to *and flushed through*
+/// the child-process pipe — never merely queued.
+#[derive(Debug)]
+pub enum ProcessInputCommand {
+    /// Write and flush these bytes, then report the outcome.
+    Write {
+        /// The frame to deliver.
+        bytes: Bytes,
+        /// Resolves with `Ok` once the bytes are written and flushed.
+        acknowledgement: oneshot::Sender<Result<(), ProcessInputWriteError>>,
+    },
+    /// Shut the child's stdin down (send EOF). Only the central input-controller
+    /// shutdown path sends this; dropping command senders does not.
+    Close {
+        /// Resolves once stdin has been shut down (or was already closed).
+        acknowledgement: oneshot::Sender<Result<(), ProcessInputWriteError>>,
+    },
+}
+
+/// Why writing to (or shutting down) a streaming child stdin failed.
+///
+/// Carries a real [`std::io::Error`] source (e.g. a broken pipe when the child
+/// dies) but is still [`Clone`] so a failure can be acknowledged to the command
+/// sender *and* surfaced as a [`ProcessEvent::StdinWriteFailed`] event. The
+/// clone reconstructs the error from its OS code where possible.
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessInputWriteError {
+    /// The child process stdin has already closed.
+    #[error("the child process stdin has already closed")]
+    Closed,
+    /// Failed to write to the child process stdin.
+    #[error("failed to write to child process stdin")]
+    Write {
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to flush the child process stdin.
+    #[error("failed to flush child process stdin")]
+    Flush {
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to shut down the child process stdin.
+    #[error("failed to shut down child process stdin")]
+    Shutdown {
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl Clone for ProcessInputWriteError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Closed => Self::Closed,
+            Self::Write { source } => Self::Write {
+                source: clone_io_error(source),
+            },
+            Self::Flush { source } => Self::Flush {
+                source: clone_io_error(source),
+            },
+            Self::Shutdown { source } => Self::Shutdown {
+                source: clone_io_error(source),
+            },
+        }
+    }
+}
+
+/// Reconstructs an [`std::io::Error`] from its OS code where possible, else from
+/// its display string — the closest available [`Clone`] for a non-`Clone` error.
+fn clone_io_error(e: &std::io::Error) -> std::io::Error {
+    match e.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::other(e.to_string()),
+    }
+}
+
 /// A timestamped chunk of process output.
 #[derive(Debug, Clone)]
 pub struct ProcessChunk {
@@ -218,8 +311,15 @@ pub enum ProcessEvent {
     Stdout(ProcessChunk),
     /// A chunk read from stderr.
     Stderr(ProcessChunk),
-    /// The prompt was fully written to stdin and stdin was closed (EOF).
+    /// The prompt was fully written to stdin and stdin was closed (EOF) — the
+    /// one-shot [`ProcessInput::Bytes`] path.
     StdinWritten,
+    /// The initial frame of a [`ProcessInput::Streaming`] process was written
+    /// and flushed; stdin remains open for further commands.
+    StdinInitialised,
+    /// A write to a streaming process's stdin failed. Delivery of further
+    /// commands will report [`ProcessInputWriteError::Closed`].
+    StdinWriteFailed(ProcessInputWriteError),
     /// The child exited and output draining is complete.
     Exited,
 }
@@ -230,7 +330,10 @@ impl ProcessEvent {
     pub fn chunk(&self) -> Option<&ProcessChunk> {
         match self {
             Self::Stdout(c) | Self::Stderr(c) => Some(c),
-            Self::StdinWritten | Self::Exited => None,
+            Self::StdinWritten
+            | Self::StdinInitialised
+            | Self::StdinWriteFailed(_)
+            | Self::Exited => None,
         }
     }
 }
@@ -246,6 +349,9 @@ pub struct RunningProcess {
     events: Option<mpsc::Receiver<ProcessEvent>>,
     completion: Option<JoinHandle<Result<ProcessOutput, ProcessError>>>,
     cancellation: CancellationToken,
+    /// Sender for streaming-stdin commands. `Some` only when the process was
+    /// spawned with [`ProcessInput::Streaming`]; otherwise `None`.
+    input_sender: Option<mpsc::Sender<ProcessInputCommand>>,
 }
 
 impl RunningProcess {
@@ -253,6 +359,15 @@ impl RunningProcess {
     pub async fn next_event(&mut self) -> Option<ProcessEvent> {
         let events = self.events.as_mut()?;
         events.recv().await
+    }
+
+    /// Returns a cloned sender for streaming-stdin commands, or `None` when the
+    /// process was not spawned with [`ProcessInput::Streaming`] (or the writer has
+    /// gone away). Prefer this protocol-neutral accessor over a steering-specific
+    /// one: the supervisor owns no steering semantics, only framed input.
+    #[must_use]
+    pub fn input_sender(&self) -> Option<mpsc::Sender<ProcessInputCommand>> {
+        self.input_sender.clone()
     }
 
     /// Polls for the next event without blocking.
@@ -339,7 +454,9 @@ pub async fn spawn(
     }
     let stdin = match &spec.input {
         ProcessInput::Inherit => Stdio::inherit(),
-        ProcessInput::Null | ProcessInput::Bytes(_) => Stdio::piped(),
+        ProcessInput::Null | ProcessInput::Bytes(_) | ProcessInput::Streaming { .. } => {
+            Stdio::piped()
+        }
     };
     cmd.stdin(stdin)
         .stdout(Stdio::piped())
@@ -358,6 +475,14 @@ pub async fn spawn(
     let (events_tx, events_rx) = mpsc::channel::<ProcessEvent>(256);
     let process_token = cancellation.child_token();
 
+    // Only the streaming variant owns a long-lived stdin and a command channel.
+    let (input_tx, input_rx) = if matches!(spec.input, ProcessInput::Streaming { .. }) {
+        let (tx, rx) = mpsc::channel::<ProcessInputCommand>(16);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let cap = spec.capture_bytes;
     let completion = tokio::spawn(supervise(
         group_child,
@@ -368,6 +493,7 @@ pub async fn spawn(
         spec.timeouts.clone(),
         process_token,
         events_tx,
+        input_rx,
         cap,
     ));
 
@@ -375,6 +501,7 @@ pub async fn spawn(
         events: Some(events_rx),
         completion: Some(completion),
         cancellation,
+        input_sender: input_tx,
     })
 }
 
@@ -409,6 +536,7 @@ async fn supervise(
     timeouts: ProcessTimeouts,
     cancel: CancellationToken,
     events_tx: mpsc::Sender<ProcessEvent>,
+    input_rx: Option<mpsc::Receiver<ProcessInputCommand>>,
     cap: usize,
 ) -> Result<ProcessOutput, ProcessError> {
     let pid = group_child.id();
@@ -424,7 +552,31 @@ async fn supervise(
     // Drop our copy so `drain_rx` returning None means both drains are done.
     drop(drain_tx);
 
-    let stdin_handle = stdin.map(|s| tokio::spawn(write_stdin(s, input, timeouts.stdin_write)));
+    // The stdin writer. For the one-shot path it writes the bytes and closes; for
+    // the streaming path it owns the long-lived stdin and serves acknowledged
+    // commands until the process terminates or the supervisor shuts down.
+    // `stdin_close` is an internal token the supervisor cancels once its main loop
+    // ends, guaranteeing the streaming writer always exits (never hangs on recv).
+    let stdin_close = CancellationToken::new();
+    let stdin_handle = match (stdin, input, input_rx) {
+        (Some(s), ProcessInput::Streaming { initial }, Some(rx)) => {
+            Some(tokio::spawn(streaming_stdin_writer(
+                s,
+                initial,
+                rx,
+                events_tx.clone(),
+                stdin_close.clone(),
+                timeouts.stdin_write,
+            )))
+        }
+        (Some(s), one_shot_input, _) => Some(tokio::spawn(write_stdin(
+            s,
+            one_shot_input,
+            timeouts.stdin_write,
+            events_tx.clone(),
+        ))),
+        (None, _, _) => None,
+    };
 
     let mut stdout_cap = CaptureBuilder::new(cap);
     let mut stderr_cap = CaptureBuilder::new(cap);
@@ -547,7 +699,9 @@ async fn supervise(
         ingest!(c);
     }
 
-    // Join the I/O tasks so we do not leak them.
+    // Signal the streaming stdin writer to stop (the process is terminating),
+    // then join the I/O tasks so we do not leak them.
+    stdin_close.cancel();
     if let Some(h) = stdout_handle {
         let _ = h.await;
     }
@@ -595,23 +749,135 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 }
 
 /// Writes the prompt to stdin and closes it, bounded by an optional deadline.
-async fn write_stdin(mut stdin: ChildStdin, input: ProcessInput, deadline: Option<Duration>) {
+/// Emits [`ProcessEvent::StdinWritten`] once the bytes are written and stdin is
+/// shut down (EOF).
+async fn write_stdin(
+    mut stdin: ChildStdin,
+    input: ProcessInput,
+    deadline: Option<Duration>,
+    events_tx: mpsc::Sender<ProcessEvent>,
+) {
     if let ProcessInput::Bytes(bytes) = input {
         let write_fut = async {
             if stdin.write_all(&bytes).await.is_err() {
-                return;
+                return false;
             }
-            // Closing stdin signals EOF to the child.
-            let _ = stdin.shutdown().await;
+            // Closing stdin signals EOF to the child; only report "written" when
+            // the full payload was accepted and stdin shut down cleanly.
+            stdin.shutdown().await.is_ok()
         };
-        match deadline {
-            Some(d) => {
-                let _ = tokio::time::timeout(d, write_fut).await;
-            }
+        let fully_written = match deadline {
+            Some(d) => tokio::time::timeout(d, write_fut).await.unwrap_or(false),
             None => write_fut.await,
+        };
+        if fully_written {
+            let _ = events_tx.try_send(ProcessEvent::StdinWritten);
         }
     }
     // stdin is dropped here → EOF.
+}
+
+/// The long-lived streaming stdin writer. Owns the child's stdin for the life of
+/// the process: writes and flushes the initial frame, emits
+/// [`ProcessEvent::StdinInitialised`], then serves acknowledged
+/// [`ProcessInputCommand`]s until the process terminates (`done` is cancelled),
+/// every command sender is dropped, or an explicit [`ProcessInputCommand::Close`]
+/// arrives.
+///
+/// Only `Close` deliberately shuts stdin down. A broken-pipe write failure flips
+/// the writer into a "closed" state (subsequent commands report
+/// [`ProcessInputWriteError::Closed`]) rather than exiting immediately, so late
+/// steering attempts get a typed result instead of a dropped channel; the
+/// supervisor's `done` token still reaps the writer promptly once the child dies.
+async fn streaming_stdin_writer(
+    mut stdin: ChildStdin,
+    initial: Bytes,
+    mut cmd_rx: mpsc::Receiver<ProcessInputCommand>,
+    events_tx: mpsc::Sender<ProcessEvent>,
+    done: CancellationToken,
+    initial_deadline: Option<Duration>,
+) {
+    // 1. Write + flush the initial frame.
+    match write_flush(&mut stdin, &initial, initial_deadline).await {
+        Ok(()) => {
+            let _ = events_tx.try_send(ProcessEvent::StdinInitialised);
+        }
+        Err(e) => {
+            let _ = events_tx.try_send(ProcessEvent::StdinWriteFailed(e));
+            return;
+        }
+    }
+
+    // 2. Serve acknowledged commands until shutdown.
+    let mut closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = done.cancelled() => return,
+            cmd = cmd_rx.recv() => match cmd {
+                None => return,
+                Some(ProcessInputCommand::Write { bytes, acknowledgement }) => {
+                    let result = if closed {
+                        Err(ProcessInputWriteError::Closed)
+                    } else {
+                        match write_flush(&mut stdin, &bytes, None).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                closed = true;
+                                let _ = events_tx
+                                    .try_send(ProcessEvent::StdinWriteFailed(e.clone()));
+                                Err(e)
+                            }
+                        }
+                    };
+                    let _ = acknowledgement.send(result);
+                }
+                Some(ProcessInputCommand::Close { acknowledgement }) => {
+                    // Close is the deliberate end-of-input signal: shut stdin down
+                    // (unless it already broke) and exit the writer.
+                    let result = if closed {
+                        Err(ProcessInputWriteError::Closed)
+                    } else {
+                        match stdin.shutdown().await {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err(ProcessInputWriteError::Shutdown { source: e }),
+                        }
+                    };
+                    let _ = acknowledgement.send(result);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Writes `bytes` to `stdin` and flushes, bounded by an optional deadline. Maps
+/// I/O failures to the corresponding [`ProcessInputWriteError`] variant.
+async fn write_flush(
+    stdin: &mut ChildStdin,
+    bytes: &[u8],
+    deadline: Option<Duration>,
+) -> Result<(), ProcessInputWriteError> {
+    let fut = async {
+        stdin
+            .write_all(bytes)
+            .await
+            .map_err(|e| ProcessInputWriteError::Write { source: e })?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| ProcessInputWriteError::Flush { source: e })?;
+        Ok(())
+    };
+    match deadline {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(ProcessInputWriteError::Write {
+                source: std::io::Error::other("stdin write timed out"),
+            }),
+        },
+        None => fut.await,
+    }
 }
 
 /// Gracefully terminates the whole process group and reaps the direct child.
@@ -686,5 +952,238 @@ fn sleep_until_option(deadline: Option<Instant>) -> Pin<Box<dyn Future<Output = 
             tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await;
         }),
         None => Box::pin(std::future::pending()),
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Deadlines generous enough for a real subprocess but short enough to fail
+    /// fast if something wedges.
+    fn test_timeouts() -> ProcessTimeouts {
+        ProcessTimeouts {
+            startup: Some(Duration::from_secs(5)),
+            idle: Some(Duration::from_secs(5)),
+            total: Some(Duration::from_secs(15)),
+            termination_grace: Duration::from_secs(2),
+            ..Default::default()
+        }
+    }
+
+    /// Drains a process's event stream to completion, collecting stdout bytes and
+    /// the set of non-output event kinds observed.
+    async fn drain(mut proc: RunningProcess) -> (Vec<u8>, Vec<&'static str>) {
+        let mut out = Vec::new();
+        let mut kinds = Vec::new();
+        while let Some(ev) = proc.next_event().await {
+            match ev {
+                ProcessEvent::Stdout(c) => out.extend_from_slice(&c.bytes),
+                ProcessEvent::Stderr(_) => {}
+                ProcessEvent::StdinWritten => kinds.push("StdinWritten"),
+                ProcessEvent::StdinInitialised => kinds.push("StdinInitialised"),
+                ProcessEvent::StdinWriteFailed(_) => kinds.push("StdinWriteFailed"),
+                ProcessEvent::Exited => kinds.push("Exited"),
+            }
+        }
+        (out, kinds)
+    }
+
+    #[tokio::test]
+    async fn streaming_stdin_writes_initial_and_acknowledged_commands() {
+        // `cat` echoes stdin to stdout and exits on EOF.
+        let spec = ProcessSpec::builder("sh")
+            .arg("-c")
+            .arg("cat")
+            .input(ProcessInput::Streaming {
+                initial: Bytes::from_static(b"first\n"),
+            })
+            .timeouts(test_timeouts())
+            .capture_bytes(64 * 1024)
+            .build();
+        let cancel = CancellationToken::new();
+        let proc = spawn(spec, cancel).await.expect("spawn");
+        let sender = proc.input_sender().expect("streaming exposes a sender");
+
+        // Two acknowledged writes after the initial frame.
+        let (a1, r1) = oneshot::channel();
+        sender
+            .send(ProcessInputCommand::Write {
+                bytes: Bytes::from_static(b"second\n"),
+                acknowledgement: a1,
+            })
+            .await
+            .expect("send write 1");
+        assert!(matches!(r1.await, Ok(Ok(()))), "write 1 acknowledged Ok");
+
+        let (a2, r2) = oneshot::channel();
+        sender
+            .send(ProcessInputCommand::Write {
+                bytes: Bytes::from_static(b"third\n"),
+                acknowledgement: a2,
+            })
+            .await
+            .expect("send write 2");
+        assert!(matches!(r2.await, Ok(Ok(()))), "write 2 acknowledged Ok");
+
+        // Deliberately close stdin so `cat` sees EOF and exits.
+        let (ac, rc) = oneshot::channel();
+        sender
+            .send(ProcessInputCommand::Close {
+                acknowledgement: ac,
+            })
+            .await
+            .expect("send close");
+        assert!(matches!(rc.await, Ok(Ok(()))), "close acknowledged Ok");
+
+        let (out, kinds) = drain(proc).await;
+        let text = String::from_utf8_lossy(&out);
+        assert_eq!(
+            text, "first\nsecond\nthird\n",
+            "all frames delivered in order"
+        );
+        assert!(
+            kinds.contains(&"StdinInitialised"),
+            "initial frame acknowledged via StdinInitialised: {kinds:?}"
+        );
+        assert!(kinds.contains(&"Exited"), "process exited cleanly");
+    }
+
+    #[tokio::test]
+    async fn streaming_stdin_close_then_late_write_reports_closed() {
+        let spec = ProcessSpec::builder("sh")
+            .arg("-c")
+            .arg("cat")
+            .input(ProcessInput::Streaming {
+                initial: Bytes::from_static(b""),
+            })
+            .timeouts(test_timeouts())
+            .capture_bytes(64 * 1024)
+            .build();
+        let cancel = CancellationToken::new();
+        let proc = spawn(spec, cancel).await.expect("spawn");
+        let sender = proc.input_sender().expect("sender");
+
+        // Close deliberately.
+        let (ac, rc) = oneshot::channel();
+        sender
+            .send(ProcessInputCommand::Close {
+                acknowledgement: ac,
+            })
+            .await
+            .expect("send close");
+        assert!(matches!(rc.await, Ok(Ok(()))));
+
+        // After Close the writer has exited: a further send fails (no receiver).
+        let (a2, _r2) = oneshot::channel();
+        let late = sender.try_send(ProcessInputCommand::Write {
+            bytes: Bytes::from_static(b"late\n"),
+            acknowledgement: a2,
+        });
+        // The writer is gone: the command cannot be delivered.
+        assert!(late.is_err(), "late write after close is not delivered");
+
+        drain(proc).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_stdin_broken_pipe_reports_failure() {
+        // Close the child's stdin read end but keep the process alive briefly, so
+        // a subsequent write hits a broken pipe while the supervisor is still
+        // running (not yet torn down).
+        let spec = ProcessSpec::builder("sh")
+            .arg("-c")
+            .arg("exec 0<&-; sleep 1")
+            .input(ProcessInput::Streaming {
+                initial: Bytes::from_static(b""),
+            })
+            .timeouts(test_timeouts())
+            .capture_bytes(64 * 1024)
+            .build();
+        let cancel = CancellationToken::new();
+        let proc = spawn(spec, cancel).await.expect("spawn");
+        let sender = proc.input_sender().expect("sender");
+
+        // Give the shell a moment to close its stdin, then write repeatedly until
+        // the broken pipe surfaces.
+        let mut saw_failure = false;
+        for _ in 0..50 {
+            let (a, r) = oneshot::channel();
+            if sender
+                .send(ProcessInputCommand::Write {
+                    bytes: Bytes::from_static(b"x\n"),
+                    acknowledgement: a,
+                })
+                .await
+                .is_err()
+            {
+                break; // writer gone (process exited)
+            }
+            if matches!(r.await, Ok(Err(_))) {
+                saw_failure = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_failure, "a broken-pipe write reports Err to the ack");
+        let (_, kinds) = drain(proc).await;
+        assert!(
+            kinds.contains(&"StdinWriteFailed"),
+            "broken pipe surfaced as StdinWriteFailed: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_one_sender_clone_does_not_close_stdin() {
+        // `cat` keeps stdin open until EOF, so a dropped sender clone must not end
+        // input.
+        let spec = ProcessSpec::builder("sh")
+            .arg("-c")
+            .arg("cat")
+            .input(ProcessInput::Streaming {
+                initial: Bytes::from_static(b""),
+            })
+            .timeouts(test_timeouts())
+            .capture_bytes(64 * 1024)
+            .build();
+        let cancel = CancellationToken::new();
+        let proc = spawn(spec, cancel).await.expect("spawn");
+
+        // Two independent clones; drop one immediately.
+        let primary = proc.input_sender().expect("sender");
+        let dropper = proc.input_sender().expect("second clone");
+        drop(dropper);
+
+        // The remaining clone must still be able to write (stdin stayed open).
+        let (a, r) = oneshot::channel();
+        primary
+            .send(ProcessInputCommand::Write {
+                bytes: Bytes::from_static(b"survived-drop\n"),
+                acknowledgement: a,
+            })
+            .await
+            .expect("send after dropping a clone");
+        assert!(
+            matches!(r.await, Ok(Ok(()))),
+            "write after a clone dropped is still delivered"
+        );
+
+        // Close to finish.
+        let (ac, rc) = oneshot::channel();
+        primary
+            .send(ProcessInputCommand::Close {
+                acknowledgement: ac,
+            })
+            .await
+            .expect("send close");
+        assert!(matches!(rc.await, Ok(Ok(()))));
+
+        let (out, _) = drain(proc).await;
+        assert!(
+            String::from_utf8_lossy(&out).contains("survived-drop"),
+            "the dropped clone did not close stdin"
+        );
     }
 }

@@ -355,6 +355,33 @@ pub enum AgentProtocolError {
 #[error("ACP agent failed: {0}")]
 pub struct AcpError(pub String);
 
+/// Why live steering could not be delivered to an active agent session.
+///
+/// Coarse and `Copy`/`Clone` so it can travel in both the
+/// [`AgentExecutionError::LiveSteeringUnavailable`] execution error and a
+/// steering command's acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LiveSteeringUnavailableReason {
+    /// The adapter/profile does not support live steering (Codex, ACP).
+    #[error("live steering is not supported by this provider")]
+    Unsupported,
+    /// No active execution is connected (e.g. between iterations).
+    #[error("no active agent session is available to steer")]
+    Inactive,
+    /// The active execution has no writable streaming-input sender.
+    #[error("the active agent session has no writable input channel")]
+    NoInputSender,
+    /// The child process's stdin has already closed.
+    #[error("the active agent session's input has already closed")]
+    StdinClosed,
+    /// Writing to the child's stdin failed (e.g. broken pipe after it exited).
+    #[error("writing to the active agent session failed")]
+    WriteFailed,
+    /// The provider rejected the stream-json input schema.
+    #[error("the provider rejected the stream-json input schema")]
+    ProtocolRejected,
+}
+
 /// The unified, layered error for agent execution. Provenance is preserved:
 /// process vs protocol vs provider vs unsuccessful-exit are distinct variants.
 #[derive(Debug, thiserror::Error)]
@@ -381,6 +408,12 @@ pub enum AgentExecutionError {
     /// An ACP protocol failure.
     #[error(transparent)]
     Acp(#[from] AcpError),
+    /// Live steering could not be delivered to the active agent session.
+    #[error("live steering unavailable: {reason}")]
+    LiveSteeringUnavailable {
+        /// Why steering was unavailable.
+        reason: LiveSteeringUnavailableReason,
+    },
     /// Execution was cancelled via the cancellation token.
     #[error("execution cancelled")]
     Cancelled,
@@ -422,6 +455,7 @@ impl AgentExecutionError {
             Self::Provider { error, .. } => error.retryability(),
             Self::UnsuccessfulExit(_) => Retryability::Permanent,
             Self::Acp(_) => Retryability::Permanent,
+            Self::LiveSteeringUnavailable { .. } => Retryability::Permanent,
             Self::Cancelled => Retryability::Permanent,
             Self::DeadlineExceeded { .. } => Retryability::Permanent,
             Self::ConcurrencyExhausted { .. } => Retryability::Permanent,

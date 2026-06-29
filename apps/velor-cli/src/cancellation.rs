@@ -1,8 +1,16 @@
-//! Two-stage cancellation handler for graceful shutdown.
+//! Cancellation handler for user-initiated stops.
 //!
-//! This module provides a cancellation mechanism that:
-//! 1. First Ctrl+C: Signals graceful shutdown (complete current iteration, then stop)
-//! 2. Second Ctrl+C within 3 seconds: Force quit immediately
+//! This module provides a cancellation mechanism with two distinct stop
+//! semantics:
+//!
+//! 1. **Force stop** — triggered by pressing Ctrl+C **twice** within a short
+//!    window. Immediately cancels the in-flight agent subprocess via the
+//!    [`CancellationToken`]. A single Ctrl+C press is a no-op (the user may
+//!    have meant to interrupt a child tool, not the whole run); two presses
+//!    are required to avoid accidental aborts.
+//! 2. **Stop after iteration** — triggered by the `s` key in the TUI. Sets a
+//!    flag that the auto loop checks between iterations; the current iteration
+//!    is allowed to finish, then the run exits cleanly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,32 +18,35 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-/// Time window for second Ctrl+C to trigger force cancellation (3 seconds)
+/// Time window for the second Ctrl+C to count as a force-stop (3 seconds).
 const FORCE_CANCEL_WINDOW: Duration = Duration::from_secs(3);
 
-/// Two-stage cancellation handler.
+/// Cancellation handler.
 ///
 /// # States
 ///
-/// - **Normal**: No Ctrl+C pressed
-/// - **Graceful Shutdown Requested**: First Ctrl+C pressed, will stop after current iteration
-/// - **Force Cancel Requested**: Second Ctrl+C pressed within 3 seconds of first
+/// - **Normal**: running, no stop requested.
+/// - **Stop after iteration requested**: the `s` key (or an explicit API call)
+///   asked to stop once the current iteration completes.
+/// - **Force cancelled**: Ctrl+C was pressed twice within
+///   [`FORCE_CANCEL_WINDOW`]; the [`CancellationToken`] is cancelled and the
+///   in-flight subprocess should abort immediately.
 #[derive(Debug, Clone)]
 pub struct CancellationHandler {
-    /// Inner state shared across all clones
+    /// Inner state shared across all clones.
     inner: Arc<CancellationInner>,
-    /// Tokio cancellation token for immediate cancellation
+    /// Tokio cancellation token for immediate (force) cancellation.
     cancel_token: CancellationToken,
 }
 
 #[derive(Debug)]
 struct CancellationInner {
-    /// First Ctrl+C received (graceful shutdown requested)
-    graceful_shutdown_requested: AtomicBool,
-    /// Second Ctrl+C received (force cancel requested)
+    /// `s` key (or explicit call): stop after the current iteration completes.
+    stop_after_iteration_requested: AtomicBool,
+    /// Ctrl+C pressed twice within the window: cancel immediately.
     force_cancel_requested: AtomicBool,
-    /// Timestamp of first Ctrl+C press (milliseconds since epoch)
-    first_press_time: AtomicU64,
+    /// Timestamp of the most recent Ctrl+C press (milliseconds since epoch).
+    last_press_time: AtomicU64,
 }
 
 impl CancellationHandler {
@@ -54,64 +65,92 @@ impl CancellationHandler {
 
         let handler = Self {
             inner: Arc::new(CancellationInner {
-                graceful_shutdown_requested: AtomicBool::new(false),
+                stop_after_iteration_requested: AtomicBool::new(false),
                 force_cancel_requested: AtomicBool::new(false),
-                first_press_time: AtomicU64::new(0),
+                last_press_time: AtomicU64::new(0),
             }),
             cancel_token: cancel_token.clone(),
         };
 
         if register_handler {
-            // Register Ctrl+C handler (if not already registered, e.g., in tests or scripts)
+            // Register Ctrl+C handler (if not already registered, e.g., in tests or scripts).
             let inner = handler.inner.clone();
             let token_for_handler = cancel_token.clone();
             if ctrlc::set_handler(move || {
                 let now = now_millis();
+                let last = inner.last_press_time.load(Ordering::SeqCst);
+                let elapsed = now.saturating_sub(last);
 
-                // Check if this is the first or second press
-                if !inner.graceful_shutdown_requested.load(Ordering::SeqCst) {
-                    // First Ctrl+C - request graceful shutdown
-                    inner.graceful_shutdown_requested.store(true, Ordering::SeqCst);
-                    inner.first_press_time.store(now, Ordering::SeqCst);
-
-                    println!("\n⚠️  Graceful shutdown requested. Will stop after current iteration completes.");
-                    println!("💡 Press Ctrl+C again within 3 seconds to force quit immediately.");
+                if last > 0 && elapsed <= FORCE_CANCEL_WINDOW.as_millis() as u64 {
+                    // Second press within the window — force cancel now.
+                    inner.force_cancel_requested.store(true, Ordering::SeqCst);
+                    token_for_handler.cancel();
+                    println!("\n🛑 Force stop requested! Shutting down immediately...");
                 } else {
-                    // Second Ctrl+C - check if within the time window
-                    let first_press = inner.first_press_time.load(Ordering::SeqCst);
-                    let elapsed = now.saturating_sub(first_press);
-
-                    if elapsed <= FORCE_CANCEL_WINDOW.as_millis() as u64 {
-                        // Within time window - force cancel
-                        inner.force_cancel_requested.store(true, Ordering::SeqCst);
-                        token_for_handler.cancel();
-                        println!("\n🛑 Force quit requested! Shutting down immediately...");
-                    } else {
-                        // Outside time window - treat as new graceful shutdown request
-                        inner.first_press_time.store(now, Ordering::SeqCst);
-                        println!("\n⚠️  Graceful shutdown requested again. Will stop after current iteration.");
-                        println!("💡 Press Ctrl+C again within 3 seconds to force quit immediately.");
-                    }
+                    // First press (or stale) — just record the time. A single
+                    // press does NOT stop the run; press Ctrl+C again within
+                    // 3 seconds to force quit.
+                    inner.last_press_time.store(now, Ordering::SeqCst);
+                    println!(
+                        "\n⏸  Ctrl+C received. Press again within 3s to force stop, or use the `s` key to stop after this iteration."
+                    );
                 }
             })
             .is_err() {
-                // Handler already registered (e.g., in tests or non-interactive shell)
-                // This is fine - the automation will still work, just without Ctrl+C handling
+                // Handler already registered (e.g., in tests or non-interactive shell).
+                // This is fine — the automation will still work, just without Ctrl+C handling.
             }
         }
 
         (handler, cancel_token)
     }
 
-    /// Returns `true` if graceful shutdown has been requested (first Ctrl+C).
-    #[must_use]
-    pub fn graceful_shutdown_requested(&self) -> bool {
+    /// Requests that the run stop after the current iteration completes.
+    ///
+    /// Toggled by the `s` key in the TUI. Idempotent: calling twice keeps it
+    /// set; use [`clear_stop_after_iteration`](Self::clear_stop_after_iteration)
+    /// to clear it.
+    #[allow(dead_code)]
+    pub fn request_stop_after_iteration(&self) {
         self.inner
-            .graceful_shutdown_requested
+            .stop_after_iteration_requested
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Toggles the "stop after this iteration" request.
+    ///
+    /// Returns the new state (`true` = will stop after the current iteration).
+    pub fn toggle_stop_after_iteration(&self) -> bool {
+        let prev = self
+            .inner
+            .stop_after_iteration_requested
+            .load(Ordering::SeqCst);
+        let new = !prev;
+        self.inner
+            .stop_after_iteration_requested
+            .store(new, Ordering::SeqCst);
+        new
+    }
+
+    /// Clears a previous "stop after this iteration" request.
+    pub fn clear_stop_after_iteration(&self) {
+        self.inner
+            .stop_after_iteration_requested
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Returns `true` if stopping after the current iteration has been requested
+    /// (the `s` key). The auto loop checks this between iterations.
+    ///
+    /// Replaces the old `graceful_shutdown_requested` name.
+    #[must_use]
+    pub fn stop_after_iteration_requested(&self) -> bool {
+        self.inner
+            .stop_after_iteration_requested
             .load(Ordering::SeqCst)
     }
 
-    /// Returns `true` if force cancellation has been requested (second Ctrl+C within window).
+    /// Returns `true` if force cancellation was requested (Ctrl+C twice).
     #[must_use]
     #[allow(dead_code)]
     pub fn force_cancel_requested(&self) -> bool {
@@ -130,16 +169,16 @@ impl CancellationHandler {
         &self.cancel_token
     }
 
-    /// Resets the graceful shutdown flag (useful for testing or continuing after interruption).
+    /// Resets all flags (useful for testing or continuing after interruption).
     #[allow(dead_code)]
     pub fn reset(&self) {
         self.inner
-            .graceful_shutdown_requested
+            .stop_after_iteration_requested
             .store(false, Ordering::SeqCst);
         self.inner
             .force_cancel_requested
             .store(false, Ordering::SeqCst);
-        self.inner.first_press_time.store(0, Ordering::SeqCst);
+        self.inner.last_press_time.store(0, Ordering::SeqCst);
     }
 }
 
@@ -165,9 +204,28 @@ mod tests {
     #[test]
     fn test_cancellation_handler_initial_state() {
         let (handler, _token) = CancellationHandler::new_with_handler(false);
-        assert!(!handler.graceful_shutdown_requested());
+        assert!(!handler.stop_after_iteration_requested());
         assert!(!handler.force_cancel_requested());
         assert!(!handler.is_cancelled());
+    }
+
+    #[test]
+    fn test_stop_after_iteration_toggle() {
+        let (handler, _token) = CancellationHandler::new_with_handler(false);
+        assert!(!handler.stop_after_iteration_requested());
+        assert!(handler.toggle_stop_after_iteration()); // on
+        assert!(handler.stop_after_iteration_requested());
+        assert!(!handler.toggle_stop_after_iteration()); // off
+        assert!(!handler.stop_after_iteration_requested());
+    }
+
+    #[test]
+    fn test_clear_stop_after_iteration() {
+        let (handler, _token) = CancellationHandler::new_with_handler(false);
+        handler.request_stop_after_iteration();
+        assert!(handler.stop_after_iteration_requested());
+        handler.clear_stop_after_iteration();
+        assert!(!handler.stop_after_iteration_requested());
     }
 
     #[test]
@@ -175,7 +233,7 @@ mod tests {
         let (handler, _token) = CancellationHandler::new_with_handler(false);
         handler
             .inner
-            .graceful_shutdown_requested
+            .stop_after_iteration_requested
             .store(true, Ordering::SeqCst);
         handler
             .inner
@@ -184,14 +242,14 @@ mod tests {
 
         handler.reset();
 
-        assert!(!handler.graceful_shutdown_requested());
+        assert!(!handler.stop_after_iteration_requested());
         assert!(!handler.force_cancel_requested());
     }
 
     #[test]
     fn test_now_millis_returns_reasonable_value() {
         let now = now_millis();
-        // Should be a timestamp sometime after 2020
+        // Should be a timestamp sometime after 2020.
         assert!(now > 1_577_836_800_000);
     }
 }

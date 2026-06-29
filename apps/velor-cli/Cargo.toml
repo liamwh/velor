@@ -24,6 +24,7 @@ humantime = { workspace = true }
 ratatui = { workspace = true }
 syntect = { workspace = true }
 tui-markdown = { workspace = true }
+unicode-width = { workspace = true }
 reqwest = { workspace = true }
 infer = { workspace = true }
 serde = { workspace = true }

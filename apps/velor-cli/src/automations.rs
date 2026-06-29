@@ -764,21 +764,22 @@ pub async fn run_daemon(
     // Create cancellation handler for graceful shutdown
     let (cancel_handler, cancel_token) = crate::cancellation::CancellationHandler::new();
 
-    println!("✅ Daemon started. Press Ctrl+C to stop gracefully.");
+    println!("✅ Daemon started. Press Ctrl+C twice to stop.");
     println!("════════════════════════════════════════\n");
 
     // Main daemon loop
     let mut tick_count = 0u64;
     loop {
-        // Check for force cancellation (Ctrl+C twice)
+        // Check for force cancellation (Ctrl+C twice).
         if cancel_handler.is_cancelled() {
-            println!("\n🛑 Force quit by user (Ctrl+C twice)");
+            println!("\n🛑 Force stop by user (Ctrl+C twice)");
             break;
         }
 
-        // Check for graceful shutdown request (Ctrl+C once)
-        if cancel_handler.graceful_shutdown_requested() {
-            println!("\n⚠️  Graceful shutdown requested. Stopping after current tick...");
+        // Check for a stop-after-iteration request (programmatic; the daemon
+        // has no TUI `s` key, so this is only set by explicit API calls).
+        if cancel_handler.stop_after_iteration_requested() {
+            println!("\n⚠️  Stop requested. Stopping after current tick...");
             break;
         }
 
