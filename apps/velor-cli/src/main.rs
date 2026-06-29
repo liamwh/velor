@@ -1387,21 +1387,17 @@ async fn run_auto(
         ));
     }
 
-    // While the TUI owns the alternate screen, tracing output on stderr would
-    // corrupt the display (e.g. retry/auth `WARN`/`ERROR` lines bleeding over
-    // the box border). Route it to a sibling `<run>.tracing.log` instead.
-    let tracing_log_path = if no_tui {
-        None
-    } else {
-        match tracing_setup::redirect_to_file(logger.path()) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::warn!(
-                    "could not redirect tracing to a log file ({e}); \
-                     stderr may be corrupted by the TUI"
-                );
-                None
-            }
+    // Route tracing to a sibling `<run>.tracing.log` for every run, regardless
+    // of TUI mode. In TUI mode this also keeps tracing off stderr so it cannot
+    // corrupt the alternate screen (retry/auth WARN/ERROR lines bleeding over
+    // the box border). Doing it in both modes means every exit surfaces the same
+    // two log files — the structured run log and the tracing log — which the
+    // summary below prints alongside the version.
+    let tracing_log_path = match tracing_setup::redirect_to_file(logger.path()) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("could not redirect tracing to a log file ({e})");
+            None
         }
     };
 
