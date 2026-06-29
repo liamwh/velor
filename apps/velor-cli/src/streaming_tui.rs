@@ -253,6 +253,18 @@ enum SubmissionState {
     },
 }
 
+/// One recorded iteration boundary: the divider's stable entry id and its 1-based
+/// iteration number. The number is stored alongside the id so the iteration a
+/// reader is *viewing* can be reported even after the divider entry itself is
+/// trimmed from the live transcript.
+#[derive(Debug, Clone, Copy)]
+struct IterationBoundary {
+    /// The divider entry id marking where this iteration begins.
+    id: crate::tui_transcript::EntryId,
+    /// The 1-based iteration number this divider introduces.
+    number: u32,
+}
+
 struct TuiState {
     transcript: Transcript,
     scroll: ScrollState,
@@ -296,10 +308,12 @@ struct TuiState {
     cached_tokens: u64,
     /// Current/total iteration (shown in the status line).
     iteration: Option<(u32, u32)>,
-    /// Entry ids marking where each iteration began, in order. Used to resolve
-    /// "this iteration" from the viewport for `gg`/`G` navigation. The first
-    /// entry ingested after an iteration change is recorded here.
-    iteration_starts: Vec<crate::tui_transcript::EntryId>,
+    /// Boundaries marking where each iteration began, in order. Each carries the
+    /// divider's stable entry id and its 1-based number, so the iteration being
+    /// *viewed* can be reported even after the divider entry is trimmed. Used to
+    /// resolve "this iteration" from the viewport for `gg`/`G` navigation and for
+    /// the "viewing iteration" indicator.
+    iteration_starts: Vec<IterationBoundary>,
     /// A pending iteration boundary awaiting its first entry. `Some((current,
     /// total))` is set when `SetIteration` advances the counter; the next ingested
     /// entry is preceded by a divider, which is indexed as the iteration boundary
@@ -434,13 +448,15 @@ impl TuiState {
     }
 
     /// Finds the iteration that contains the viewport's top entry, returning the
-    /// `(start_id, end_id)` boundary ids. `end_id` is the entry just before the
-    /// next iteration begins (or the newest entry for the last iteration).
+    /// `(start_id, end_id, number)` boundary. `end_id` is the entry just before
+    /// the next iteration begins (or the newest entry for the last iteration);
+    /// `number` is the 1-based iteration the viewport is currently in.
     fn current_iteration_bounds(
         &self,
     ) -> Option<(
         crate::tui_transcript::EntryId,
         crate::tui_transcript::EntryId,
+        u32,
     )> {
         let entries = self.transcript.entries();
         if self.iteration_starts.is_empty() || entries.is_empty() {
@@ -455,14 +471,15 @@ impl TuiState {
             .unwrap_or(entries.len() - 1);
 
         // Find the latest iteration start at or before the viewport entry.
-        // `iteration_starts` are entry ids; resolve each to its retained index.
         let mut start_idx = 0;
         let mut start_id = entries[0].id;
-        for &id in &self.iteration_starts {
-            if let Some(i) = entries.iter().position(|e| e.id == id) {
+        let mut number = self.iteration_starts[0].number;
+        for boundary in &self.iteration_starts {
+            if let Some(i) = entries.iter().position(|e| e.id == boundary.id) {
                 if i <= view_idx {
                     start_idx = i;
                     start_id = entries[i].id;
+                    number = boundary.number;
                 } else {
                     break;
                 }
@@ -473,7 +490,7 @@ impl TuiState {
         let end_id = self
             .iteration_starts
             .iter()
-            .filter_map(|&id| entries.iter().position(|e| e.id == id))
+            .filter_map(|b| entries.iter().position(|e| e.id == b.id))
             .find(|&i| i > start_idx)
             .map(|i| entries[i - 1].id)
             .unwrap_or_else(|| entries.last().unwrap().id);
@@ -485,13 +502,21 @@ impl TuiState {
             start_id
         };
         let _ = start_idx;
-        Some((begin, end_id))
+        Some((begin, end_id, number))
+    }
+
+    /// The 1-based number of the iteration the viewport's top entry currently
+    /// sits in, or `None` when there are no iteration boundaries. Used for the
+    /// "viewing iteration" indicator, which differs from the *running* iteration
+    /// ([`TuiState::iteration`]) when the reader has scrolled into history.
+    fn viewing_iteration_number(&self) -> Option<u32> {
+        self.current_iteration_bounds().map(|(_, _, number)| number)
     }
 
     /// `gg` — jump to the top of the iteration currently in view.
     fn jump_to_iteration_top(&mut self) {
         match self.current_iteration_bounds() {
-            Some((start_id, _)) => self.jump_to_entry(start_id),
+            Some((start_id, _, _)) => self.jump_to_entry(start_id),
             None => self.jump_to_absolute_top(),
         }
     }
@@ -499,7 +524,7 @@ impl TuiState {
     /// `G` — jump to the bottom of the iteration currently in view. For the
     /// latest iteration this is the live tail, so it re-enables streaming.
     fn jump_to_iteration_bottom(&mut self) {
-        let Some((_, end_id)) = self.current_iteration_bounds() else {
+        let Some((_, end_id, _)) = self.current_iteration_bounds() else {
             self.jump_to_bottom();
             return;
         };
@@ -1136,7 +1161,10 @@ pub async fn run_streaming_tui(
                                 maximum: Some(total),
                             }));
                         if let Some(divider) = state.transcript.entries().last() {
-                            state.iteration_starts.push(divider.id);
+                            state.iteration_starts.push(IterationBoundary {
+                                id: divider.id,
+                                number: current,
+                            });
                         }
                     }
                     state.transcript.ingest(e);
@@ -1595,6 +1623,22 @@ fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
             format!("🔁 {current}/{total}"),
             Style::default().fg(Color::Yellow),
         ));
+    }
+    // "Viewing iteration" — distinct from the running iteration (🔁 above).
+    // Shown only when the reader has scrolled into a different iteration than
+    // the one currently running, so they can tell e.g. they are reading
+    // iteration 2 while the agent works on iteration 3.
+    if let Some(viewing) = state.viewing_iteration_number() {
+        let running = state.iteration.map(|(c, _)| c);
+        if running.is_some_and(|r| r != viewing) {
+            spans.push(Span::raw("  ·  "));
+            spans.push(Span::styled(
+                format!("👁 viewing iter {viewing}"),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     // Persistent-append indicator (set by the controller via SetPersistentAppend).
     if let Some(append) = &state.persistent_append {
@@ -2254,7 +2298,10 @@ mod render_tests {
                         maximum: Some(t),
                     }));
                 if let Some(divider) = state.transcript.entries().last() {
-                    state.iteration_starts.push(divider.id);
+                    state.iteration_starts.push(IterationBoundary {
+                        id: divider.id,
+                        number: c,
+                    });
                 }
             }
             state
@@ -2270,9 +2317,9 @@ mod render_tests {
         let mut state = TuiState::new(TuiLimits::default());
         // iter 1 (40) then iter 2 (40).
         start_iteration(&mut state, 1, 2, 40);
-        let iter1_start = state.iteration_starts[0];
+        let iter1_start = state.iteration_starts[0].id;
         start_iteration(&mut state, 2, 2, 40);
-        let iter2_start = state.iteration_starts[1];
+        let iter2_start = state.iteration_starts[1].id;
         // Copy ids out so we don't hold an immutable borrow across mutations.
         let (iter1_mid, iter2_mid) = {
             let entries = state.transcript.entries();
@@ -2374,11 +2421,11 @@ mod render_tests {
         assert_eq!(state.iteration_starts.len(), 2);
         // Each indexed boundary must resolve to a retained IterationDivider entry,
         // and the divider numbers must match the iterations they introduce.
-        for (i, &boundary_id) in state.iteration_starts.iter().enumerate() {
+        for (i, boundary) in state.iteration_starts.iter().enumerate() {
             let entries = state.transcript.entries();
             let entry = entries
                 .iter()
-                .find(|e| e.id == boundary_id)
+                .find(|e| e.id == boundary.id)
                 .expect("indexed boundary id is retained");
             match &entry.kind {
                 EntryKind::IterationDivider { number, maximum } => {
@@ -2388,6 +2435,52 @@ mod render_tests {
                 other => panic!("indexed boundary is a divider, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn viewing_iteration_tracks_the_scrolled_position() {
+        let mut state = TuiState::new(TuiLimits::default());
+        // Three iterations, 40 entries each: iter1 = divider@0 + infos@1..40,
+        // iter2 = divider@41 + infos@42..81, iter3 = divider@82 + infos@83..122.
+        start_iteration(&mut state, 1, 3, 40);
+        start_iteration(&mut state, 2, 3, 40);
+        start_iteration(&mut state, 3, 3, 40);
+        // The agent is running iteration 3 (live tail).
+        state.iteration = Some((3, 3));
+        state.last_viewport_rows = 5;
+
+        // Anchored inside iteration 1 → the reader is viewing iteration 1 even
+        // though iteration 3 is running.
+        let iter1_mid = state.transcript.entries()[10].id;
+        state.scroll = ScrollState::Anchored {
+            entry_id: iter1_mid,
+            hidden_rows: 0,
+        };
+        assert_eq!(
+            state.viewing_iteration_number(),
+            Some(1),
+            "scrolled into iteration 1 reports viewing 1"
+        );
+
+        // Anchored inside iteration 2 → viewing 2.
+        let iter2_mid = state.transcript.entries()[51].id;
+        state.scroll = ScrollState::Anchored {
+            entry_id: iter2_mid,
+            hidden_rows: 0,
+        };
+        assert_eq!(
+            state.viewing_iteration_number(),
+            Some(2),
+            "scrolled into iteration 2 reports viewing 2"
+        );
+
+        // Back at the live tail (newest content = iteration 3) → viewing == running.
+        state.scroll = ScrollState::Tail;
+        assert_eq!(
+            state.viewing_iteration_number(),
+            Some(3),
+            "tail reports the running iteration"
+        );
     }
 
     #[test]
