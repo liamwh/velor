@@ -2026,6 +2026,12 @@ async fn run_auto_loop(
     let mut history = ConversationHistory::new();
     let mut final_output = String::new();
     let mut previous_iteration_completed = false;
+    // Anchor for the per-iteration absolute timeout (`retry_config.absolute_timeout_ms`,
+    // default 5 hours). `None` until the iteration's first attempt; persists across
+    // crash-recovery `continue`s (same iteration) and is cleared when the iteration
+    // advances, so a single stuck iteration is bounded by the configured budget
+    // instead of looping forever through crash recovery with a reset clock.
+    let mut iteration_retry_started_at: Option<std::time::Instant> = None;
     // The single controller-owned persistent-append cell, seeded from --append.
     let mut persistent_append: Option<
         velor_core::execution_service::adapters::claude_stream::PersistentAppend,
@@ -2041,6 +2047,12 @@ async fn run_auto_loop(
     let use_acp_session = rules_set.is_some() && runner.is_acp() && rules_config.enabled;
 
     while current_iteration <= iterations {
+        // Lazily stamp the iteration's retry clock on first entry. `get_or_insert`
+        // keeps the same instant across crash-recovery retries of this iteration;
+        // it is reset to `None` below when `current_iteration` advances.
+        let retry_started_at =
+            *iteration_retry_started_at.get_or_insert_with(std::time::Instant::now);
+
         // Check for force cancellation at the start of each iteration
         if cancel_handler.is_cancelled() {
             println!("\n🛑 Force quit by user (Ctrl+C twice)");
@@ -2197,6 +2209,7 @@ async fn run_auto_loop(
                     tui_tx,
                     &mut iter_steer_rx,
                     logger,
+                    retry_started_at,
                 ),
                 iter_steer_tx,
                 &mut tui_command_rx,
@@ -2316,6 +2329,8 @@ async fn run_auto_loop(
         }
 
         current_iteration += 1;
+        // Fresh retry budget for the next iteration.
+        iteration_retry_started_at = None;
     }
 
     // Ran all iterations without completion token
@@ -2541,6 +2556,32 @@ struct AutoLoopResult {
     output: String,
 }
 
+/// Whether [`execute_with_retry`] should make another attempt after `e`.
+///
+/// Provider-classified and process-I/O failures defer to their typed
+/// [`core::execution_service::error::Retryability`]. The one override is
+/// *internal* cancellation: an
+/// [`core::execution_service::error::AgentExecutionError::Cancelled`] (or the
+/// underlying process [`core::execution_service::error::ProcessError::Cancelled`])
+/// produced when the subprocess is torn down mid-request — often while the
+/// provider is flaky — is transient and worth retrying. Without this, a single
+/// internal teardown would classify as a permanent failure and kill a long
+/// unattended run that had been retrying happily for hours.
+///
+/// Genuine user cancellation never reaches here: the cancel token is checked
+/// first and surfaces as [`RetryError::Cancelled`].
+fn is_attempt_retryable(e: &core::execution_service::error::AgentExecutionError) -> bool {
+    use core::execution_service::error::{AgentExecutionError, ProcessError};
+
+    if e.retryability().is_retryable() {
+        return true;
+    }
+    matches!(
+        e,
+        AgentExecutionError::Cancelled | AgentExecutionError::Process(ProcessError::Cancelled)
+    )
+}
+
 /// Executes Claude with exponential backoff retry logic.
 ///
 /// # Errors
@@ -2548,6 +2589,13 @@ struct AutoLoopResult {
 /// Returns `RetryError::Permanent` for non-retryable errors.
 /// Returns `RetryError::Retryable` when all retries are exhausted.
 /// Returns `RetryError::TimeoutExceeded` when the absolute timeout is exceeded.
+/// Returns `RetryError::Cancelled` when the user's cancel token fires.
+///
+/// `retry_started_at` anchors the absolute-timeout check so it spans crash
+/// recovery: the caller passes the same instant for every retry of one
+/// iteration rather than letting each call reset the 5-hour clock. An *internal*
+/// cancellation (subprocess torn down mid-request while the user has not
+/// cancelled) is retried — see [`is_attempt_retryable`].
 #[tracing::instrument(level = "debug", ret, err, skip(runner, prompt, logger))]
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_retry(
@@ -2565,10 +2613,10 @@ async fn execute_with_retry(
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
     steering: &mut Option<tokio::sync::mpsc::Receiver<core::agent::AgentInput>>,
     logger: &std::sync::Arc<run_logger::RunLogger>,
+    retry_started_at: std::time::Instant,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let mut last_floor: Option<std::time::Duration> = None;
-    let retry_start = std::time::Instant::now();
     let mut jitter = core::retry::SystemJitter;
 
     for attempt in 1..=config.max_retries {
@@ -2578,7 +2626,7 @@ async fn execute_with_retry(
         }
 
         // Check absolute timeout before each retry attempt
-        if retry_start.elapsed().as_millis() > config.absolute_timeout_ms as u128 {
+        if retry_started_at.elapsed().as_millis() > config.absolute_timeout_ms as u128 {
             return Err(RetryError::TimeoutExceeded(format!(
                 "absolute timeout of {}ms exceeded",
                 config.absolute_timeout_ms
@@ -2686,14 +2734,21 @@ async fn execute_with_retry(
                 return Ok(result);
             }
             Err(e) => {
+                // A genuine user Ctrl+C (the cancel token fired during the run)
+                // is surfaced as a clean cancel — not retried, not a failure.
+                if cancel_token.is_cancelled() {
+                    return Err(RetryError::Cancelled);
+                }
                 last_error = e.to_string();
                 // Capture the per-class floor (overload ~5s, rate-limit Retry-After,
                 // connection-reset ~2s) so the next backoff honours it.
                 last_floor = e.retryability().floor();
 
                 // Typed classification: provider/process errors decide retryability
-                // structurally, not by string matching.
-                if !e.retryability().is_retryable() {
+                // structurally, not by string matching. Internal cancellations
+                // (subprocess torn down mid-request while the user did not cancel)
+                // are transient when the provider is flaky and are retried here.
+                if !is_attempt_retryable(&e) {
                     tracing::error!("permanent error detected on iteration {iteration}: {e}");
                     logger.log_permanent_failure(attempt, &e.to_string());
                     return Err(RetryError::Permanent(e.to_string()));
@@ -3001,5 +3056,47 @@ mod finalize_prompt_tests {
         let append = "line1\n\nline2";
         let result = finalize_prompt(base, Some(append));
         assert!(result.contains("line1\n\nline2"));
+    }
+}
+
+#[cfg(test)]
+mod retry_classification_tests {
+    use super::is_attempt_retryable;
+    use std::path::PathBuf;
+    use velor_core::execution_service::error::{AgentExecutionError, ProcessError};
+
+    #[test]
+    fn provider_overload_is_retryable() {
+        // Retryable by classification — floors/floors aside, it must retry.
+        let e = AgentExecutionError::Process(ProcessError::Spawn {
+            executable: PathBuf::from("claude"),
+            source: std::io::Error::other("boom"),
+        });
+        assert!(is_attempt_retryable(&e));
+    }
+
+    #[test]
+    fn missing_executable_is_permanent() {
+        let e = AgentExecutionError::Process(ProcessError::ExecutableNotFound {
+            executable: PathBuf::from("claude-glm"),
+        });
+        assert!(
+            !is_attempt_retryable(&e),
+            "a missing binary must not be retried"
+        );
+    }
+
+    #[test]
+    fn internal_execution_cancel_is_retryable() {
+        // The bug: this classified as Permanent and killed a 10-hour run.
+        // It must now be retried (the user did not cancel).
+        assert!(is_attempt_retryable(&AgentExecutionError::Cancelled));
+    }
+
+    #[test]
+    fn internal_process_cancel_is_retryable() {
+        assert!(is_attempt_retryable(&AgentExecutionError::Process(
+            ProcessError::Cancelled
+        )));
     }
 }
