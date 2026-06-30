@@ -44,6 +44,12 @@ pub enum EntryKind {
     Error(String),
     /// A lifecycle/status line.
     Info(String),
+    /// A non-fatal warning surfaced inline in the transcript — e.g. a retryable
+    /// provider failure (overload / rate-limit) that Velor is backing off and
+    /// retrying. Unlike [`EntryKind::Error`] this renders in the main log (so the
+    /// user can see the run is retrying, not frozen) and flips the spinner to
+    /// "retrying".
+    Warning(String),
     /// A visual separator marking the start of a new Vel iteration. `number` is
     /// the 1-based iteration counter; `maximum` is the configured total, when one
     /// is meaningful. Dividers are derived from the run loop (not from an agent
@@ -427,9 +433,11 @@ fn bound_edit_input(input: serde_json::Value, max_lines: usize) -> serde_json::V
 /// Approximate retained byte cost of a kind (UTF-8 length of its stringy parts).
 fn approx_bytes(kind: &EntryKind) -> usize {
     match kind {
-        EntryKind::Text(s) | EntryKind::Thinking(s) | EntryKind::Error(s) | EntryKind::Info(s) => {
-            s.len()
-        }
+        EntryKind::Text(s)
+        | EntryKind::Thinking(s)
+        | EntryKind::Error(s)
+        | EntryKind::Info(s)
+        | EntryKind::Warning(s) => s.len(),
         EntryKind::ToolResult { detail, .. } => detail.len(),
         EntryKind::FileEdit(edit) => edit.approx_byte_size(),
         EntryKind::ToolCall {
@@ -468,7 +476,7 @@ fn logical_line_count(kind: &EntryKind) -> u64 {
             }
             n
         }
-        EntryKind::Error(s) | EntryKind::Info(s) => line_count(s).max(1),
+        EntryKind::Error(s) | EntryKind::Info(s) | EntryKind::Warning(s) => line_count(s).max(1),
         // A divider renders as exactly one logical line.
         EntryKind::IterationDivider { .. } => 1,
         EntryKind::Usage { .. } => 0,

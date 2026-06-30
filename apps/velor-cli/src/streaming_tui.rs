@@ -1156,6 +1156,14 @@ pub async fn run_streaming_tui(
                             }
                         }
                         EntryKind::Info(_) => {}
+                        EntryKind::Warning(_) => {
+                            // A retry/backoff is in flight — say so on the spinner
+                            // so a sustained provider outage doesn't read as "stuck
+                            // generating". The inline transcript entry carries the
+                            // reason (overload / rate-limit / attempt count).
+                            state.spinner_verb = "retrying";
+                            set_title("vel auto — retrying");
+                        }
                         // File edits render their own header/hunks; the surrounding
                         // ToolCall/ToolResult already drove the spinner verb.
                         EntryKind::FileEdit(_) => {}
@@ -1876,6 +1884,16 @@ fn render_entry(kind: &EntryKind, _width: usize, syntax: &Syntax) -> Vec<Line<'s
                 Line::from(vec![
                     Span::styled("ℹ️ ", Style::default().fg(Color::Cyan)),
                     Span::styled(l.to_string(), Style::default().fg(Color::Cyan)),
+                ])
+            })
+            .collect(),
+
+        EntryKind::Warning(msg) => msg
+            .lines()
+            .map(|l| {
+                Line::from(vec![
+                    Span::styled("⚠️ ", Style::default().fg(Color::Yellow)),
+                    Span::styled(l.to_string(), Style::default().fg(Color::Yellow)),
                 ])
             })
             .collect(),

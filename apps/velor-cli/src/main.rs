@@ -2582,6 +2582,31 @@ fn is_attempt_retryable(e: &core::execution_service::error::AgentExecutionError)
     )
 }
 
+/// A short, human-facing label for a retryable failure — shown on the TUI/stdout
+/// retry line so the user can see *why* Velor is backing off, without dumping the
+/// verbose classifier evidence.
+fn short_failure_reason(e: &core::execution_service::error::AgentExecutionError) -> &'static str {
+    use core::execution_service::error::{AgentExecutionError, ProcessError, ProviderErrorKind};
+
+    match e {
+        AgentExecutionError::Provider { error, .. } => match error.kind() {
+            ProviderErrorKind::Overloaded => "provider overloaded",
+            ProviderErrorKind::RateLimited => "provider rate-limited",
+            ProviderErrorKind::ConnectionReset => "connection reset",
+            ProviderErrorKind::Authentication => "provider auth failed",
+            ProviderErrorKind::ContextTooLarge => "context too large",
+            ProviderErrorKind::InvalidConfiguration => "invalid provider config",
+            ProviderErrorKind::Other => "provider error",
+        },
+        AgentExecutionError::Cancelled | AgentExecutionError::Process(ProcessError::Cancelled) => {
+            "subprocess interrupted"
+        }
+        AgentExecutionError::Process(ProcessError::TimedOut { .. }) => "subprocess timed out",
+        AgentExecutionError::Process(_) => "subprocess I/O error",
+        _ => "transient error",
+    }
+}
+
 /// Executes Claude with exponential backoff retry logic.
 ///
 /// # Errors
@@ -2765,6 +2790,21 @@ async fn execute_with_retry(
                     &e.to_string(),
                     &format!("{:?}", e.retryability()),
                 );
+
+                // Surface the retry in the TUI. The `println!` retry lines below
+                // are hidden by the TUI's alternate screen; without this, a
+                // sustained provider outage reads as a frozen "generating…"
+                // spinner — the run is retrying, just invisibly. The Warning entry
+                // also flips the spinner verb to "retrying".
+                if let Some(tx) = tui_tx {
+                    let _ = tx.try_send(streaming_tui::TuiMessage::Entry(
+                        streaming_tui::TuiEntry::now(streaming_tui::EntryKind::Warning(format!(
+                            "Attempt {attempt}/{} failed — {}. Backing off, retrying…",
+                            config.max_retries,
+                            short_failure_reason(&e),
+                        ))),
+                    ));
+                }
             }
         }
     }
