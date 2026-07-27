@@ -151,6 +151,18 @@ impl SyntaxKind {
             Self::PlainText => "",
         }
     }
+
+    /// Returns `true` for composite template languages whose highlighting
+    /// requires surrounding file context (an embedded `<script>`/`<style>` tag
+    /// determines the language mode of a hunk far below it). For these, the
+    /// adapter carries the full post-edit source on [`FileEdit`] so the
+    /// highlighter can parse whole-file state before clipping to a hunk.
+    ///
+    /// Plain languages return `false`; they highlight correctly line-by-line.
+    #[must_use]
+    pub const fn is_composite(self) -> bool {
+        matches!(self, Self::Svelte)
+    }
 }
 
 /// The nature of a captured file edit, for header/summary rendering.
@@ -190,6 +202,13 @@ pub struct FileEdit {
     /// Diff lines omitted to bound a very large edit (head + tail kept). Zero
     /// when nothing was dropped; the full diff remains in the run log.
     pub omitted_lines: u64,
+    /// The full post-edit source for composite languages (Svelte, Vue, Astro)
+    /// whose highlighting needs surrounding context — an embedded `<script>` tag
+    /// far above a diff hunk establishes the language mode for that hunk. Only
+    /// populated when [`SyntaxKind::is_composite`] is true and the new-side
+    /// bytes were available at capture time; `None` otherwise (plain languages
+    /// never need it). Bounded to [`DEFAULT_MAX_DIFF_LINES`].
+    pub full_new_source: Option<String>,
 }
 
 impl FileEdit {
@@ -343,7 +362,39 @@ pub fn compute_file_edit(
         kind,
         hunks,
         omitted_lines: omitted,
+        // Only composite template languages need whole-file context; for those
+        // we carry the new-side source (bounded) so the highlighter can resolve
+        // embedded `<script>`/`<style>` state before clipping to a diff hunk.
+        full_new_source: full_source_for(syntax, new),
     })
+}
+
+/// Returns the full new-side source for composite languages (so the renderer's
+/// highlighter can parse whole-file embedded-language state), or `None` for
+/// plain languages / missing / binary input. The source is bounded to
+/// [`DEFAULT_MAX_DIFF_LINES`] lines to cap durable-log + transcript memory.
+fn full_source_for(syntax: SyntaxKind, new: Option<&[u8]>) -> Option<String> {
+    if !syntax.is_composite() {
+        return None;
+    }
+    let bytes = new?;
+    if is_binary(bytes) {
+        return None;
+    }
+    let text = decode_text(bytes);
+    // Bound by line count to avoid carrying a multi-MB minified bundle on the
+    // event (the full diff already lives in the run log). Trailing content past
+    // the cap is dropped — the head carries the structural context that matters.
+    let cap = DEFAULT_MAX_DIFF_LINES;
+    let mut out = String::with_capacity(text.len().min(64 * 1024));
+    for (i, line) in text.lines().enumerate() {
+        if i >= cap {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 impl FileEditKind {

@@ -14,6 +14,7 @@ use std::sync::Arc;
 mod automations;
 mod cancellation;
 mod completion;
+mod highlight;
 mod plan;
 mod projects;
 mod run_logger;
@@ -167,7 +168,7 @@ struct CommonArgs {
     #[arg(long = "set", value_parser = parse_kv, action = ArgAction::Append)]
     set_vars: Vec<(String, String)>,
 
-    /// Override the agent binary to use (e.g. "claude", "claude-glm", or "codex")
+    /// Override the agent binary to use (e.g. "claude", "claude-glm", "codex", or "omp")
     #[arg(short, long, visible_alias = "bin", global = true)]
     pub binary: Option<String>,
 
@@ -348,7 +349,7 @@ const DEFAULT_VELOR_TOML: &str = r#"# Velor Agent CLI Configuration
 # Customise the values below to suit your project's needs.
 
 [defaults]
-# Agent provider: "claude" or "codex"
+# Agent provider: "claude", "codex", or "omp" (Oh My Pi)
 provider = "claude"
 
 # Default permission mode for Claude (accepts edit suggestions automatically)
@@ -377,6 +378,18 @@ skip_git_repo_check = true
 progress_cursor = false
 # Optional: low|medium|high|xhigh
 # model_reasoning_effort = "high"
+
+# Oh My Pi defaults (used when provider = "omp"). Velor drives `omp --mode rpc`
+# non-interactively, so auto_approve defaults to true. Only set the fields you
+# want to override.
+[defaults.omp]
+auto_approve = true
+# Optional model (omp fuzzy match, e.g. "opus", "gpt-5.2")
+# model = "gpt-5.2"
+# Optional thinking level: off|minimal|low|medium|high|xhigh|max|auto
+# thinking = "medium"
+# Optional hard session cap (e.g. "600", "10m", "1h")
+# max_time = "30m"
 
 # Global variables available to all prompt templates
 [vars]
@@ -933,7 +946,8 @@ fn finalize_prompt(prompt: &str, append_text: Option<&str>) -> String {
 /// Resolves the effective agent binary for the selected provider.
 ///
 /// If Codex is selected and the binary was not explicitly overridden, this
-/// falls back to `codex` instead of the Claude default binary.
+/// falls back to `codex`; if Oh My Pi is selected, it falls back to `omp`;
+/// otherwise the Claude default binary is used.
 fn resolve_agent_binary(common: &CommonArgs, defaults: &core::config::Defaults) -> String {
     if let Some(binary) = common.binary.clone() {
         return binary;
@@ -941,6 +955,10 @@ fn resolve_agent_binary(common: &CommonArgs, defaults: &core::config::Defaults) 
 
     if defaults.provider == core::config::AgentProvider::Codex && defaults.binary == "claude-glm" {
         return "codex".to_string();
+    }
+
+    if defaults.provider == core::config::AgentProvider::Omp && defaults.binary == "claude-glm" {
+        return "omp".to_string();
     }
 
     defaults.binary.clone()
@@ -1072,6 +1090,7 @@ async fn run_once(
         file_cfg.defaults.protocol,
         file_cfg.defaults.acp.clone(),
         file_cfg.defaults.codex.clone(),
+        file_cfg.defaults.omp.clone(),
     );
 
     if common.diagnose {
@@ -1315,6 +1334,7 @@ async fn run_auto(
         file_cfg.defaults.protocol,
         acp_config.clone(),
         file_cfg.defaults.codex.clone(),
+        file_cfg.defaults.omp.clone(),
     );
     tracing::info!("Runner created: {:?}", runner);
 

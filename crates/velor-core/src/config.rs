@@ -331,6 +331,9 @@ pub enum AgentProvider {
     Claude,
     /// OpenAI Codex CLI via JSON event stream.
     Codex,
+    /// Oh My Pi (`omp`) via its newline-delimited JSON RPC over stdio
+    /// (`omp --mode rpc`).
+    Omp,
 }
 
 /// Permission handling mode for ACP.
@@ -451,6 +454,48 @@ impl CodexConfig {
         effective.sandbox = "danger-full-access".to_string();
         effective.skip_git_repo_check = true;
         effective
+    }
+}
+
+/// Configuration for Oh My Pi (`omp --mode rpc`) execution mode.
+///
+/// `omp` speaks a newline-delimited JSON RPC over stdio; Velor drives it as a
+/// subprocess with streaming stdin (see [`crate::execution_service::adapters::omp`]).
+/// Only the most useful user-tunable flags are surfaced here; anything else can
+/// be passed through `extra_args` on the params struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OmpConfig {
+    /// Optional model override (`omp --model`, fuzzy match e.g. "opus", "gpt-5.2").
+    pub model: Option<String>,
+
+    /// Thinking level (`omp --thinking`): off, minimal, low, medium, high, xhigh, max, auto.
+    pub thinking: Option<String>,
+
+    /// Optional hard session-duration cap (`omp --max-time`, e.g. "600", "10m", "1h").
+    /// Independent of Velor's own [`ProcessTimeouts`]; acts as an in-process backstop.
+    pub max_time: Option<String>,
+
+    /// Auto-approve every tool call so autonomous runs never block on approval
+    /// prompts (`omp --auto-approve`). Defaults to `true` — Velor drives `omp`
+    /// non-interactively.
+    pub auto_approve: bool,
+
+    /// Use an isolated `omp` profile for auth/sessions/settings (`omp --profile`).
+    pub profile: Option<String>,
+}
+
+impl Default for OmpConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            thinking: None,
+            max_time: None,
+            // Velor always drives omp non-interactively over RPC; auto-approving
+            // tool calls is the only sane default for autonomous iterations.
+            auto_approve: true,
+            profile: None,
+        }
     }
 }
 
@@ -608,6 +653,10 @@ pub struct Defaults {
     #[serde(default)]
     pub codex: CodexConfig,
 
+    /// Oh My Pi configuration (only used when provider = "omp").
+    #[serde(default)]
+    pub omp: OmpConfig,
+
     /// Bounds for the streaming TUI live transcript.
     #[serde(default)]
     pub tui: TuiConfig,
@@ -723,6 +772,8 @@ impl Defaults {
             acp: overlay.acp,
             // For codex, overlay takes precedence
             codex: overlay.codex,
+            // For omp, overlay takes precedence
+            omp: overlay.omp,
             // TUI bounds: per-field overlay-wins.
             tui: self.tui.merge(overlay.tui),
         }

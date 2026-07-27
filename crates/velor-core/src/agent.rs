@@ -14,10 +14,11 @@ use std::process::Command;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{AcpConfig, AgentProvider, CodexConfig, Protocol};
+use crate::config::{AcpConfig, AgentProvider, CodexConfig, OmpConfig, Protocol};
 use crate::execution_service::adapters::acp::AcpParams;
 use crate::execution_service::adapters::claude::ClaudeParams;
 use crate::execution_service::adapters::codex::CodexParams;
+use crate::execution_service::adapters::omp::OmpParams;
 use crate::execution_service::error::AgentExecutionError;
 use crate::execution_service::service::{AgentProfile, shared_service};
 use crate::execution_service::supervisor::ProcessTimeouts;
@@ -146,6 +147,8 @@ pub enum AgentRunner {
     ClaudeAcp(AcpConfig),
     /// Codex CLI via `codex exec --json`.
     Codex(CodexConfig),
+    /// Oh My Pi CLI via `omp --mode rpc`.
+    Omp(OmpConfig),
 }
 
 impl AgentRunner {
@@ -157,15 +160,18 @@ impl AgentRunner {
     /// * `protocol` - The communication protocol to use
     /// * `acp_config` - ACP configuration (only used for Claude ACP)
     /// * `codex_config` - Codex configuration (only used for Codex provider)
+    /// * `omp_config` - Oh My Pi configuration (only used for the omp provider)
     #[must_use]
     pub fn from_config(
         provider: AgentProvider,
         protocol: Protocol,
         acp_config: AcpConfig,
         codex_config: CodexConfig,
+        omp_config: OmpConfig,
     ) -> Self {
         match provider {
             AgentProvider::Codex => Self::Codex(codex_config),
+            AgentProvider::Omp => Self::Omp(omp_config),
             AgentProvider::Claude => match protocol {
                 Protocol::Subprocess => Self::ClaudeSubprocess,
                 Protocol::Acp => Self::ClaudeAcp(acp_config),
@@ -192,6 +198,13 @@ impl AgentRunner {
     #[allow(dead_code)]
     pub const fn is_codex(&self) -> bool {
         matches!(self, Self::Codex(_))
+    }
+
+    /// Returns `true` if this is an Oh My Pi runner.
+    #[must_use]
+    #[allow(dead_code)]
+    pub const fn is_omp(&self) -> bool {
+        matches!(self, Self::Omp(_))
     }
 
     /// Builds the execution profile for this runner variant.
@@ -240,6 +253,16 @@ impl AgentRunner {
                 prompt_name: prompt_name.to_string(),
                 config: config.clone(),
                 working_directory: cwd.to_path_buf(),
+                cancellation,
+            }),
+            Self::Omp(config) => AgentProfile::Omp(OmpParams {
+                binary: binary.to_string(),
+                prompt: Bytes::copy_from_slice(prompt.as_bytes()),
+                working_directory: cwd.to_path_buf(),
+                config: config.clone(),
+                extra_args: Vec::new(),
+                extra_env: Vec::new(),
+                timeouts,
                 cancellation,
             }),
         }
@@ -493,7 +516,9 @@ pub fn require_claude_on_path(binary: &str) -> color_eyre::eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AcpConfig, AgentProvider, CodexConfig, PermissionMode, Protocol};
+    use crate::config::{
+        AcpConfig, AgentProvider, CodexConfig, OmpConfig, PermissionMode, Protocol,
+    };
 
     #[test]
     fn test_agent_runner_from_config_subprocess() {
@@ -502,6 +527,7 @@ mod tests {
             Protocol::Subprocess,
             AcpConfig::default(),
             CodexConfig::default(),
+            OmpConfig::default(),
         );
         assert!(runner.is_subprocess());
         assert!(!runner.is_acp());
@@ -519,6 +545,7 @@ mod tests {
             Protocol::Acp,
             acp_config,
             CodexConfig::default(),
+            OmpConfig::default(),
         );
         assert!(runner.is_acp());
         assert!(!runner.is_subprocess());
@@ -531,8 +558,21 @@ mod tests {
             Protocol::Subprocess,
             AcpConfig::default(),
             CodexConfig::default(),
+            OmpConfig::default(),
         );
         assert!(runner.is_codex());
+    }
+
+    #[test]
+    fn test_agent_runner_from_config_omp() {
+        let runner = AgentRunner::from_config(
+            AgentProvider::Omp,
+            Protocol::Subprocess,
+            AcpConfig::default(),
+            CodexConfig::default(),
+            OmpConfig::default(),
+        );
+        assert!(runner.is_omp());
     }
 
     #[test]
@@ -542,6 +582,7 @@ mod tests {
             Protocol::Subprocess,
             AcpConfig::default(),
             CodexConfig::default(),
+            OmpConfig::default(),
         );
         let _cloned = runner.clone();
     }
