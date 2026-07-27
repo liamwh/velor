@@ -579,6 +579,8 @@ fn capture_failed(path: &str, reason: String) -> FileEdit {
         kind: FileEditKind::CaptureFailed { reason },
         hunks: Vec::new(),
         omitted_lines: 0,
+        // No source to highlight for a capture failure.
+        full_new_source: None,
     }
 }
 

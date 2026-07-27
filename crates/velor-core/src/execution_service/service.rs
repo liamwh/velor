@@ -20,6 +20,7 @@ use crate::execution_service::adapter::{AgentAdapter, AgentEventSink, AgentSinkE
 use crate::execution_service::adapters::acp::{AcpAdapter, AcpParams};
 use crate::execution_service::adapters::claude::{ClaudeParams, ClaudeSubprocessAdapter};
 use crate::execution_service::adapters::codex::{CodexParams, CodexSubprocessAdapter};
+use crate::execution_service::adapters::omp::{OmpParams, OmpSubprocessAdapter};
 use crate::execution_service::error::AgentExecutionError;
 use crate::execution_service::policy::{
     CircuitBreaker, CircuitBreakerConfig, ConcurrencyLimit, is_transient_upstream,
@@ -38,6 +39,8 @@ pub enum AgentProfile {
     Codex(CodexParams),
     /// ACP over stdio (`!Send`).
     Acp(AcpParams),
+    /// Oh My Pi `omp --mode rpc`.
+    Omp(OmpParams),
 }
 
 impl AgentProfile {
@@ -48,6 +51,7 @@ impl AgentProfile {
             Self::Claude(p) => &p.cancellation,
             Self::Codex(p) => &p.cancellation,
             Self::Acp(p) => &p.cancellation,
+            Self::Omp(p) => &p.cancellation,
         }
     }
 
@@ -58,6 +62,7 @@ impl AgentProfile {
             Self::Claude(p) => p.prompt.len(),
             Self::Codex(p) => p.prompt.len(),
             Self::Acp(p) => p.prompt.len(),
+            Self::Omp(p) => p.prompt.len(),
         }
     }
 
@@ -68,12 +73,13 @@ impl AgentProfile {
             Self::Claude(p) => &p.binary,
             Self::Codex(p) => &p.binary,
             Self::Acp(p) => &p.binary,
+            Self::Omp(p) => &p.binary,
         }
     }
 
     /// Returns the static capabilities advertised by this profile. Claude reports
-    /// live steering only when its streaming path is enabled; Codex and ACP do
-    /// not support live steering.
+    /// live steering only when its streaming path is enabled; Codex, ACP, and omp
+    /// do not support live steering.
     #[must_use]
     pub fn capabilities(&self) -> crate::execution_service::capabilities::AgentCapabilities {
         use crate::execution_service::capabilities::AgentCapabilities;
@@ -85,7 +91,7 @@ impl AgentProfile {
                     AgentCapabilities::none()
                 }
             }
-            Self::Codex(_) | Self::Acp(_) => AgentCapabilities::none(),
+            Self::Codex(_) | Self::Acp(_) | Self::Omp(_) => AgentCapabilities::none(),
         }
     }
 
@@ -109,6 +115,10 @@ impl AgentProfile {
                 p.cancellation = cancellation;
                 Self::Acp(p)
             }
+            Self::Omp(mut p) => {
+                p.cancellation = cancellation;
+                Self::Omp(p)
+            }
         }
     }
 }
@@ -119,6 +129,7 @@ fn build_adapter(profile: AgentProfile) -> Box<dyn AgentAdapter> {
         AgentProfile::Claude(params) => Box::new(ClaudeSubprocessAdapter::new(params)),
         AgentProfile::Codex(params) => Box::new(CodexSubprocessAdapter::new(params)),
         AgentProfile::Acp(params) => Box::new(AcpAdapter::new(params)),
+        AgentProfile::Omp(params) => Box::new(OmpSubprocessAdapter::new(params)),
     }
 }
 

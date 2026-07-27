@@ -29,12 +29,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, ThemeSet};
-use syntect::parsing::SyntaxSet;
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::highlight::theme::token_style;
+use crate::highlight::token::{SemanticSpan, SemanticToken};
+use crate::highlight::{HighlightEngine, HighlightRequest};
 use crate::tui_transcript::{
     self, LiveEntry, RowMeter, ScrollState, Transcript, TuiLimits, Viewport,
 };
@@ -847,7 +847,7 @@ struct LayoutCache {
     map: HashMap<CacheKey, CachedLayout>,
     order: VecDeque<CacheKey>,
     capacity: usize,
-    syntax: Syntax,
+    engine: HighlightEngine,
     /// Entries rendered since construction (cache misses). Instrumented so tests
     /// can assert per-frame work is bounded by the viewport, not total history.
     renders: usize,
@@ -859,7 +859,7 @@ impl LayoutCache {
             map: HashMap::new(),
             order: VecDeque::new(),
             capacity,
-            syntax: Syntax::new(),
+            engine: HighlightEngine::new(),
             renders: 0,
         }
     }
@@ -874,7 +874,7 @@ impl LayoutCache {
             width,
         };
         if !self.map.contains_key(&key) {
-            let rows = build_layout(&entry.kind, entry.ts, width, &self.syntax);
+            let rows = build_layout(&entry.kind, entry.ts, width, &mut self.engine);
             self.insert(key.clone(), CachedLayout { rows });
             self.renders += 1;
         }
@@ -922,9 +922,9 @@ fn build_layout(
     kind: &EntryKind,
     ts: DateTime<Local>,
     width: u16,
-    syntax: &Syntax,
+    engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
-    let content_lines = render_entry(kind, width as usize, syntax);
+    let content_lines = render_entry(kind, width as usize, engine);
     // Dividers read as a clean full-width rule; file edits render their own
     // gutter and must skip the timestamp so wrapped rows align under the source.
     let no_timestamp = matches!(
@@ -1012,65 +1012,11 @@ fn flush_span_buf(
 }
 
 // ── Syntax highlighting ─────────────────────────────────────────────────────
-
-struct Syntax {
-    set: SyntaxSet,
-    theme: syntect::highlighting::Theme,
-}
-
-impl Syntax {
-    fn new() -> Self {
-        Self {
-            set: SyntaxSet::load_defaults_newlines(),
-            theme: ThemeSet::load_defaults().themes["base16-ocean.dark"].clone(),
-        }
-    }
-
-    /// Highlights one source line into owned ratatui spans, mapping syntect's
-    /// per-token foreground directly to `Color::Rgb` (no ANSI escapes). The
-    /// syntax set and theme are loaded once per [`LayoutCache`] and reused, so
-    /// this never rebuilds them.
-    fn highlight_line(&self, syntax_name: &str, line: &str) -> Vec<Span<'static>> {
-        let syntax = self
-            .set
-            .find_syntax_by_extension(syntax_name)
-            .or_else(|| self.set.find_syntax_by_name(syntax_name))
-            .unwrap_or_else(|| self.set.find_syntax_plain_text());
-        let mut h = HighlightLines::new(syntax, &self.theme);
-        let regions = h.highlight_line(line, &self.set).unwrap_or_default();
-        regions
-            .iter()
-            .map(|(style, text)| {
-                Span::styled((*text).to_string(), syntect_style_to_ratatui(*style))
-            })
-            .collect()
-    }
-}
-
-/// Converts a syntect [`syntect::highlighting::Style`] into a ratatui
-/// [`Style`], preserving foreground colour and bold/italic/underline. A default
-/// (unspecified) foreground maps to no foreground so the terminal default shows.
-fn syntect_style_to_ratatui(style: syntect::highlighting::Style) -> Style {
-    let mut out = Style::default();
-    let fg = style.foreground;
-    if fg.a != 0 {
-        out = out.fg(Color::Rgb(fg.r, fg.g, fg.b));
-    }
-    let mut mods = Modifier::empty();
-    if style.font_style.contains(FontStyle::BOLD) {
-        mods |= Modifier::BOLD;
-    }
-    if style.font_style.contains(FontStyle::ITALIC) {
-        mods |= Modifier::ITALIC;
-    }
-    if style.font_style.contains(FontStyle::UNDERLINE) {
-        mods |= Modifier::UNDERLINED;
-    }
-    if !mods.is_empty() {
-        out = out.add_modifier(mods);
-    }
-    out
-}
+//
+// The highlight engine (`crate::highlight`) classifies source into semantic
+// tokens; this module composes those tokens with diff/gutter styling. The engine
+// is owned by `LayoutCache` and built once; see `crate::highlight` for the
+// provider architecture (syntect for ~14 languages, tree-sitter for Svelte).
 
 fn expand_tabs(s: &str) -> String {
     s.replace('\t', &" ".repeat(TAB_WIDTH))
@@ -1777,7 +1723,11 @@ fn fmt_tokens(n: u64) -> String {
 
 // ── Per-entry rendering (content lines, pre-wrap) ────────────────────────────
 
-fn render_entry(kind: &EntryKind, _width: usize, syntax: &Syntax) -> Vec<Line<'static>> {
+fn render_entry(
+    kind: &EntryKind,
+    _width: usize,
+    engine: &mut HighlightEngine,
+) -> Vec<Line<'static>> {
     match kind {
         EntryKind::Text(text) => text
             .lines()
@@ -1902,7 +1852,7 @@ fn render_entry(kind: &EntryKind, _width: usize, syntax: &Syntax) -> Vec<Line<'s
             vec![render_iteration_divider(*number, *maximum, _width)]
         }
 
-        EntryKind::FileEdit(edit) => render_file_edit(edit, _width, syntax),
+        EntryKind::FileEdit(edit) => render_file_edit(edit, _width, engine),
     }
 }
 
@@ -1972,7 +1922,11 @@ fn line_number_width(edit: &FileEdit) -> usize {
 /// diff lines with syntax highlighting and diff styling. Binary and
 /// capture-failed edits render a concise note instead of hunks. Wrapping +
 /// hanging-indent alignment is applied later in [`build_layout`].
-fn render_file_edit(edit: &FileEdit, _width: usize, syntax: &Syntax) -> Vec<Line<'static>> {
+fn render_file_edit(
+    edit: &FileEdit,
+    _width: usize,
+    engine: &mut HighlightEngine,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Header: icon + path (kind-coloured) + optional status suffix.
@@ -2017,8 +1971,20 @@ fn render_file_edit(edit: &FileEdit, _width: usize, syntax: &Syntax) -> Vec<Line
             ]));
         }
         FileEditKind::Modified | FileEditKind::Created | FileEditKind::Deleted => {
-            let hint = edit.syntax.syntect_hint();
             let num_width = line_number_width(edit);
+            // Highlighting strategy:
+            // - Composite languages (Svelte) need whole-file embedded-language
+            //   state (a `<script lang="ts">` tag far above a hunk establishes
+            //   its mode). We highlight the full source once and clip each diff
+            //   line's spans to its byte range — so isolated hunks still get TS
+            //   / CSS classifications they'd otherwise lose.
+            // - Plain languages also benefit from stateful highlighting across
+            //   the full source (block comments, raw strings, embedded JS in
+            //   HTML), so we use the same path when full source is available.
+            // - When no full source is carried (plain-language modifications
+            //   where only hunks were captured), highlight per-line from the
+            //   hunk text — line-oriented grammars still classify well enough.
+            let highlighted = HighlightedEdit::build(engine, edit);
             for (i, hunk) in edit.hunks.iter().enumerate() {
                 if i > 0
                     && let Some(gap) = inter_hunk_gap(edit.hunks.get(i - 1), hunk)
@@ -2026,7 +1992,7 @@ fn render_file_edit(edit: &FileEdit, _width: usize, syntax: &Syntax) -> Vec<Line
                     lines.push(dim_line(format!("  ⋯ {gap} lines ⋯")));
                 }
                 for dl in &hunk.lines {
-                    lines.push(render_diff_line(dl, num_width, hint, syntax));
+                    lines.push(render_diff_line(dl, num_width, &highlighted, engine));
                 }
             }
             if edit.omitted_lines > 0 {
@@ -2052,13 +2018,230 @@ fn header_style(kind: &FileEditKind) -> (Color, Option<&'static str>) {
     }
 }
 
+/// Pre-highlighted source for one file edit, used to render every diff line in
+/// that edit from a single whole-file parse (so embedded-language state — a
+/// `<script lang="ts">` tag above a hunk — is established before clipping).
+///
+/// Two modes:
+/// - **Full-source** (composite languages, or when the adapter carried
+///   `full_new_source`): the whole file was highlighted once; each diff line
+///   slices its byte range out of that result. State-correct for Svelte etc.
+/// - **Per-line fallback** (plain-language modifications with no carried
+///   source): each line is highlighted in isolation. Line-oriented grammars
+///   (Rust, Python, …) still classify well; only multi-line constructs (block
+///   comments, raw strings) lose state, which is the pre-existing behaviour.
+enum HighlightedEdit {
+    /// Whole-file spans over `source`. Diff lines slice by byte range.
+    Full {
+        source: String,
+        spans: Vec<SemanticSpan>,
+        kind: velor_core::file_edit::SyntaxKind,
+    },
+    /// No carried source; highlight each line independently.
+    PerLine {
+        kind: velor_core::file_edit::SyntaxKind,
+    },
+}
+
+impl HighlightedEdit {
+    /// Highlights the edit's source once. Composite languages always use the
+    /// full-source path (their `full_new_source` is populated by the adapter);
+    /// plain languages use it too when available, else fall back to per-line.
+    fn build(engine: &mut HighlightEngine, edit: &FileEdit) -> Self {
+        if let Some(source) = edit.full_new_source.as_deref() {
+            let spans = engine.highlight(&HighlightRequest::full(edit.syntax, source));
+            Self::Full {
+                source: source.to_string(),
+                spans,
+                kind: edit.syntax,
+            }
+        } else {
+            Self::PerLine { kind: edit.syntax }
+        }
+    }
+
+    /// The syntax kind (used by the per-line fallback path).
+    const fn kind(&self) -> velor_core::file_edit::SyntaxKind {
+        match self {
+            Self::Full { kind, .. } | Self::PerLine { kind } => *kind,
+        }
+    }
+
+    /// Returns the `(content, foreground_style)` spans for one diff line,
+    /// expanding tabs to spaces for display. The caller applies the diff
+    /// background tint independently (foreground only here).
+    fn spans_for_line(
+        &self,
+        dl: &DiffLine,
+        expanded: &str,
+        engine: &mut HighlightEngine,
+    ) -> Vec<(String, Style)> {
+        match self {
+            Self::Full { source, spans, .. } => {
+                if let Some(range) = Self::line_range(source, dl) {
+                    return Self::render_spans(spans, range, source, expanded);
+                }
+                // Line not found in carried source (e.g. a removal of a line
+                // that no longer exists in the new file): fall back to an
+                // isolated highlight of the line text so it still gets colour.
+                Self::isolated_line(engine, self.kind(), expanded)
+            }
+            Self::PerLine { .. } => Self::isolated_line(engine, self.kind(), expanded),
+        }
+    }
+
+    /// Locates a diff line's raw byte range in the full source by 1-based new
+    /// line number. Returns `None` for removals whose old-only line isn't in the
+    /// new source (caller falls back to isolated highlighting).
+    fn line_range(source: &str, dl: &DiffLine) -> Option<std::ops::Range<usize>> {
+        // Prefer the new-file line number (the carried source is the new side).
+        let lineno = dl.new_no.or(dl.old_no)?; // 1-based
+        if lineno == 0 {
+            return None;
+        }
+        let mut start = 0usize;
+        for (i, line) in source.split_inclusive('\n').enumerate() {
+            let end = start + line.len();
+            // split_inclusive keeps the terminator; line i is 0-based, lineno is 1-based.
+            if i + 1 == lineno {
+                // The diff line text has its terminator stripped; match the
+                // body (terminator-free) range so spans line up with `expanded`.
+                let body_end = start + strip_term(line).len();
+                return Some(start..body_end);
+            }
+            start = end;
+        }
+        None
+    }
+
+    /// Slices the pre-highlighted `spans` to `range`, then re-segments against
+    /// the tab-expanded display text so spans line up with the rendered columns.
+    /// Returns `(content, foreground_style)` pairs.
+    fn render_spans(
+        spans: &[SemanticSpan],
+        range: std::ops::Range<usize>,
+        source: &str,
+        expanded: &str,
+    ) -> Vec<(String, Style)> {
+        // Collect clipped spans localised to this line's body range.
+        let local: Vec<(std::ops::Range<usize>, SemanticToken)> = spans
+            .iter()
+            .filter_map(|s| {
+                if s.end <= range.start || s.start >= range.end {
+                    return None;
+                }
+                let start = s.start.max(range.start) - range.start;
+                let end = s.end.min(range.end) - range.start;
+                if start >= end {
+                    None
+                } else {
+                    Some((start..end, s.token))
+                }
+            })
+            .collect();
+
+        let raw_body = source.get(range).unwrap_or("");
+        let mut out: Vec<(String, Style)> = Vec::new();
+        let mut cursor = 0usize;
+        for (lr, token) in local {
+            // Fill any gap before this span (unhighlighted text) — expanded.
+            if lr.start > cursor
+                && let Some(slice) = raw_body.get(cursor..lr.start)
+            {
+                let e = slice.replace('\t', &" ".repeat(TAB_WIDTH));
+                if !e.is_empty() {
+                    out.push((e, Style::default()));
+                }
+            }
+            if let Some(slice) = raw_body.get(lr.start..lr.end) {
+                let e = slice.replace('\t', &" ".repeat(TAB_WIDTH));
+                let style = token_style(token);
+                if !e.is_empty() {
+                    out.push((e, style));
+                }
+            }
+            cursor = lr.end;
+        }
+        // Trailing unhighlighted tail.
+        if cursor < raw_body.len()
+            && let Some(slice) = raw_body.get(cursor..)
+        {
+            let e = slice.replace('\t', &" ".repeat(TAB_WIDTH));
+            if !e.is_empty() {
+                out.push((e, Style::default()));
+            }
+        }
+        // If nothing was classified, emit the whole expanded line as one span.
+        if out.is_empty() && !expanded.is_empty() {
+            out.push((expanded.to_string(), Style::default()));
+        }
+        out
+    }
+
+    /// Fallback: highlight a single line in isolation. Used when no full source
+    /// is available or a removal line isn't present in the new-file source.
+    fn isolated_line(
+        engine: &mut HighlightEngine,
+        kind: velor_core::file_edit::SyntaxKind,
+        line: &str,
+    ) -> Vec<(String, Style)> {
+        let spans = engine.highlight(&HighlightRequest::full(kind, line));
+        let mut out: Vec<(String, Style)> = Vec::new();
+        let mut cursor = 0usize;
+        for s in &spans {
+            if s.start > cursor
+                && let Some(slice) = line.get(cursor..s.start)
+            {
+                let e = slice.replace('\t', &" ".repeat(TAB_WIDTH));
+                if !e.is_empty() {
+                    out.push((e, Style::default()));
+                }
+            }
+            if let Some(slice) = line.get(s.start..s.end) {
+                let e = slice.replace('\t', &" ".repeat(TAB_WIDTH));
+                let style = token_style(s.token);
+                if !e.is_empty() {
+                    out.push((e, style));
+                }
+            }
+            cursor = s.end;
+        }
+        if cursor < line.len()
+            && let Some(slice) = line.get(cursor..)
+        {
+            let e = slice.replace('\t', &" ".repeat(TAB_WIDTH));
+            if !e.is_empty() {
+                out.push((e, Style::default()));
+            }
+        }
+        if out.is_empty() && !line.is_empty() {
+            out.push((line.to_string(), Style::default()));
+        }
+        out
+    }
+}
+
+/// Strips a trailing line terminator (CR/LF) from a slice, mirroring how diff
+/// lines store terminator-free source text.
+fn strip_term(s: &str) -> &str {
+    s.trim_end_matches(['\n', '\r'])
+}
+
 /// Renders one diff line: a stable gutter (sign + line number + separator)
-/// followed by syntax-highlighted source. Style precedence — selection/focus is
-/// not applicable in the transcript, so: diff treatment (sign colour + line
-/// background tint) overrides, then syntax token foreground, then default. Added
-/// and removed lines keep their syntax foreground but gain a background tint so
-/// they stay distinguishable; context lines keep syntax foreground only.
-fn render_diff_line(dl: &DiffLine, num_width: usize, hint: &str, syntax: &Syntax) -> Line<'static> {
+/// followed by syntax-highlighted source.
+///
+/// **Composition contract** (the load-bearing fix): syntax highlighting owns the
+/// **foreground only**; diff state owns the **background only**. The token style
+/// from [`token_style`] is merged with the diff tint via [`Style::patch`], which
+/// sets background without touching foreground — so syntax colours survive on
+/// added/removed lines instead of being washed out by the green/red tint. The
+/// gutter (sign + line number + separator) is styled independently.
+fn render_diff_line(
+    dl: &DiffLine,
+    num_width: usize,
+    highlighted: &HighlightedEdit,
+    engine: &mut HighlightEngine,
+) -> Line<'static> {
     let (sign, sign_color, tint) = match dl.kind {
         LineKind::Context => (" ", Color::DarkGray, None),
         LineKind::Addition => ("+", Color::Green, Some(Color::Rgb(20, 40, 20))),
@@ -2071,13 +2254,21 @@ fn render_diff_line(dl: &DiffLine, num_width: usize, hint: &str, syntax: &Syntax
         None => " ".repeat(num_width),
     };
 
-    let mut source = syntax.highlight_line(hint, &expand_tabs(&dl.text));
-    if let Some(bg) = tint {
-        source = source
-            .into_iter()
-            .map(|s| Span::styled(s.content, s.style.bg(bg)))
-            .collect();
-    }
+    let expanded = expand_tabs(&dl.text);
+    let source_spans = highlighted.spans_for_line(dl, &expanded, engine);
+    // Apply the diff tint as a *background* only: merge each span's foreground
+    // token style with the tinted background. Style::patch keeps fg + modifiers
+    // from the left side and only fills in bg from the right.
+    let source: Vec<Span<'static>> = source_spans
+        .into_iter()
+        .map(|(content, fg_style)| {
+            let mut style = fg_style;
+            if let Some(bg) = tint {
+                style = style.bg(bg);
+            }
+            Span::styled(content, style)
+        })
+        .collect();
 
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -2659,9 +2850,9 @@ mod render_tests {
 
     #[test]
     fn file_edit_layout_has_gutter_syntax_and_diff_styles() {
-        let syntax = Syntax::new();
+        let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::FileEdit(Box::new(one_line_replacement_edit()));
-        let rows = build_layout(&kind, Local::now(), 80, &syntax);
+        let rows = build_layout(&kind, Local::now(), 80, &mut engine);
         assert!(!rows.is_empty());
 
         // Flatten spans, checking for ANSI escapes and gathering evidence of
@@ -2710,7 +2901,7 @@ mod render_tests {
 
     #[test]
     fn file_edit_wrapped_continuation_aligns_under_source() {
-        let syntax = Syntax::new();
+        let mut engine = crate::highlight::HighlightEngine::new();
         // A created file with one very long line so it wraps at a narrow width.
         let long = format!("fn long() {{ /* {} */ }}", "x".repeat(200));
         let edit = velor_core::file_edit::compute_file_edit(
@@ -2721,7 +2912,7 @@ mod render_tests {
         )
         .expect("created edit");
         let kind = EntryKind::FileEdit(Box::new(edit));
-        let rows = build_layout(&kind, Local::now(), 40, &syntax);
+        let rows = build_layout(&kind, Local::now(), 40, &mut engine);
 
         // rows[0] = header; rows[1] = first (guttered) row of the added line;
         // rows[2..] = wrapped continuation rows.
@@ -2777,5 +2968,294 @@ mod render_tests {
         assert!(all.contains("src/lib.rs"), "file path header is rendered");
         assert!(all.contains('+'), "addition marker is rendered");
         assert!(all.contains('-'), "removal marker is rendered");
+    }
+
+    // ── Svelte highlighting (composition + state preservation) ───────────────
+
+    /// A representative Svelte 5 component exercising every construct the task
+    /// requires: `<script lang="ts">`, imports, types/generics, runes
+    /// (`$state`/`$derived`/`$derived.by`/`$effect`/`$props`), control blocks
+    /// (`{#if}`/`{#each}`/`{#await}`/`{:else}`/`{@const}`/`{@render}`), a
+    /// snippet, directives (`bind:`/`class:`/`on:`), props, HTML, `<style>`
+    /// CSS, and a trailing malformed fragment representative of a live diff.
+    const SVELTE5_FIXTURE: &str = "\
+<script lang=\"ts\">
+  import { onMount } from 'svelte';
+  import type { Snippet } from 'svelte';
+
+  interface Item<T> {
+    id: number;
+    label: string;
+    data: T;
+  }
+
+  let { items = [], header }: { items: Item<string>[]; header: Snippet } = $props();
+  let count = $state(0);
+  let selected = $state<Item<string> | null>(null);
+  let total = $derived(items.length);
+  let first = $derived.by(() => items[0]?.id ?? 0);
+  let greeting = `hello #${count}`;
+
+  $effect(() => {
+    console.log('count is', count);
+  });
+
+  onMount(() => { count = 1; });
+
+  function pick(item: Item<string>): void {
+    selected = item;
+  }
+</script>
+
+{#if items.length > 0}
+  <ul>
+    {#each items as item, i (item.id)}
+      {@const upper = item.label.toUpperCase()}
+      <li
+        class:active={selected?.id === item.id}
+        on:click={() => pick(item)}
+        bind:data-idx={i}
+      >
+        {@render header({ item, upper })}
+        <span>{item.label}</span>
+      </li>
+    {/each}
+  </ul>
+{:else}
+  {#await loadBackup() then backup}
+    <p>{backup}</p>
+  {/await}
+{/if}
+
+<style>
+  .active {
+    color: red;
+    padding: 4px;
+    font-weight: bold;
+  }
+  ul > li {
+    margin: 0;
+  }
+</style>
+<div class=\"malformed attribute=\
+";
+
+    /// A Svelte edit where a hunk sits *inside* the `<script lang=\"ts\">` block
+    /// (so it carries no `<script>` tag itself) — the regression case that
+    /// isolated per-line highlighting could never classify correctly.
+    fn svelte_script_hunk_edit() -> velor_core::file_edit::FileEdit {
+        let old = format!(
+            "<script lang=\"ts\">\n  let count = $state(0);\n  let name = 'world';\n</script>\n\n<p>hi</p>\n",
+        );
+        let new = format!(
+            "<script lang=\"ts\">\n  let count = $state(0);\n  let name = $derived('hello');\n</script>\n\n<p>hi</p>\n",
+        );
+        velor_core::file_edit::compute_file_edit(
+            "src/Comp.svelte",
+            Some(old.as_bytes()),
+            Some(new.as_bytes()),
+            velor_core::file_edit::DEFAULT_MAX_DIFF_LINES,
+        )
+        .expect("a real change produces an edit")
+    }
+
+    #[test]
+    fn svelte_edit_carries_full_source() {
+        // The adapter must populate `full_new_source` for composite languages
+        // so the highlighter can resolve embedded-language state.
+        let edit = svelte_script_hunk_edit();
+        assert_eq!(edit.syntax, velor_core::file_edit::SyntaxKind::Svelte);
+        assert!(
+            edit.full_new_source.is_some(),
+            "Svelte edits carry the full new-side source"
+        );
+        let src = edit.full_new_source.as_deref().unwrap();
+        assert!(src.contains("<script lang=\"ts\">"));
+        assert!(src.contains("$derived"));
+    }
+
+    #[test]
+    fn plain_edit_does_not_carry_full_source() {
+        // Plain languages don't need it; the field stays None.
+        let edit = one_line_replacement_edit();
+        assert_eq!(edit.syntax, velor_core::file_edit::SyntaxKind::Rust);
+        assert!(
+            edit.full_new_source.is_none(),
+            "Rust edits do not carry full source"
+        );
+    }
+
+    #[test]
+    fn svelte_hunk_inside_script_is_highlighted() {
+        // The critical regression test: a diff line inside `<script lang="ts">`
+        // (no script tag in the hunk) must still get TS classifications,
+        // because the engine parsed the whole carried source for state.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let edit = svelte_script_hunk_edit();
+        let highlighted = HighlightedEdit::build(&mut engine, &edit);
+
+        // Find the addition line (the `$derived` line) and render its spans.
+        let added = edit
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .find(|l| l.kind == LineKind::Addition && l.text.contains("$derived"))
+            .expect("an added $derived line exists");
+
+        let expanded = expand_tabs(&added.text);
+        let spans = highlighted.spans_for_line(added, &expanded, &mut engine);
+
+        // `$derived` must be classified as a function, not left as plain text —
+        // this is exactly what the pre-fix HTML-grammar path could not do.
+        let rune_classified = spans
+            .iter()
+            .any(|(content, style)| content.contains("$derived") && style.fg.is_some());
+        assert!(
+            rune_classified,
+            "$derived rune must receive a foreground colour: {spans:?}"
+        );
+
+        // And `'hello'` should be a string.
+        let string_classified = spans
+            .iter()
+            .any(|(content, style)| content.contains('\'') && style.fg.is_some());
+        assert!(
+            string_classified,
+            "the 'hello' string must be coloured: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn added_line_background_preserves_syntax_foreground() {
+        // The composition invariant: on an added line, a syntax-coloured span
+        // must carry BOTH a non-None foreground (syntax) AND the green tint
+        // background (diff). Neither side clobbers the other.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let edit = svelte_script_hunk_edit();
+        let highlighted = HighlightedEdit::build(&mut engine, &edit);
+        let num_width = line_number_width(&edit);
+
+        let added = edit
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .find(|l| l.kind == LineKind::Addition && l.text.contains("$derived"))
+            .expect("an added $derived line exists");
+        let line = render_diff_line(added, num_width, &highlighted, &mut engine);
+
+        // Find a span covering a syntax token on the added line and assert it
+        // has both fg (syntax) and the addition bg tint.
+        let addition_bg = Color::Rgb(20, 40, 20);
+        let has_composed = line.spans.iter().any(|s| {
+            s.style.bg == Some(addition_bg) && s.style.fg.is_some() && !s.content.trim().is_empty()
+        });
+        assert!(
+            has_composed,
+            "added line must preserve syntax fg under the diff bg tint: {:?}",
+            line.spans
+        );
+    }
+
+    #[test]
+    fn removed_line_background_preserves_syntax_foreground() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let edit = svelte_script_hunk_edit();
+        let highlighted = HighlightedEdit::build(&mut engine, &edit);
+        let num_width = line_number_width(&edit);
+
+        let removed = edit
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .find(|l| l.kind == LineKind::Removal)
+            .expect("a removed line exists");
+        let line = render_diff_line(removed, num_width, &highlighted, &mut engine);
+
+        let removal_bg = Color::Rgb(40, 20, 20);
+        // At least some non-empty content on the removal line carries the bg.
+        let has_bg = line
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(removal_bg) && !s.content.trim().is_empty());
+        assert!(has_bg, "removed line carries the red bg tint");
+    }
+
+    #[test]
+    fn context_line_keeps_syntax_foreground_without_diff_bg() {
+        // Context lines have no diff tint; syntax foreground shows alone.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let edit = svelte_script_hunk_edit();
+        let highlighted = HighlightedEdit::build(&mut engine, &edit);
+        let num_width = line_number_width(&edit);
+
+        let ctx = edit
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .find(|l| l.kind == LineKind::Context)
+            .expect("a context line exists");
+        let line = render_diff_line(ctx, num_width, &highlighted, &mut engine);
+        // No source span on a context line should carry a diff bg tint.
+        let source_spans = &line.spans;
+        assert!(
+            source_spans.iter().all(|s| !matches!(
+                s.style.bg,
+                Some(Color::Rgb(20, 40, 20) | Color::Rgb(40, 20, 20))
+            )),
+            "context lines carry no diff background"
+        );
+    }
+
+    #[test]
+    fn svelte_full_fixture_renders_without_panic() {
+        // The representative Svelte 5 fixture (including the malformed trailing
+        // snippet) must render end-to-end without panicking.
+        let edit = velor_core::file_edit::compute_file_edit(
+            "src/Full.svelte",
+            None,
+            Some(SVELTE5_FIXTURE.as_bytes()),
+            velor_core::file_edit::DEFAULT_MAX_DIFF_LINES,
+        )
+        .expect("fixture produces an edit");
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let _rows = build_layout(
+            &EntryKind::FileEdit(Box::new(edit)),
+            Local::now(),
+            100,
+            &mut engine,
+        );
+        // Reaching here = no panic on the full Svelte 5 construct set.
+    }
+
+    #[test]
+    fn svelte_full_fixture_classifies_runes_and_ts() {
+        // Highlight the whole Svelte 5 fixture directly through the engine and
+        // assert the headline classifications hold across the full construct set.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let spans = engine.highlight(&HighlightRequest::full(
+            velor_core::file_edit::SyntaxKind::Svelte,
+            SVELTE5_FIXTURE,
+        ));
+        let token_at = |needle: &str| -> Option<SemanticToken> {
+            let idx = SVELTE5_FIXTURE.find(needle)?;
+            spans
+                .iter()
+                .find(|s| s.start <= idx && idx < s.end)
+                .map(|s| s.token)
+        };
+        // Runes are functions.
+        assert_eq!(token_at("$state"), Some(SemanticToken::Function));
+        assert_eq!(token_at("$derived"), Some(SemanticToken::Function));
+        assert_eq!(token_at("$effect"), Some(SemanticToken::Function));
+        assert_eq!(token_at("$props"), Some(SemanticToken::Function));
+        // TS types and keywords inside lang="ts".
+        assert_eq!(token_at("interface"), Some(SemanticToken::Keyword));
+        assert_eq!(token_at("number"), Some(SemanticToken::Type));
+        // Strings and numbers.
+        assert_eq!(token_at("'count is'"), Some(SemanticToken::String));
+        // HTML/Svelte attributes/directives. `token_at` finds the first
+        // substring match, so the needles must land inside the intended token.
+        assert_eq!(token_at("on:click"), Some(SemanticToken::Attribute));
+        assert_eq!(token_at("bind:data-idx"), Some(SemanticToken::Attribute));
     }
 }

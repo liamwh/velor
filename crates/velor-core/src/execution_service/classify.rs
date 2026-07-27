@@ -38,6 +38,8 @@ pub enum ProviderKind {
     Claude,
     /// Codex (`codex exec --json`).
     Codex,
+    /// Oh My Pi (`omp --mode rpc`). Errors surface as structured RPC failures.
+    Omp,
 }
 
 /// Where a classification decision found its evidence.

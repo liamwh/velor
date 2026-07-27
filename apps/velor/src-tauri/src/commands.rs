@@ -592,12 +592,16 @@ async fn run_execution_task(
     if merged.defaults.provider == velor_core::AgentProvider::Codex && binary == "claude-glm" {
         binary = "codex".to_string();
     }
+    if merged.defaults.provider == velor_core::AgentProvider::Omp && binary == "claude-glm" {
+        binary = "omp".to_string();
+    }
 
     let runner = AgentRunner::from_config(
         merged.defaults.provider,
         merged.defaults.protocol,
         merged.defaults.acp.clone(),
         merged.defaults.codex.clone(),
+        merged.defaults.omp.clone(),
     );
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
@@ -606,6 +610,8 @@ async fn run_execution_task(
     let event_execution_id = execution_id.clone();
     let provider_name = if merged.defaults.provider == velor_core::AgentProvider::Codex {
         "codex"
+    } else if merged.defaults.provider == velor_core::AgentProvider::Omp {
+        "omp"
     } else {
         "claude"
     }
