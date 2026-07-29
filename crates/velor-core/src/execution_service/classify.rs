@@ -298,29 +298,48 @@ fn classify_text(
     None
 }
 
-/// Extracts a `Retry-After` value from known textual forms only. Accepts:
-/// `Retry-After: <secs>`, `retry_after: <secs>`, `retry_after_ms: <ms>`. Never
+/// Known `Retry-After`-shaped keys, most-specific (milliseconds) first so a
+/// `..._ms` key is never mistaken for its seconds sibling. Matched anywhere in
+/// the text (not just at line start) since some tools — e.g. `omp`'s
+/// `tracing`-style structured logs — append `key=value` fields after a
+/// human-readable message rather than emitting them on their own line, e.g.
+/// `Original error: 429 {...} retry-after-ms=12313000`.
+const RETRY_AFTER_MS_KEYS: &[&str] = &["retry-after-ms", "retry_after_ms"];
+const RETRY_AFTER_SECS_KEYS: &[&str] = &["retry-after", "retry_after"];
+
+/// Extracts a `Retry-After` value from known textual forms only, e.g.
+/// `Retry-After: 30`, `retry_after=30`, `retry-after-ms=12313000`. The
+/// separator may be `:` or `=`, with optional surrounding whitespace. Never
 /// extracts arbitrary numbers from prose.
 fn parse_retry_after(text: &str) -> Option<Duration> {
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        let value = if let Some(rest) = lower.strip_prefix("retry-after:") {
-            rest.trim()
-        } else if let Some(rest) = lower.strip_prefix("retry_after:") {
-            rest.trim()
-        } else {
+    let lower = text.to_ascii_lowercase();
+    if let Some(ms) = find_retry_after_value(&lower, RETRY_AFTER_MS_KEYS) {
+        return Some(Duration::from_millis(ms));
+    }
+    if let Some(secs) = find_retry_after_value(&lower, RETRY_AFTER_SECS_KEYS) {
+        return Some(Duration::from_secs(secs));
+    }
+    None
+}
+
+/// Finds the first `key(:|=)\s*<digits>` occurrence for any of `keys` in
+/// `lower` (already lowercased), returning the parsed number.
+fn find_retry_after_value(lower: &str, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        let Some(key_pos) = lower.find(key) else {
             continue;
         };
-        if let Ok(secs) = value.parse::<u64>() {
-            return Some(Duration::from_secs(secs));
-        }
-    }
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("retry_after_ms:")
-            && let Ok(ms) = rest.trim().parse::<u64>()
-        {
-            return Some(Duration::from_millis(ms));
+        let rest = lower[key_pos + key.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('=')) else {
+            continue;
+        };
+        let digits: String = rest
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(value) = digits.parse::<u64>() {
+            return Some(value);
         }
     }
     None
@@ -503,6 +522,28 @@ mod tests {
         );
         // Arbitrary numbers in prose must not be extracted.
         assert_eq!(parse_retry_after("please wait 30 seconds"), None);
+    }
+
+    #[test]
+    fn retry_after_matches_omp_trailing_key_value_field() {
+        // omp's tracing-style structured error appends `key=value` fields after
+        // a human-readable message, e.g.:
+        //   Error: Retry failed after 1 attempts: Provider requested 12313000ms
+        //   wait, exceeds retry.maxDelayMs (300000ms). Original error: 429
+        //   {"type":"error","error":{...}} retry-after-ms=12313000
+        let text = "Original error: 429 {\"type\":\"error\"} retry-after-ms=12313000";
+        assert_eq!(
+            parse_retry_after(text),
+            Some(Duration::from_millis(12_313_000))
+        );
+    }
+
+    #[test]
+    fn retry_after_equals_form() {
+        assert_eq!(
+            parse_retry_after("retry_after=45"),
+            Some(Duration::from_secs(45))
+        );
     }
 
     #[test]
