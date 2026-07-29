@@ -632,7 +632,9 @@ pub struct Defaults {
     pub backoff_floor: Option<HumantimeDuration>,
 
     /// Per-attempt idle deadline: no agent output for this long terminates the
-    /// attempt (e.g. "3m"). Optional.
+    /// attempt (e.g. "3m"). Optional; when unset, `vel`'s `auto`/`run` commands
+    /// fall back to a 10-minute idle timeout so a hung subprocess can't block a
+    /// run forever with no feedback — set this to override that default.
     #[serde(default)]
     pub idle_timeout: Option<HumantimeDuration>,
 

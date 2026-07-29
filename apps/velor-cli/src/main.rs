@@ -1159,16 +1159,29 @@ fn emit_diagnostic(
     Ok(())
 }
 
+/// Idle deadline applied when `idle_timeout` is unset in config: without
+/// *some* bound, an agent subprocess that hangs mid-request (rather than
+/// exiting with a classifiable error — observed with `omp` under sustained
+/// provider throttling) blocks the run forever with zero feedback, the exact
+/// failure mode `auto` mode exists to survive. 10 minutes is long enough not
+/// to false-positive on a slow-but-working silent tool call (a big build, a
+/// long test suite) and short enough that a genuine hang is caught and
+/// retried — via `auto` mode's now-unbounded backoff loop — well before a
+/// human watching would think to intervene.
+const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Builds per-attempt process deadlines from config (idle/total/grace), with a
 /// 5 s termination grace default. Used to bound agent invocations so a hung
-/// provider request cannot block forever.
+/// provider request cannot block forever. `idle` falls back to
+/// [`DEFAULT_IDLE_TIMEOUT`] when not configured; set `idle_timeout` explicitly
+/// in `velor.toml` to override.
 fn process_timeouts_from_defaults(
     d: &core::config::Defaults,
 ) -> core::execution_service::supervisor::ProcessTimeouts {
     core::execution_service::supervisor::ProcessTimeouts {
         startup: None,
         stdin_write: None,
-        idle: d.idle_timeout.map(|t| t.get()),
+        idle: Some(d.idle_timeout.map_or(DEFAULT_IDLE_TIMEOUT, |t| t.get())),
         total: d.attempt_timeout.map(|t| t.get()),
         termination_grace: d
             .termination_grace
@@ -2643,14 +2656,25 @@ struct AutoLoopResult {
 /// Whether [`execute_with_retry`] should make another attempt after `e`.
 ///
 /// Provider-classified and process-I/O failures defer to their typed
-/// [`core::execution_service::error::Retryability`]. The one override is
-/// *internal* cancellation: an
-/// [`core::execution_service::error::AgentExecutionError::Cancelled`] (or the
-/// underlying process [`core::execution_service::error::ProcessError::Cancelled`])
-/// produced when the subprocess is torn down mid-request — often while the
-/// provider is flaky — is transient and worth retrying. Without this, a single
-/// internal teardown would classify as a permanent failure and kill a long
-/// unattended run that had been retrying happily for hours.
+/// [`core::execution_service::error::Retryability`]. Two overrides exist,
+/// both because [`core::execution_service::error::ProcessError::retryability`]
+/// is deliberately conservative at the process layer and defers the "is this
+/// actually fatal" call to the retry driver here (see its doc comment):
+///
+/// - *Internal* cancellation: an
+///   [`core::execution_service::error::AgentExecutionError::Cancelled`] (or the
+///   underlying process [`core::execution_service::error::ProcessError::Cancelled`])
+///   produced when the subprocess is torn down mid-request — often while the
+///   provider is flaky — is transient and worth retrying. Without this, a single
+///   internal teardown would classify as a permanent failure and kill a long
+///   unattended run that had been retrying happily for hours.
+/// - A Velor-owned deadline
+///   ([`core::execution_service::error::ProcessError::TimedOut`], e.g. the
+///   default idle timeout in [`process_timeouts_from_defaults`]) firing means
+///   the subprocess produced no output for too long — most often a hung
+///   provider request under sustained throttling, exactly the condition
+///   `auto` mode exists to survive — so it is retried rather than treated as
+///   fatal.
 ///
 /// Genuine user cancellation never reaches here: the cancel token is checked
 /// first and surfaces as [`RetryError::Cancelled`].
@@ -2662,7 +2686,9 @@ fn is_attempt_retryable(e: &core::execution_service::error::AgentExecutionError)
     }
     matches!(
         e,
-        AgentExecutionError::Cancelled | AgentExecutionError::Process(ProcessError::Cancelled)
+        AgentExecutionError::Cancelled
+            | AgentExecutionError::Process(ProcessError::Cancelled)
+            | AgentExecutionError::Process(ProcessError::TimedOut { .. })
     )
 }
 
@@ -3322,6 +3348,18 @@ mod retry_classification_tests {
     fn internal_process_cancel_is_retryable() {
         assert!(is_attempt_retryable(&AgentExecutionError::Process(
             ProcessError::Cancelled
+        )));
+    }
+
+    #[test]
+    fn idle_timeout_is_retryable() {
+        // A hung subprocess (no output for the idle deadline — the default
+        // safety net added so `auto` mode doesn't sit silently forever) must
+        // be retried, not treated as a fatal, permanent failure.
+        assert!(is_attempt_retryable(&AgentExecutionError::Process(
+            ProcessError::TimedOut {
+                which: velor_core::execution_service::error::TimeoutKind::Idle,
+            }
         )));
     }
 }
