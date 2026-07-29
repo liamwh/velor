@@ -2691,6 +2691,84 @@ fn short_failure_reason(e: &core::execution_service::error::AgentExecutionError)
     }
 }
 
+/// Formats `wait` from now as a human wall-clock ETA in the user's local time,
+/// e.g. `07:58:53 CEST (in 3h 25m)`. Providers (e.g. z.ai) report usage-window
+/// resets in their own timezone (often UTC+8), which is meaningless at a
+/// glance — converting to local time lets the user tell at a glance when
+/// `auto` mode will resume real work.
+///
+/// Resolves the system's IANA zone (e.g. `Europe/Amsterdam`) via
+/// `iana-time-zone` so the abbreviation reflects the correct DST offset for
+/// the target date (`CEST` in summer, `CET` in winter), falling back to a
+/// numeric UTC offset if the zone can't be resolved (e.g. `TZ` unset in a
+/// minimal container).
+fn format_resume_eta(wait: std::time::Duration) -> String {
+    let target = chrono::Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default();
+    let clock = iana_time_zone::get_timezone()
+        .ok()
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
+        .map(|tz| target.with_timezone(&tz).format("%H:%M:%S %Z").to_string())
+        .unwrap_or_else(|| {
+            target
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S %z")
+                .to_string()
+        });
+    format!("{clock} ({})", humanize_duration(wait))
+}
+
+/// Renders a duration as `in <h>h <m>m` / `in <m>m <s>s` / `in <s>s`, coarse
+/// enough for a human ETA (no sub-second precision).
+fn humanize_duration(d: std::time::Duration) -> String {
+    let total_secs = d.as_secs();
+    let (h, m, s) = (total_secs / 3600, (total_secs % 3600) / 60, total_secs % 60);
+    if h > 0 {
+        format!("in {h}h {m}m")
+    } else if m > 0 {
+        format!("in {m}m {s}s")
+    } else {
+        format!("in {s}s")
+    }
+}
+
+#[cfg(test)]
+mod resume_eta_tests {
+    use super::*;
+
+    #[test]
+    fn humanize_duration_picks_coarsest_useful_unit() {
+        assert_eq!(
+            humanize_duration(std::time::Duration::from_secs(45)),
+            "in 45s"
+        );
+        assert_eq!(
+            humanize_duration(std::time::Duration::from_secs(125)),
+            "in 2m 5s"
+        );
+        assert_eq!(
+            humanize_duration(std::time::Duration::from_secs(3 * 3600 + 25 * 60 + 13)),
+            "in 3h 25m"
+        );
+    }
+
+    #[test]
+    fn format_resume_eta_includes_humanized_duration_and_a_clock_time() {
+        let wait = std::time::Duration::from_secs(3 * 3600 + 25 * 60);
+        let eta = format_resume_eta(wait);
+        assert!(
+            eta.ends_with("(in 3h 25m)"),
+            "expected a humanized duration suffix, got {eta:?}"
+        );
+        // A clock time (HH:MM:SS) should precede the duration, regardless of
+        // whether the local IANA zone resolved to a named abbreviation or a
+        // numeric UTC offset fallback.
+        assert!(
+            eta.chars().filter(|c| *c == ':').count() >= 2,
+            "expected an HH:MM:SS clock time, got {eta:?}"
+        );
+    }
+}
+
 /// Executes Claude with exponential backoff retry logic.
 ///
 /// # Errors
@@ -2743,11 +2821,24 @@ async fn execute_with_retry(
         }
         if attempt > 1 {
             let delay = policy.delay(attempt, &mut jitter, last_floor);
-            let secs = delay.as_secs_f64();
-            println!(
-                "⏳ Retrying attempt {attempt}/{} for iteration {iteration} after {secs:.1}s...",
-                config.max_retries
-            );
+            // Below ~30s a countdown in seconds is more useful than a clock
+            // time; above it (typically a provider-mandated wait — a rate-limit
+            // or usage-window reset) show the actual local resume time so an
+            // unattended run's ETA is legible at a glance.
+            if delay >= std::time::Duration::from_secs(30) {
+                println!(
+                    "⏳ Retrying attempt {attempt}/{} for iteration {iteration} — provider says \
+                     wait until {}...",
+                    config.max_retries,
+                    format_resume_eta(delay)
+                );
+            } else {
+                let secs = delay.as_secs_f64();
+                println!(
+                    "⏳ Retrying attempt {attempt}/{} for iteration {iteration} after {secs:.1}s...",
+                    config.max_retries
+                );
+            }
             tokio::time::sleep(delay).await;
 
             // Check again after sleep
@@ -2881,9 +2972,19 @@ async fn execute_with_retry(
                 // spinner — the run is retrying, just invisibly. The Warning entry
                 // also flips the spinner verb to "retrying".
                 if let Some(tx) = tui_tx {
+                    // When the floor exceeds `policy.max`, the next delay is
+                    // deterministically exactly that floor (the jittered part is
+                    // always <= policy.max in that case), so the resume time can
+                    // be stated precisely rather than as a lower bound.
+                    let eta_suffix = match last_floor {
+                        Some(floor) if floor > policy.max => {
+                            format!(" Provider says wait until {}.", format_resume_eta(floor))
+                        }
+                        _ => String::new(),
+                    };
                     let _ = tx.try_send(streaming_tui::TuiMessage::Entry(
                         streaming_tui::TuiEntry::now(streaming_tui::EntryKind::Warning(format!(
-                            "Attempt {attempt}/{} failed — {}. Backing off, retrying…",
+                            "Attempt {attempt}/{} failed — {}.{eta_suffix} Backing off, retrying…",
                             config.max_retries,
                             short_failure_reason(&e),
                         ))),

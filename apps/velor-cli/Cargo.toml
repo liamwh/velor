@@ -57,8 +57,10 @@ secrecy = { workspace = true }
 rpassword = "7.3"
 atty = "0.2"
 
-# Timezone support (for automations)
+# Timezone support (for automations, and for rendering provider-supplied
+# retry/reset times in the user's local zone in `auto` mode)
 chrono-tz = { workspace = true }
+iana-time-zone = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

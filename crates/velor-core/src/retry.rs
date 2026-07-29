@@ -225,8 +225,13 @@ impl Default for BackoffPolicy {
 impl BackoffPolicy {
     /// Computes the delay before `attempt` (1-based; attempt 1 is the initial run
     /// and is never delayed). The cap is `min(max, initial * multiplier^(attempt-2))`;
-    /// the delay is uniform in `[floor, cap]`, then raised to `retry_after` if
-    /// larger.
+    /// the delay is uniform in `[floor, cap]`. A provider-supplied `retry_after`
+    /// (e.g. a rate-limit reset time) then raises the delay further if larger —
+    /// deliberately *not* re-clamped to `max` afterwards: `max` bounds our own
+    /// jittered guess, but an explicit provider-mandated wait (which can be
+    /// hours, e.g. a usage-window reset) is authoritative and must be honoured
+    /// in full, or `auto` mode would hammer an already-throttled provider every
+    /// `max` seconds instead of waiting out the real reset window.
     #[must_use]
     pub fn delay(
         &self,
@@ -238,11 +243,14 @@ impl BackoffPolicy {
         let capped = (self.initial.as_secs_f64() * exp).min(self.max.as_secs_f64());
         let cap = Duration::from_secs_f64(capped);
         let hi = cap.max(self.floor);
-        let mut delay = jitter.in_range(self.floor, hi);
-        if let Some(retry_after) = retry_after {
-            delay = delay.max(retry_after);
+        let delay = jitter
+            .in_range(self.floor, hi)
+            .min(self.max)
+            .max(self.floor);
+        match retry_after {
+            Some(retry_after) => delay.max(retry_after),
+            None => delay,
         }
-        delay.min(self.max).max(self.floor)
     }
 }
 
@@ -375,6 +383,27 @@ mod tests {
             d,
             Duration::from_secs(7),
             "Retry-After should override the jittered floor"
+        );
+    }
+
+    #[test]
+    fn backoff_policy_retry_after_can_exceed_max() {
+        // A provider-mandated wait (e.g. a multi-hour usage-window reset) must
+        // be honoured in full, not clamped back down to `policy.max` — otherwise
+        // `auto` mode would hammer an already-throttled provider every `max`
+        // seconds instead of waiting out the real reset window.
+        let policy = BackoffPolicy::default();
+        assert!(policy.max < Duration::from_secs(3 * 3600));
+        let mut jitter = FixedJitter(Duration::from_secs(1000));
+        let d = policy.delay(
+            2,
+            &mut jitter,
+            Some(Duration::from_secs(3 * 3600 + 25 * 60)),
+        );
+        assert_eq!(
+            d,
+            Duration::from_secs(3 * 3600 + 25 * 60),
+            "a retry_after beyond policy.max must not be clamped down"
         );
     }
 
