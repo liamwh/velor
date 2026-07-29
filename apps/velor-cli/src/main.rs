@@ -2048,9 +2048,13 @@ async fn run_auto_loop(
     let mut previous_iteration_completed = false;
     // Anchor for the per-iteration absolute timeout (`retry_config.absolute_timeout_ms`,
     // default 5 hours). `None` until the iteration's first attempt; persists across
-    // crash-recovery `continue`s (same iteration) and is cleared when the iteration
-    // advances, so a single stuck iteration is bounded by the configured budget
-    // instead of looping forever through crash recovery with a reset clock.
+    // crash-recovery `continue`s of the same iteration so a burst of rapid
+    // failures is bounded. It is reset to `None` (fresh budget) both when the
+    // iteration advances AND whenever a retry/timeout/empty-output cycle is
+    // caused by provider throttling — `auto` mode's whole purpose is to survive
+    // temporary, time-based rate limiting, so waiting out an outage must never
+    // by itself end the run. Only a genuinely `Permanent` error (bad config,
+    // auth) stops the loop.
     let mut iteration_retry_started_at: Option<std::time::Instant> = None;
     // Consecutive iterations whose agent run exited cleanly but produced NO
     // assistant output (empty stdout). This is a degenerate provider turn —
@@ -2058,8 +2062,10 @@ async fn run_auto_loop(
     // `usage{input:0, output:0}` and exits 0 — so it is neither an error nor a
     // completion. Without a guard the loop spawns a fresh agent every few
     // seconds and runs away (hundreds/thousands of no-op iterations, no
-    // backoff). We back off and retry the SAME iteration, then stop once the
-    // streak exceeds `empty_output_limit` (ties to the configured retry budget).
+    // backoff). We back off and retry the SAME iteration forever; the backoff
+    // delay plateaus at `backoff_policy.max` once `consecutive_empty_iterations`
+    // passes `empty_output_limit`, so it never gives up, it just stops
+    // escalating and settles into a steady, low-frequency poll.
     let mut consecutive_empty_iterations: u32 = 0;
     let empty_output_limit = retry_config.max_retries.max(3);
     let mut empty_backoff_jitter = core::retry::SystemJitter;
@@ -2265,11 +2271,6 @@ async fn run_auto_loop(
                         "permanent failure on iteration {current_iteration}: {e}"
                     ));
                 }
-                Err(RetryError::TimeoutExceeded(e)) => {
-                    return Err(color_eyre::eyre::eyre!(
-                        "timeout exceeded on iteration {current_iteration}: {e}"
-                    ));
-                }
                 Err(RetryError::Cancelled) => {
                     println!("\n🛑 Cancelled by user during iteration {current_iteration}");
                     return Ok(AutoLoopResult {
@@ -2281,16 +2282,27 @@ async fn run_auto_loop(
                         output: final_output,
                     });
                 }
-                Err(RetryError::Retryable(e)) => {
+                // `Retryable` (max_retries exhausted) and `TimeoutExceeded` (the
+                // absolute per-iteration budget elapsed) are handled identically:
+                // a sustained provider outage — rate limiting, 529s — is exactly
+                // what unattended `auto` mode exists to survive, so neither ends
+                // the run. Reset the retry clock for a fresh budget and keep
+                // retrying the same iteration forever. Only a `Permanent` error
+                // (returned earlier, above) stops the loop.
+                Err(RetryError::Retryable(e)) | Err(RetryError::TimeoutExceeded(e)) => {
                     println!("⚠️  All retries exhausted for iteration {current_iteration}");
                     println!("📝 Preserving context for crash recovery...");
-                    println!("💡 The iteration will be retried with previous context prepended.");
+                    println!(
+                        "💡 The iteration will be retried indefinitely with previous context \
+                         prepended until the provider recovers."
+                    );
 
                     history.add(
                         current_iteration,
                         &rendered_prompt,
                         &format!("<FAILED: {e}>"),
                     );
+                    iteration_retry_started_at = None;
                     continue; // Retry same iteration
                 }
             }
@@ -2299,30 +2311,40 @@ async fn run_auto_loop(
         // Runaway guard: the agent exited cleanly (Ok) but produced no assistant
         // output at all. See the note on `consecutive_empty_iterations` above —
         // without this, a provider that returns empty turns while still exiting 0
-        // makes the loop advance forever. Back off and retry the same iteration;
-        // stop once the streak exceeds the limit so a persistent provider outage
-        // fails fast instead of spinning up fresh agents by the thousand.
+        // makes the loop spin hot. Back off and retry the same iteration
+        // *forever* — `BackoffPolicy::delay`'s cap is `min(max, ...)`, so the
+        // delay plateaus at `backoff_policy.max` past `empty_output_limit`
+        // attempts instead of growing without bound, and we never give up: a
+        // provider that is throttling (e.g. HTTP 529) recovers on its own given
+        // enough time, which is the entire premise of unattended `auto` mode.
         if iteration_output.trim().is_empty() {
             consecutive_empty_iterations += 1;
-            if consecutive_empty_iterations > empty_output_limit {
-                return Err(color_eyre::eyre::eyre!(
-                    "agent produced no output for {consecutive_empty_iterations} consecutive \
-                     iterations — the provider is likely throttling or erroring, but the agent \
-                     process still exits 0. Stopping to avoid a runaway loop."
-                ));
-            }
             let delay = backoff_policy.delay(
                 consecutive_empty_iterations,
                 &mut empty_backoff_jitter,
                 None,
             );
-            println!(
-                "⚠️  Iteration {current_iteration} produced no agent output (provider may be \
-                 throttling); backing off for {:.1}s and retrying the same iteration \
-                 ({consecutive_empty_iterations}/{empty_output_limit})…",
-                delay.as_secs_f64()
-            );
+            if consecutive_empty_iterations == empty_output_limit + 1 {
+                println!(
+                    "⚠️  Agent has produced no output for {consecutive_empty_iterations} \
+                     consecutive iterations — provider looks throttled or overloaded (e.g. \
+                     HTTP 529). Settling into a steady {:.0}s poll and retrying indefinitely \
+                     until it recovers.",
+                    backoff_policy.max.as_secs_f64()
+                );
+            } else {
+                println!(
+                    "⚠️  Iteration {current_iteration} produced no agent output (provider may be \
+                     throttling); backing off for {:.1}s and retrying the same iteration \
+                     ({consecutive_empty_iterations} consecutive so far)…",
+                    delay.as_secs_f64()
+                );
+            }
             tokio::time::sleep(delay).await;
+            // Waiting out an outage shouldn't consume the iteration's execution
+            // budget — reset it so `absolute_timeout_ms` only bounds actual
+            // failed attempts, not time spent idling for provider recovery.
+            iteration_retry_started_at = None;
             continue; // retry same iteration with backoff; do NOT advance
         }
         consecutive_empty_iterations = 0;
