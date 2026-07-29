@@ -2105,7 +2105,11 @@ async fn run_auto_loop(
 
         // Check for force cancellation at the start of each iteration
         if cancel_handler.is_cancelled() {
-            println!("\n🛑 Force quit by user (Ctrl+C twice)");
+            emit_status(
+                tui_tx,
+                true,
+                "Force quit by user (Ctrl+C twice)".to_string(),
+            );
             return Ok(AutoLoopResult {
                 status: RunStatus::Cancelled,
                 stop_reason: StopReason::ForceCancelled,
@@ -2120,7 +2124,8 @@ async fn run_auto_loop(
         let should_stop_after_this = cancel_handler.stop_after_iteration_requested();
 
         // Surface the iteration counter to the TUI status line (or stdout when
-        // running without a TUI).
+        // running without a TUI). The TUI derives its own iteration divider
+        // from `SetIteration`, so the plain-text divider below is stdout-only.
         if let Some(tx) = tui_tx {
             let _ = tx.try_send(streaming_tui::TuiMessage::SetIteration {
                 current: current_iteration,
@@ -2128,11 +2133,15 @@ async fn run_auto_loop(
             });
         } else {
             println!("🔁 Iteration {current_iteration}/{iterations}");
+            println!("────────────────────────────────────────");
         }
         if should_stop_after_this {
-            println!("⚠️  Stopping after this iteration (stop requested via `s` key)");
+            emit_status(
+                tui_tx,
+                true,
+                "Stopping after this iteration (stop requested via `s` key)".to_string(),
+            );
         }
-        println!("────────────────────────────────────────");
 
         // Render prompt with context if crash recovery is active
         let rendered_prompt = if !history.is_empty() {
@@ -2187,9 +2196,14 @@ async fn run_auto_loop(
                 Err(e) => {
                     // Treat as retryable error
                     let msg = format!("ACP iteration failed: {e}");
-                    println!("⚠️  All retries exhausted for iteration {current_iteration}");
-                    println!("📝 Preserving context for crash recovery...");
-                    println!("💡 The iteration will be retried with previous context prepended.");
+                    emit_status(
+                        tui_tx,
+                        true,
+                        format!(
+                            "All retries exhausted for iteration {current_iteration} — {msg}. \
+                             Preserving context for crash recovery and retrying."
+                        ),
+                    );
 
                     history.add(
                         current_iteration,
@@ -2285,7 +2299,11 @@ async fn run_auto_loop(
                     ));
                 }
                 Err(RetryError::Cancelled) => {
-                    println!("\n🛑 Cancelled by user during iteration {current_iteration}");
+                    emit_status(
+                        tui_tx,
+                        true,
+                        format!("Cancelled by user during iteration {current_iteration}"),
+                    );
                     return Ok(AutoLoopResult {
                         status: RunStatus::Cancelled,
                         stop_reason: StopReason::Cancelled,
@@ -2303,11 +2321,14 @@ async fn run_auto_loop(
                 // retrying the same iteration forever. Only a `Permanent` error
                 // (returned earlier, above) stops the loop.
                 Err(RetryError::Retryable(e)) | Err(RetryError::TimeoutExceeded(e)) => {
-                    println!("⚠️  All retries exhausted for iteration {current_iteration}");
-                    println!("📝 Preserving context for crash recovery...");
-                    println!(
-                        "💡 The iteration will be retried indefinitely with previous context \
-                         prepended until the provider recovers."
+                    emit_status(
+                        tui_tx,
+                        true,
+                        format!(
+                            "All retries exhausted for iteration {current_iteration} — {e}. \
+                             Preserving context for crash recovery; retrying indefinitely until \
+                             the provider recovers."
+                        ),
                     );
 
                     history.add(
@@ -2338,19 +2359,27 @@ async fn run_auto_loop(
                 None,
             );
             if consecutive_empty_iterations == empty_output_limit + 1 {
-                println!(
-                    "⚠️  Agent has produced no output for {consecutive_empty_iterations} \
-                     consecutive iterations — provider looks throttled or overloaded (e.g. \
-                     HTTP 529). Settling into a steady {:.0}s poll and retrying indefinitely \
-                     until it recovers.",
-                    backoff_policy.max.as_secs_f64()
+                emit_status(
+                    tui_tx,
+                    true,
+                    format!(
+                        "Agent has produced no output for {consecutive_empty_iterations} \
+                         consecutive iterations — provider looks throttled or overloaded (e.g. \
+                         HTTP 529). Settling into a steady {:.0}s poll and retrying indefinitely \
+                         until it recovers.",
+                        backoff_policy.max.as_secs_f64()
+                    ),
                 );
             } else {
-                println!(
-                    "⚠️  Iteration {current_iteration} produced no agent output (provider may be \
-                     throttling); backing off for {:.1}s and retrying the same iteration \
-                     ({consecutive_empty_iterations} consecutive so far)…",
-                    delay.as_secs_f64()
+                emit_status(
+                    tui_tx,
+                    true,
+                    format!(
+                        "Iteration {current_iteration} produced no agent output (provider may be \
+                         throttling); backing off for {:.1}s and retrying the same iteration \
+                         ({consecutive_empty_iterations} consecutive so far)…",
+                        delay.as_secs_f64()
+                    ),
                 );
             }
             tokio::time::sleep(delay).await;
@@ -2368,20 +2397,25 @@ async fn run_auto_loop(
         // Success - clear history and continue
         if !history.is_empty() {
             let failure_reasons = history.get_failure_reasons();
-            if failure_reasons.is_empty() {
-                println!("✅ Crash recovery successful for iteration {current_iteration}");
+            let msg = if failure_reasons.is_empty() {
+                format!("Crash recovery successful for iteration {current_iteration}")
             } else {
-                println!(
-                    "✅ Crash recovery successful for iteration {current_iteration} (previous failure: {})",
+                format!(
+                    "Crash recovery successful for iteration {current_iteration} (previous failure: {})",
                     failure_reasons.join(", ")
-                );
-            }
+                )
+            };
+            emit_status(tui_tx, false, msg);
         }
         history.clear();
 
         if iteration_output.contains(complete_token) {
             if previous_iteration_completed {
-                println!("✅ Completion token seen in consecutive iterations, exiting.");
+                emit_status(
+                    tui_tx,
+                    false,
+                    "Completion token seen in consecutive iterations, exiting.".to_string(),
+                );
                 return Ok(AutoLoopResult {
                     status: RunStatus::Completed,
                     stop_reason: StopReason::Completed,
@@ -2391,8 +2425,11 @@ async fn run_auto_loop(
                     output: final_output,
                 });
             } else {
-                println!(
-                    "⏳ Completion token found - one more consecutive iteration needed to stop."
+                emit_status(
+                    tui_tx,
+                    false,
+                    "Completion token found - one more consecutive iteration needed to stop."
+                        .to_string(),
                 );
                 previous_iteration_completed = true;
             }
@@ -2403,7 +2440,11 @@ async fn run_auto_loop(
         // Check if a stop-after-iteration was requested (the `s` key in the TUI).
         let should_stop_after_this = cancel_handler.stop_after_iteration_requested();
         if should_stop_after_this {
-            println!("✅ Stop requested: stopping after iteration {current_iteration}");
+            emit_status(
+                tui_tx,
+                false,
+                format!("Stop requested: stopping after iteration {current_iteration}"),
+            );
             cancel_handler.clear_stop_after_iteration();
             return Ok(AutoLoopResult {
                 status: RunStatus::Cancelled,
@@ -2692,6 +2733,40 @@ fn is_attempt_retryable(e: &core::execution_service::error::AgentExecutionError)
     )
 }
 
+/// Emits a run-loop status line: as a TUI transcript entry when a TUI is
+/// attached, otherwise a plain `println!`.
+///
+/// `run_auto_loop`/`execute_with_retry` had accumulated many call sites that
+/// printed unconditionally regardless of TUI mode — writing raw bytes into
+/// the TUI's alternate-screen buffer while ratatui is still actively
+/// redrawing it, corrupting the live display. This centralizes the
+/// TUI-vs-stdout branch so every status line goes through one place instead
+/// of ad-hoc `if let Some(tx) = tui_tx {...} else { println!(...) }`
+/// blocks that were easy to add without noticing (and were missed at several
+/// sites). It matters more now than it used to: a sustained provider outage
+/// keeps `auto` mode retrying — and re-emitting these exact messages —
+/// indefinitely instead of erroring out after a few attempts, so a single
+/// missed site no longer glitches the screen once, it does so on a loop.
+fn emit_status(
+    tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+    warning: bool,
+    line: String,
+) {
+    match tui_tx {
+        Some(tx) => {
+            let kind = if warning {
+                streaming_tui::EntryKind::Warning(line)
+            } else {
+                streaming_tui::EntryKind::Info(line)
+            };
+            let _ = tx.try_send(streaming_tui::TuiMessage::Entry(
+                streaming_tui::TuiEntry::now(kind),
+            ));
+        }
+        None => println!("{line}"),
+    }
+}
+
 /// A short, human-facing label for a retryable failure — shown on the TUI/stdout
 /// retry line so the user can see *why* Velor is backing off, without dumping the
 /// verbose classifier evidence.
@@ -2847,23 +2922,33 @@ async fn execute_with_retry(
         }
         if attempt > 1 {
             let delay = policy.delay(attempt, &mut jitter, last_floor);
-            // Below ~30s a countdown in seconds is more useful than a clock
-            // time; above it (typically a provider-mandated wait — a rate-limit
-            // or usage-window reset) show the actual local resume time so an
-            // unattended run's ETA is legible at a glance.
-            if delay >= std::time::Duration::from_secs(30) {
-                println!(
-                    "⏳ Retrying attempt {attempt}/{} for iteration {iteration} — provider says \
-                     wait until {}...",
-                    config.max_retries,
-                    format_resume_eta(delay)
-                );
-            } else {
-                let secs = delay.as_secs_f64();
-                println!(
-                    "⏳ Retrying attempt {attempt}/{} for iteration {iteration} after {secs:.1}s...",
-                    config.max_retries
-                );
+            // These duplicate the TUI Warning entry already sent when the error
+            // occurred (below), so only print them on the plain-stdout path — a
+            // TUI is rendering the alternate screen and a raw `println!` here
+            // would write into it while ratatui is mid-redraw, corrupting the
+            // display. This loops for as long as the provider stays down, so an
+            // ungated print here would corrupt the screen on every single retry,
+            // not just once.
+            if tui_tx.is_none() {
+                // Below ~30s a countdown in seconds is more useful than a clock
+                // time; above it (typically a provider-mandated wait — a
+                // rate-limit or usage-window reset) show the actual local resume
+                // time so an unattended run's ETA is legible at a glance.
+                if delay >= std::time::Duration::from_secs(30) {
+                    println!(
+                        "⏳ Retrying attempt {attempt}/{} for iteration {iteration} — provider \
+                         says wait until {}...",
+                        config.max_retries,
+                        format_resume_eta(delay)
+                    );
+                } else {
+                    let secs = delay.as_secs_f64();
+                    println!(
+                        "⏳ Retrying attempt {attempt}/{} for iteration {iteration} after \
+                         {secs:.1}s...",
+                        config.max_retries
+                    );
+                }
             }
             tokio::time::sleep(delay).await;
 
@@ -2872,10 +2957,12 @@ async fn execute_with_retry(
                 return Err(RetryError::Cancelled);
             }
 
-            println!(
-                "🔄 Retry attempt {attempt}/{} for iteration {iteration}...",
-                config.max_retries
-            );
+            if tui_tx.is_none() {
+                println!(
+                    "🔄 Retry attempt {attempt}/{} for iteration {iteration}...",
+                    config.max_retries
+                );
+            }
         }
 
         match runner
@@ -2953,9 +3040,17 @@ async fn execute_with_retry(
             .await
         {
             Ok(result) => {
-                println!(); // newline after streamed text
-                if attempt > 1 {
-                    println!("✅ Retry {attempt} succeeded for iteration {iteration}");
+                if tui_tx.is_none() {
+                    println!(); // newline after streamed text
+                    if attempt > 1 {
+                        println!("✅ Retry {attempt} succeeded for iteration {iteration}");
+                    }
+                } else if attempt > 1 {
+                    emit_status(
+                        tui_tx,
+                        false,
+                        format!("Retry {attempt} succeeded for iteration {iteration}"),
+                    );
                 }
                 return Ok(result);
             }
