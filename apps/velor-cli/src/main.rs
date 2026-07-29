@@ -2052,6 +2052,17 @@ async fn run_auto_loop(
     // advances, so a single stuck iteration is bounded by the configured budget
     // instead of looping forever through crash recovery with a reset clock.
     let mut iteration_retry_started_at: Option<std::time::Instant> = None;
+    // Consecutive iterations whose agent run exited cleanly but produced NO
+    // assistant output (empty stdout). This is a degenerate provider turn —
+    // observed with omp/glm-5.2 under throttling, which emits
+    // `usage{input:0, output:0}` and exits 0 — so it is neither an error nor a
+    // completion. Without a guard the loop spawns a fresh agent every few
+    // seconds and runs away (hundreds/thousands of no-op iterations, no
+    // backoff). We back off and retry the SAME iteration, then stop once the
+    // streak exceeds `empty_output_limit` (ties to the configured retry budget).
+    let mut consecutive_empty_iterations: u32 = 0;
+    let empty_output_limit = retry_config.max_retries.max(3);
+    let mut empty_backoff_jitter = core::retry::SystemJitter;
     // The single controller-owned persistent-append cell, seeded from --append.
     let mut persistent_append: Option<
         velor_core::execution_service::adapters::claude_stream::PersistentAppend,
@@ -2284,6 +2295,37 @@ async fn run_auto_loop(
                 }
             }
         };
+
+        // Runaway guard: the agent exited cleanly (Ok) but produced no assistant
+        // output at all. See the note on `consecutive_empty_iterations` above —
+        // without this, a provider that returns empty turns while still exiting 0
+        // makes the loop advance forever. Back off and retry the same iteration;
+        // stop once the streak exceeds the limit so a persistent provider outage
+        // fails fast instead of spinning up fresh agents by the thousand.
+        if iteration_output.trim().is_empty() {
+            consecutive_empty_iterations += 1;
+            if consecutive_empty_iterations > empty_output_limit {
+                return Err(color_eyre::eyre::eyre!(
+                    "agent produced no output for {consecutive_empty_iterations} consecutive \
+                     iterations — the provider is likely throttling or erroring, but the agent \
+                     process still exits 0. Stopping to avoid a runaway loop."
+                ));
+            }
+            let delay = backoff_policy.delay(
+                consecutive_empty_iterations,
+                &mut empty_backoff_jitter,
+                None,
+            );
+            println!(
+                "⚠️  Iteration {current_iteration} produced no agent output (provider may be \
+                 throttling); backing off for {:.1}s and retrying the same iteration \
+                 ({consecutive_empty_iterations}/{empty_output_limit})…",
+                delay.as_secs_f64()
+            );
+            tokio::time::sleep(delay).await;
+            continue; // retry same iteration with backoff; do NOT advance
+        }
+        consecutive_empty_iterations = 0;
 
         // Store final output for notification preview
         final_output = iteration_output.clone();
