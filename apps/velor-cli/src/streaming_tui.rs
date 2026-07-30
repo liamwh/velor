@@ -1784,8 +1784,8 @@ fn render_entry(
                 Line::from(Span::styled(
                     l.to_string(),
                     Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::ITALIC),
                 ))
             })
             .collect(),
