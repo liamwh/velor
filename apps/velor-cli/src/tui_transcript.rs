@@ -33,6 +33,12 @@ pub enum EntryKind {
     },
     /// A tool/action result.
     ToolResult {
+        /// The tool/action name, matching the [`EntryKind::ToolCall`] this
+        /// result completes. Used at render time to decide styling (e.g.
+        /// first-class edit tools skip the terminal-card treatment since the
+        /// real diff renders as an [`EntryKind::FileEdit`]) without needing
+        /// to look at neighbouring entries.
+        tool: String,
         detail: String,
         success: Option<bool>,
     },
@@ -361,7 +367,7 @@ fn cap_streamed_text(s: &mut String, max_bytes: usize) {
     let omitted = s.len() - head_end - (s.len() - tail_start);
     let head = &s[..head_end];
     let tail = &s[tail_start..];
-    *s = format!("{head}\n ⋯ {omitted} bytes omitted — full text is in the run log ⋯\n{tail}");
+    *s = format!("{head}\n ⋯ {omitted} more bytes (Ctrl+O: Expand) ⋯\n{tail}");
 }
 
 /// Bounds an oversized tool result or Edit/Write diff so one entry cannot hold
@@ -369,7 +375,12 @@ fn cap_streamed_text(s: &mut String, max_bytes: usize) {
 fn bound_oversized(kind: EntryKind, max_lines: usize) -> EntryKind {
     let max_lines = max_lines.max(2);
     match kind {
-        EntryKind::ToolResult { detail, success } => EntryKind::ToolResult {
+        EntryKind::ToolResult {
+            tool,
+            detail,
+            success,
+        } => EntryKind::ToolResult {
+            tool,
             detail: fold_multiline(&detail, max_lines),
             success,
         },
@@ -401,9 +412,7 @@ fn fold_multiline(s: &str, max_lines: usize) -> String {
         out.push_str(l);
         out.push('\n');
     }
-    out.push_str(&format!(
-        "  ⋯ {omitted} lines omitted — full output is in the run log ⋯"
-    ));
+    out.push_str(&format!("  … {omitted} more lines (Ctrl+O: Expand)"));
     out.push('\n');
     for l in tail {
         out.push_str(l);
