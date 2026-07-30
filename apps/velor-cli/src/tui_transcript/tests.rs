@@ -155,7 +155,11 @@ fn never_trims_the_last_entry() {
 }
 
 #[test]
-fn oversized_tool_result_is_folded_with_marker() {
+fn oversized_tool_result_is_retained_in_full_for_the_expand_toggle() {
+    // ToolResult output is deliberately NOT folded at ingest (unlike Edit
+    // diff input, still folded below): the TUI shows it collapsed by default
+    // and expands to the full text on Ctrl+O, which only has something to
+    // reveal if the full text survived ingest.
     let limits = TuiLimits {
         max_entries: usize::MAX,
         max_bytes: usize::MAX,
@@ -168,18 +172,16 @@ fn oversized_tool_result_is_folded_with_marker() {
         .join("\n");
     t.ingest(TuiEntry::now(EntryKind::ToolResult {
         tool: "Bash".to_string(),
-        detail: huge,
+        detail: huge.clone(),
         success: Some(true),
         command: None,
     }));
     let EntryKind::ToolResult { detail, .. } = &t.entries()[0].kind else {
         panic!("expected ToolResult");
     };
-    assert!(detail.contains("more lines"), "fold marker must be present");
-    let kept_lines = detail.lines().count();
-    assert!(
-        kept_lines <= 11,
-        "folded detail must be bounded, got {kept_lines} lines"
+    assert_eq!(
+        detail, &huge,
+        "full output is retained, not folded, at ingest"
     );
 }
 

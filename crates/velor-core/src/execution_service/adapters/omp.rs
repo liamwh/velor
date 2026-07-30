@@ -42,6 +42,13 @@ use crate::execution_service::supervisor::{
 /// itself advertises a 1 MiB per-frame cap and a 64 MiB reassembly cap.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum bytes of a `tool_execution_end` result carried on
+/// [`crate::agent::AgentEvent::ToolResult::detail`]. Generous — this is the
+/// real output a user can expand to read in full, not a preview — the TUI's
+/// own transcript byte budget (`TuiLimits::max_bytes`) is the actual memory
+/// bound, not this constant.
+const TOOL_RESULT_DETAIL_MAX: usize = 20_000;
+
 /// Grace window after `agent_end` + EOF for `omp` to exit naturally before the
 /// supervisor force-cancels the group. `omp` normally exits in well under a
 /// second; this only guards a linger.
@@ -399,7 +406,7 @@ fn parse_omp_line(
                         }
                     })
                 })
-                .map(|s| truncate(s, 240))
+                .map(|s| truncate(s, TOOL_RESULT_DETAIL_MAX))
                 .unwrap_or_default();
             let command = value
                 .get("toolCallId")
