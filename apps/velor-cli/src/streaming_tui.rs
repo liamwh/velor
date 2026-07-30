@@ -1993,18 +1993,44 @@ fn infer_output_syntax(
 ) -> Option<velor_core::file_edit::SyntaxKind> {
     let command = command?;
     match tool.to_ascii_lowercase().as_str() {
-        "read" => Some(velor_core::file_edit::infer_syntax(command)),
+        "read" => Some(velor_core::file_edit::infer_syntax(
+            strip_line_range_suffix(command),
+        )),
         "bash" | "command_execution" => {
             let trimmed = command.trim();
             ["cat ", "bat "].iter().find_map(|prefix| {
                 trimmed.strip_prefix(prefix).and_then(|rest| {
                     rest.split_whitespace()
                         .find(|w| !w.starts_with('-'))
-                        .map(velor_core::file_edit::infer_syntax)
+                        .map(|path| {
+                            velor_core::file_edit::infer_syntax(strip_line_range_suffix(path))
+                        })
                 })
             })
         }
         _ => None,
+    }
+}
+
+/// Strips a trailing `:N` or `:N-M` line-range suffix some providers append
+/// to a Read call's path (e.g. `lib.rs:2728-2871`), which would otherwise
+/// defeat extension-based language detection — `infer_syntax` would see the
+/// "extension" `rs:2728-2871` and fall back to plain text. Only strips when
+/// the entire suffix after the last `:` is digits/hyphens, so this is a
+/// no-op for plain paths and doesn't misfire on a Windows drive letter.
+fn strip_line_range_suffix(path: &str) -> &str {
+    let Some(colon) = path.rfind(':') else {
+        return path;
+    };
+    let suffix = &path[colon + 1..];
+    let looks_like_range = !suffix.is_empty()
+        && suffix
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    if looks_like_range {
+        &path[..colon]
+    } else {
+        path
     }
 }
 
@@ -2141,22 +2167,21 @@ fn render_entry(
         EntryKind::Usage { .. } => Vec::new(),
 
         EntryKind::ToolCall { tool, detail, .. } => {
-            // A plain, unboxed announcement — never a box. Tool calls can
-            // arrive several-in-a-row before any of their results do (e.g. a
-            // Read and a Bash issued in parallel), so a call has no reliable
-            // "next entry" to pair with; a box opened here with no matching
-            // close would swallow whatever comes next, including an unrelated
-            // call's own box. The result, when it arrives, carries the real
-            // content and is fully self-contained (see the ToolResult arm).
-            let spans = if tool == "Bash" {
-                vec![Span::raw(format!("$ {detail}"))]
-            } else {
-                vec![
+            // Edit-tool calls stay a plain, unboxed announcement — the real
+            // content is a separate FileEdit card, so this is the only place
+            // the path/summary shows before it lands. Every other tool's call
+            // renders nothing: its result opens a self-contained box (see the
+            // ToolResult arm) with the correlated command as that box's own
+            // header, so printing the same command again here would just be
+            // the same line twice.
+            if is_file_edit_tool(tool) {
+                vec![Line::from(vec![
                     Span::styled(tool.clone(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::raw(format!("  {detail}")),
-                ]
-            };
-            vec![Line::from(spans)]
+                ])]
+            } else {
+                Vec::new()
+            }
         }
 
         EntryKind::ToolResult {
@@ -4174,37 +4199,26 @@ mod render_tests {
     }
 
     #[test]
-    fn bash_tool_call_is_a_plain_unboxed_shell_prompt_label() {
+    fn non_edit_tool_calls_render_nothing_the_result_box_shows_the_command() {
         // ToolCall never opens a box: calls can arrive several-in-a-row
         // before any result does (parallel tool use), so a call has no
-        // reliable neighbour to pair a box with.
+        // reliable neighbour to pair a box with. Its result, once it arrives,
+        // shows the correlated command as the box's own header (see
+        // `tool_result_is_a_fully_self_contained_box_even_for_one_line`), so
+        // printing the command again here would just be the same line twice.
         let mut engine = crate::highlight::HighlightEngine::new();
-        let kind = EntryKind::ToolCall {
-            tool: "Bash".to_string(),
-            detail: "echo hi".to_string(),
-            input: serde_json::Value::Null,
-        };
-        let rows = render_entry(&kind, 40, &mut engine);
-        assert_eq!(rows.len(), 1);
-        let text = row_text(&rows[0]);
-        assert!(text.starts_with("$ echo hi"), "got {text:?}");
-        assert!(rows[0].spans.iter().all(|s| s.style.bg.is_none()));
-    }
-
-    #[test]
-    fn read_tool_call_is_a_plain_unboxed_label_with_the_path() {
-        let mut engine = crate::highlight::HighlightEngine::new();
-        let kind = EntryKind::ToolCall {
-            tool: "Read".to_string(),
-            detail: "src/lib.rs".to_string(),
-            input: serde_json::Value::Null,
-        };
-        let rows = render_entry(&kind, 40, &mut engine);
-        assert_eq!(rows.len(), 1);
-        let text = row_text(&rows[0]);
-        assert!(text.contains("Read"), "got {text:?}");
-        assert!(text.contains("src/lib.rs"), "got {text:?}");
-        assert!(rows[0].spans.iter().all(|s| s.style.bg.is_none()));
+        for (tool, detail) in [("Bash", "echo hi"), ("Read", "src/lib.rs")] {
+            let kind = EntryKind::ToolCall {
+                tool: tool.to_string(),
+                detail: detail.to_string(),
+                input: serde_json::Value::Null,
+            };
+            assert_eq!(
+                render_entry(&kind, 40, &mut engine),
+                Vec::<Line>::new(),
+                "{tool} call should render nothing"
+            );
+        }
     }
 
     #[test]
@@ -4288,12 +4302,11 @@ mod render_tests {
             success: Some(true),
             command: Some("git diff".to_string()),
         };
-        // Neither call opens a box, so their order/adjacency can't corrupt
-        // anything; each result independently opens and closes its own.
+        // Neither call renders anything (the result's box header carries the
+        // command instead), so their order/adjacency can't corrupt anything;
+        // each result independently opens and closes its own box.
         for kind in [&read_call, &bash_call] {
-            let rows = render_entry(kind, 40, &mut engine);
-            assert_eq!(rows.len(), 1);
-            assert!(!row_text(&rows[0]).starts_with('╭'));
+            assert_eq!(render_entry(kind, 40, &mut engine), Vec::<Line>::new());
         }
         for (kind, expected_header) in [(&read_result, "SPEC.md"), (&bash_result, "$ git diff")] {
             let rows = render_entry(kind, 40, &mut engine);
@@ -4442,6 +4455,36 @@ mod render_tests {
         assert_eq!(infer_output_syntax("Bash", Some("git diff")), None);
         assert_eq!(infer_output_syntax("Grep", Some("TODO")), None);
         assert_eq!(infer_output_syntax("Bash", None), None);
+    }
+
+    #[test]
+    fn infer_output_syntax_strips_a_line_range_suffix() {
+        // Regression: some providers (omp) append ":start-end" to a Read
+        // call's path; naive extension detection saw "rs:2728-2871" and fell
+        // back to plain text instead of Rust.
+        assert_eq!(
+            infer_output_syntax(
+                "read",
+                Some("crates/domain/aq-fundamentals/src/lib.rs:2728-2871")
+            ),
+            Some(velor_core::file_edit::SyntaxKind::Rust)
+        );
+        assert_eq!(
+            infer_output_syntax("read", Some("src/lib.rs:254")),
+            Some(velor_core::file_edit::SyntaxKind::Rust)
+        );
+    }
+
+    #[test]
+    fn strip_line_range_suffix_only_strips_genuine_ranges() {
+        assert_eq!(
+            strip_line_range_suffix("src/lib.rs:2728-2871"),
+            "src/lib.rs"
+        );
+        assert_eq!(strip_line_range_suffix("src/lib.rs:254"), "src/lib.rs");
+        assert_eq!(strip_line_range_suffix("src/lib.rs"), "src/lib.rs");
+        // A Windows drive letter isn't a line range (suffix isn't all digits).
+        assert_eq!(strip_line_range_suffix(r"C:\Users\x"), r"C:\Users\x");
     }
 
     #[test]
