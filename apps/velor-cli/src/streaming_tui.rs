@@ -330,6 +330,11 @@ struct TuiState {
     pending_g: bool,
     /// Deadline at which a pending `g` prefix is cancelled.
     g_deadline: Option<Instant>,
+    /// The current todo-list state, rendered as a sticky panel pinned above
+    /// the spinner/hints rows so it survives scrolling. Refreshed whenever a
+    /// todo-tool call/result carries a new snapshot; never cleared mid-run
+    /// (the last known state is more useful than nothing while idle).
+    sticky_todo: Option<String>,
 }
 
 impl TuiState {
@@ -367,6 +372,7 @@ impl TuiState {
             pending_ack: None,
             pending_append_ack: None,
             transient_status: None,
+            sticky_todo: None,
         }
     }
 
@@ -928,18 +934,17 @@ fn build_layout(
     engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
     let content_lines = render_entry(kind, width as usize, engine);
-    // Dividers, file edits, and boxed tool cards read as clean full-width
-    // rules/gutters/borders from column 0; a timestamp would break the row.
-    // Edit-tool calls/results stay a plain unboxed label (the real content is
-    // the FileEdit card), so they keep their timestamp like prose does.
+    // Dividers, file edits, and boxed tool-result cards read as clean
+    // full-width rules/gutters/borders from column 0; a timestamp would break
+    // the row. ToolCall is never boxed (see its render_entry arm) and
+    // edit-tool results stay a plain unboxed label (the real content is the
+    // FileEdit card), so both keep their timestamp like prose does.
     let no_timestamp = matches!(
         kind,
         EntryKind::IterationDivider { .. } | EntryKind::FileEdit(_)
-    ) || matches!(kind, EntryKind::ToolCall { tool, .. } if !is_file_edit_tool(tool))
-        || matches!(kind, EntryKind::ToolResult { tool, .. } if !is_file_edit_tool(tool));
-    // File-edit lines carry a gutter, and boxed tool-result lines carry a
-    // border; their wrapped continuation rows indent to match so they align
-    // beneath the source/content rather than the gutter or border.
+    ) || matches!(kind, EntryKind::ToolResult { tool, .. } if !is_file_edit_tool(tool));
+    // File-edit lines carry a gutter; their wrapped continuation rows indent
+    // to align beneath the source rather than the gutter.
     let hang = entry_hang(kind);
     let ts_span = Span::styled(
         ts.format("%H:%M:%S ").to_string(),
@@ -1066,7 +1071,7 @@ pub async fn run_streaming_tui(
                     // Update spinner verb + token usage from the event kind, then
                     // ingest (coalesces/bounds/trims; transient Usage is dropped).
                     match &e.kind {
-                        EntryKind::ToolCall { tool, .. } => {
+                        EntryKind::ToolCall { tool, input, .. } => {
                             state.spinner_verb = match tool.as_str() {
                                 "Bash" => "running command",
                                 "Read" => "reading file",
@@ -1075,11 +1080,28 @@ pub async fn run_streaming_tui(
                                 "Glob" => "finding files",
                                 _ => "working",
                             };
+                            // A todo-tool call that carries the full current list
+                            // (e.g. Claude's TodoWrite) is the freshest, most
+                            // reliable source — always overwrite with it.
+                            if is_todo_tool(tool)
+                                && let Some(summary) = todo_summary_from_input(input)
+                            {
+                                state.sticky_todo = Some(summary);
+                            }
                             set_title(&format!("vel auto — {}", state.spinner_verb));
                         }
-                        EntryKind::ToolResult { .. } => {
+                        EntryKind::ToolResult { tool, detail, .. } => {
                             state.spinner_verb = "thinking";
                             set_title("vel auto — thinking");
+                            // A todo tool's *result* text is the freshest source
+                            // for providers that report the full board back
+                            // (e.g. omp's "Remaining items… Overall: N/M done…"),
+                            // as opposed to a short generic acknowledgement — the
+                            // line-count/length heuristic tells those apart
+                            // without needing to know the provider.
+                            if is_todo_tool(tool) && is_substantial_todo_summary(detail) {
+                                state.sticky_todo = Some(detail.clone());
+                            }
                         }
                         EntryKind::Text(_) => {
                             state.spinner_verb = "generating";
@@ -1380,17 +1402,20 @@ fn render(
 ) {
     let area = f.area();
 
+    let sticky_height = sticky_todo_height(state.sticky_todo.as_deref(), area.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
+            Constraint::Length(sticky_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
     let log_area = chunks[0];
-    let spinner_area = chunks[1];
-    let hints_area = chunks[2];
+    let sticky_area = chunks[1];
+    let spinner_area = chunks[2];
+    let hints_area = chunks[3];
 
     state.spinner_idx = (state.spinner_idx + 1) % SPINNER.len();
 
@@ -1472,6 +1497,12 @@ fn render(
         .title(Line::from(right_title).alignment(Alignment::Right));
     let para = Paragraph::new(visible_lines).block(block);
     f.render_widget(para, log_area);
+
+    if sticky_area.height > 0
+        && let Some(todo) = &state.sticky_todo
+    {
+        render_sticky_todo(f, sticky_area, todo);
+    }
 
     render_spinner(f, state, spinner_area);
     render_hints(f, state, cancel_handler, error_count, hints_area);
@@ -1604,6 +1635,75 @@ fn build_title(
     };
     let right = vec![Span::styled(s, Style::default().fg(right_color))];
     (left, right)
+}
+
+/// Max lines of todo content shown in the sticky panel before truncating with
+/// a "N more" marker — keeps the panel from dominating a tall terminal even
+/// when the board itself is long.
+const MAX_STICKY_TODO_LINES: usize = 6;
+
+/// Row height (including the top/bottom border) for the sticky todo panel:
+/// `0` collapses it entirely when there's nothing to show. Bounded so it can
+/// never crowd out the log area's guaranteed minimum or the spinner/hints
+/// rows on a short terminal.
+fn sticky_todo_height(todo: Option<&str>, terminal_height: u16) -> u16 {
+    let Some(todo) = todo else {
+        return 0;
+    };
+    if todo.trim().is_empty() {
+        return 0;
+    }
+    let content_lines = todo.lines().count().clamp(1, MAX_STICKY_TODO_LINES);
+    let desired = (content_lines + 2) as u16; // + top/bottom border
+    let reserved_for_log_and_footer = 3 + 1 + 1; // log's Constraint::Min(3) + spinner + hints
+    let budget = terminal_height.saturating_sub(reserved_for_log_and_footer);
+    desired.min(budget)
+}
+
+/// Renders the sticky todo panel: a small bordered block pinned above the
+/// spinner/hints rows so the current task list stays visible regardless of
+/// scroll position. Checklist-style lines (`[x]`/`[~]`/`[ ]`, as produced by
+/// [`todo_summary_from_input`]) are colour-coded by status; free-text board
+/// summaries (as reported directly by some providers) render plain.
+fn render_sticky_todo(f: &mut Frame, area: Rect, todo: &str) {
+    let visible_budget = area.height.saturating_sub(2) as usize;
+    if visible_budget == 0 {
+        return;
+    }
+    let total_lines = todo.lines().count();
+    let truncated = total_lines > visible_budget;
+    let take = if truncated {
+        visible_budget.saturating_sub(1).max(1)
+    } else {
+        visible_budget
+    };
+    let mut lines: Vec<Line<'static>> = todo.lines().take(take).map(todo_line_span).collect();
+    if truncated {
+        let hidden = total_lines - lines.len();
+        lines.push(Line::from(Span::styled(
+            format!("… {hidden} more (Ctrl+O: Expand)"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(Span::styled(
+            " Todos ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Colours one line of sticky todo content by its checklist marker, if any.
+fn todo_line_span(line: &str) -> Line<'static> {
+    let color = match line.trim_start() {
+        s if s.starts_with("[x]") => Color::Green,
+        s if s.starts_with("[~]") => Color::Yellow,
+        s if s.starts_with("[ ]") => Color::Gray,
+        _ => Color::White,
+    };
+    Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
 }
 
 fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
@@ -1833,6 +1933,51 @@ fn is_file_edit_tool(tool: &str) -> bool {
     matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
 }
 
+/// Whether `tool` is a todo/task-list tool, across the provider-specific
+/// names seen in practice (Claude's `TodoWrite`/`TodoRead`, omp's lowercase
+/// `todo`). Drives the sticky todo panel, which is populated regardless of
+/// which provider produced the event.
+fn is_todo_tool(tool: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    t == "todo" || t.contains("todowrite") || t.contains("todoread")
+}
+
+/// Builds a checklist summary from a structured todo-tool call input, e.g.
+/// Claude's `TodoWrite` shape `{"todos": [{"content", "status", ...}]}`.
+/// Returns `None` when the input doesn't carry a non-empty `todos` array —
+/// providers that report state via the result instead (see
+/// [`is_substantial_todo_summary`]) simply don't match here.
+fn todo_summary_from_input(input: &serde_json::Value) -> Option<String> {
+    let todos = input.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for t in todos {
+        let content = t.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+        let status = t
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
+        let mark = match status {
+            "completed" => "x",
+            "in_progress" => "~",
+            _ => " ",
+        };
+        out.push_str(&format!("[{mark}] {content}\n"));
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// Whether a todo tool's *result* text looks like a real board summary
+/// (multi-line, or long enough to be more than a one-line acknowledgement)
+/// rather than a generic "todos updated" confirmation that would otherwise
+/// clobber a better summary already sourced from the call's structured input.
+fn is_substantial_todo_summary(detail: &str) -> bool {
+    let detail = detail.trim();
+    !detail.is_empty() && (detail.lines().count() > 1 || detail.len() > 60)
+}
+
 /// The top or bottom rule of a tool card's box, optionally with an embedded
 /// label (the command/target, on the opening rule). Filled with
 /// [`TOOL_CARD_BG`] so the rule reads as part of the same solid card as the
@@ -1920,27 +2065,22 @@ fn render_entry(
         EntryKind::Usage { .. } => Vec::new(),
 
         EntryKind::ToolCall { tool, detail, .. } => {
-            // The opening rule of the terminal-card box: the command/target
-            // embedded as the rule's label, e.g. a shell-prompt-style "$ …"
-            // for Bash or "• {Tool} {target}" otherwise. The ToolResult entry
-            // that follows continues the same box (border + background) with
-            // "── Output" + the output body, then closes it — so the two
-            // entries read as one seamless card even though they're rendered
-            // independently. For edit tools the real before/after diff
-            // arrives as a separate `FileEdit` entry (computed from the
-            // filesystem), so they stay a plain unboxed label instead.
-            if is_file_edit_tool(tool) {
-                return vec![Line::from(vec![
+            // A plain, unboxed announcement — never a box. Tool calls can
+            // arrive several-in-a-row before any of their results do (e.g. a
+            // Read and a Bash issued in parallel), so a call has no reliable
+            // "next entry" to pair with; a box opened here with no matching
+            // close would swallow whatever comes next, including an unrelated
+            // call's own box. The result, when it arrives, carries the real
+            // content and is fully self-contained (see the ToolResult arm).
+            let spans = if tool == "Bash" {
+                vec![Span::raw(format!("$ {detail}"))]
+            } else {
+                vec![
                     Span::styled(tool.clone(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::raw(format!("  {detail}")),
-                ])];
-            }
-            let label = if tool == "Bash" {
-                format!("$ {detail}")
-            } else {
-                format!("• {tool} {detail}")
+                ]
             };
-            vec![tool_card_rule('╭', '╮', &label, width)]
+            vec![Line::from(spans)]
         }
 
         EntryKind::ToolResult {
@@ -1957,6 +2097,12 @@ fn render_entry(
                     Style::default().fg(color),
                 ))];
             }
+            // Fully self-contained box — never relies on a neighbouring
+            // ToolCall to open it, so it renders correctly regardless of how
+            // many other calls/results are interleaved around it in the
+            // stream. The tool name on the opening rule is what lets the
+            // reader match this box back to its call.
+            let mut lines = vec![tool_card_rule('╭', '╮', tool, width)];
             let body_fg = if failed {
                 Color::Rgb(230, 110, 110)
             } else {
@@ -1974,7 +2120,7 @@ fn render_entry(
             if failed {
                 divider_spans.push(Span::styled(" (failed)", Style::default().fg(Color::Red)));
             }
-            let mut lines = vec![tool_card_row(divider_spans, width)];
+            lines.push(tool_card_row(divider_spans, width));
             let body: Vec<&str> = detail.lines().collect();
             if body.is_empty() {
                 lines.push(tool_card_row(
@@ -3935,7 +4081,10 @@ mod render_tests {
     }
 
     #[test]
-    fn bash_tool_call_opens_a_card_with_a_shell_prompt_label() {
+    fn bash_tool_call_is_a_plain_unboxed_shell_prompt_label() {
+        // ToolCall never opens a box: calls can arrive several-in-a-row
+        // before any result does (parallel tool use), so a call has no
+        // reliable neighbour to pair a box with.
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::ToolCall {
             tool: "Bash".to_string(),
@@ -3943,14 +4092,14 @@ mod render_tests {
             input: serde_json::Value::Null,
         };
         let rows = render_entry(&kind, 40, &mut engine);
-        assert_eq!(rows.len(), 1, "just the opening rule");
+        assert_eq!(rows.len(), 1);
         let text = row_text(&rows[0]);
-        assert!(text.starts_with('╭'), "got {text:?}");
-        assert!(text.contains("$ echo hi"), "got {text:?}");
+        assert!(text.starts_with("$ echo hi"), "got {text:?}");
+        assert!(rows[0].spans.iter().all(|s| s.style.bg.is_none()));
     }
 
     #[test]
-    fn read_tool_call_opens_a_card_with_a_bullet_and_the_path() {
+    fn read_tool_call_is_a_plain_unboxed_label_with_the_path() {
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::ToolCall {
             tool: "Read".to_string(),
@@ -3960,11 +4109,16 @@ mod render_tests {
         let rows = render_entry(&kind, 40, &mut engine);
         assert_eq!(rows.len(), 1);
         let text = row_text(&rows[0]);
-        assert!(text.contains("• Read src/lib.rs"), "got {text:?}");
+        assert!(text.contains("Read"), "got {text:?}");
+        assert!(text.contains("src/lib.rs"), "got {text:?}");
+        assert!(rows[0].spans.iter().all(|s| s.style.bg.is_none()));
     }
 
     #[test]
-    fn tool_result_always_gets_a_boxed_output_card_even_for_one_line() {
+    fn tool_result_is_a_fully_self_contained_box_even_for_one_line() {
+        // No dependency on a neighbouring ToolCall: the opening rule lives on
+        // the result itself, so this renders correctly no matter what other
+        // calls/results are interleaved around it in the stream.
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::ToolResult {
             tool: "Bash".to_string(),
@@ -3972,19 +4126,25 @@ mod render_tests {
             success: Some(true),
         };
         let rows = render_entry(&kind, 40, &mut engine);
-        // divider + 1 output line + closing rule + trailing blank.
-        assert_eq!(rows.len(), 4, "even a one-line result gets the full card");
-        assert!(row_text(&rows[0]).contains("Output"));
-        assert!(row_text(&rows[2]).starts_with('╰'));
+        // opening rule + divider + 1 output line + closing rule + trailing blank.
+        assert_eq!(rows.len(), 5, "even a one-line result gets the full card");
         assert!(
-            rows[..3]
+            row_text(&rows[0]).starts_with('╭'),
+            "got {:?}",
+            row_text(&rows[0])
+        );
+        assert!(row_text(&rows[0]).contains("Bash"));
+        assert!(row_text(&rows[1]).contains("Output"));
+        assert!(row_text(&rows[3]).starts_with('╰'));
+        assert!(
+            rows[..4]
                 .iter()
                 .all(|l| l.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)))
         );
     }
 
     #[test]
-    fn multiline_tool_result_gets_an_output_divider_and_closing_rule() {
+    fn multiline_tool_result_gets_an_opening_rule_output_divider_and_closing_rule() {
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::ToolResult {
             tool: "Bash".to_string(),
@@ -3992,15 +4152,63 @@ mod render_tests {
             success: Some(true),
         };
         let rows = render_entry(&kind, 40, &mut engine);
-        // divider + 2 output lines + closing rule + trailing blank.
-        assert_eq!(rows.len(), 5);
-        assert!(row_text(&rows[0]).contains("── Output"));
-        assert!(row_text(&rows[3]).starts_with('╰'));
+        // opening rule + divider + 2 output lines + closing rule + trailing blank.
+        assert_eq!(rows.len(), 6);
+        assert!(row_text(&rows[0]).starts_with('╭'));
+        assert!(row_text(&rows[1]).contains("── Output"));
+        assert!(row_text(&rows[4]).starts_with('╰'));
         assert!(
-            rows[..4]
+            rows[..5]
                 .iter()
                 .all(|l| l.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)))
         );
+    }
+
+    #[test]
+    fn a_bash_call_followed_by_an_unrelated_read_result_renders_two_clean_boxes() {
+        // Regression: parallel tool calls (e.g. Read + Bash issued together,
+        // results arriving in any order) must never merge into one garbled
+        // box. Each ToolResult opens and closes its own box regardless of
+        // what other entries surround it.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let read_call = EntryKind::ToolCall {
+            tool: "Read".to_string(),
+            detail: "SPEC.md".to_string(),
+            input: serde_json::Value::Null,
+        };
+        let bash_call = EntryKind::ToolCall {
+            tool: "Bash".to_string(),
+            detail: "git diff".to_string(),
+            input: serde_json::Value::Null,
+        };
+        let read_result = EntryKind::ToolResult {
+            tool: "Read".to_string(),
+            detail: "line one\nline two".to_string(),
+            success: Some(true),
+        };
+        let bash_result = EntryKind::ToolResult {
+            tool: "Bash".to_string(),
+            detail: "diff output".to_string(),
+            success: Some(true),
+        };
+        // Neither call opens a box, so their order/adjacency can't corrupt
+        // anything; each result independently opens and closes its own.
+        for kind in [&read_call, &bash_call] {
+            let rows = render_entry(kind, 40, &mut engine);
+            assert_eq!(rows.len(), 1);
+            assert!(!row_text(&rows[0]).starts_with('╭'));
+        }
+        for kind in [&read_result, &bash_result] {
+            let rows = render_entry(kind, 40, &mut engine);
+            assert!(row_text(&rows[0]).starts_with('╭'));
+            // Last row is the trailing spacer blank; the one before it closes the box.
+            let close = &rows[rows.len() - 2];
+            assert!(
+                row_text(close).starts_with('╰'),
+                "got {:?}",
+                row_text(close)
+            );
+        }
     }
 
     #[test]
@@ -4100,6 +4308,104 @@ mod render_tests {
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(joined.contains("dangling"));
         assert!(joined.contains("backtick with no close"));
+    }
+
+    // ── Sticky todo panel ────────────────────────────────────────────────────
+
+    #[test]
+    fn is_todo_tool_matches_known_provider_names() {
+        assert!(is_todo_tool("todo"));
+        assert!(is_todo_tool("TodoWrite"));
+        assert!(is_todo_tool("TodoRead"));
+        assert!(!is_todo_tool("Bash"));
+        assert!(!is_todo_tool("Read"));
+    }
+
+    #[test]
+    fn todo_summary_from_input_builds_a_marked_checklist() {
+        let input = serde_json::json!({
+            "todos": [
+                {"content": "Ship the feature", "status": "completed"},
+                {"content": "Write tests", "status": "in_progress"},
+                {"content": "Update docs", "status": "pending"},
+            ]
+        });
+        let summary = todo_summary_from_input(&input).expect("summary present");
+        assert_eq!(
+            summary,
+            "[x] Ship the feature\n[~] Write tests\n[ ] Update docs"
+        );
+    }
+
+    #[test]
+    fn todo_summary_from_input_is_none_without_a_todos_array() {
+        assert!(todo_summary_from_input(&serde_json::json!({"op": "done"})).is_none());
+        assert!(todo_summary_from_input(&serde_json::json!({"todos": []})).is_none());
+    }
+
+    #[test]
+    fn substantial_todo_summary_distinguishes_board_dumps_from_short_acks() {
+        assert!(is_substantial_todo_summary(
+            "Remaining items (1):\n  - Update handoff\nOverall: 6/7 done, 1 open."
+        ));
+        assert!(is_substantial_todo_summary(&"x".repeat(61)));
+        assert!(!is_substantial_todo_summary("Todos updated successfully."));
+        assert!(!is_substantial_todo_summary(""));
+        assert!(!is_substantial_todo_summary("   "));
+    }
+
+    #[test]
+    fn sticky_todo_height_is_zero_with_no_todo() {
+        assert_eq!(sticky_todo_height(None, 40), 0);
+        assert_eq!(sticky_todo_height(Some(""), 40), 0);
+        assert_eq!(sticky_todo_height(Some("   "), 40), 0);
+    }
+
+    #[test]
+    fn sticky_todo_height_fits_short_content_plus_border() {
+        assert_eq!(sticky_todo_height(Some("[x] one\n[ ] two"), 40), 4);
+    }
+
+    #[test]
+    fn sticky_todo_height_caps_at_max_lines_plus_border() {
+        let long = (0..50)
+            .map(|i| format!("[ ] item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            sticky_todo_height(Some(&long), 40),
+            (MAX_STICKY_TODO_LINES + 2) as u16
+        );
+    }
+
+    #[test]
+    fn sticky_todo_height_never_exceeds_the_short_terminal_budget() {
+        // terminal_height=10: budget = 10 - (3 log min + 1 spinner + 1 hints) = 5.
+        let long = (0..20)
+            .map(|i| format!("[ ] item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(sticky_todo_height(Some(&long), 10), 5);
+    }
+
+    #[test]
+    fn todo_line_span_colours_by_checklist_marker() {
+        assert_eq!(
+            todo_line_span("[x] done").spans[0].style.fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            todo_line_span("[~] in progress").spans[0].style.fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            todo_line_span("[ ] pending").spans[0].style.fg,
+            Some(Color::Gray)
+        );
+        assert_eq!(
+            todo_line_span("Remaining items (1):").spans[0].style.fg,
+            Some(Color::White)
+        );
     }
 
     // ── File-edit header ─────────────────────────────────────────────────────
