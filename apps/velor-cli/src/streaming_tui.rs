@@ -925,16 +925,18 @@ fn build_layout(
     engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
     let content_lines = render_entry(kind, width as usize, engine);
-    // Dividers and file edits read as clean full-width rules/gutters; boxed
-    // tool results open on a full-width card rule too — none of these want a
-    // timestamp eating into column 0.
+    // Dividers and file edits read as clean full-width rules/gutters; tool
+    // calls/results fill a black background from column 0 — none of these
+    // want a timestamp breaking the row.
     let no_timestamp = matches!(
         kind,
-        EntryKind::IterationDivider { .. } | EntryKind::FileEdit(_)
-    ) || matches!(kind, EntryKind::ToolResult { detail, .. } if tool_result_boxed(detail));
-    // File-edit lines carry a gutter, and boxed tool-result lines carry a
-    // border; their wrapped continuation rows indent to match so they align
-    // beneath the source/content rather than the gutter or border.
+        EntryKind::IterationDivider { .. }
+            | EntryKind::FileEdit(_)
+            | EntryKind::ToolCall { .. }
+            | EntryKind::ToolResult { .. }
+    );
+    // File-edit lines carry a gutter; their wrapped continuation rows indent
+    // to align beneath the source rather than the gutter.
     let hang = entry_hang(kind);
     let ts_span = Span::styled(
         ts.format("%H:%M:%S ").to_string(),
@@ -1748,11 +1750,33 @@ fn fmt_tokens(n: u64) -> String {
 
 // ── Per-entry rendering (content lines, pre-wrap) ────────────────────────────
 
-/// Display width of the "│ " left border prefixed to every body row of a
-/// bordered card (tool-result output, file-edit gutters). Shared by the
-/// border span constructors and [`entry_hang`] so continuation rows always
-/// align under the content, never under the border.
-const CARD_BORDER_WIDTH: usize = 2;
+/// Background fill for the tool-call/result "terminal card": distinctly
+/// darker than the surrounding transcript so a command and its output read as
+/// one embedded terminal, command on top and output beneath it.
+const TOOL_CARD_BG: Color = Color::Rgb(8, 8, 10);
+
+/// Applies `bg` to every span in `spans`, then right-pads with a trailing
+/// bg-filled span so the fill reads edge-to-edge at `width` columns rather
+/// than stopping wherever the text ends.
+fn bg_fill_spans(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+    let content_w: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    for s in &mut spans {
+        s.style = s.style.bg(bg);
+    }
+    let pad = width.saturating_sub(content_w);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    }
+    Line::from(spans)
+}
+
+/// Single-span convenience wrapper over [`bg_fill_spans`].
+fn bg_fill(text: String, fg: Color, width: usize, bg: Color) -> Line<'static> {
+    bg_fill_spans(vec![Span::styled(text, Style::default().fg(fg))], width, bg)
+}
 
 fn render_entry(
     kind: &EntryKind,
@@ -1793,47 +1817,51 @@ fn render_entry(
         EntryKind::Usage { .. } => Vec::new(),
 
         EntryKind::ToolCall { tool, detail, .. } => {
-            // A lightweight, unboxed label — the substantial content (output,
-            // diffs) arrives in the ToolResult/FileEdit entries that follow and
-            // get the bordered card treatment. For edit tools the real
-            // before/after diff arrives as a separate `FileEdit` entry
-            // (computed from the filesystem), so we never render the agent's
-            // claimed patch here.
-            vec![Line::from(vec![
-                Span::styled(
-                    tool.clone(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(detail.clone(), Style::default().fg(Color::DarkGray)),
-            ])]
+            // The top of the terminal card: the command/target on a black
+            // background, e.g. a shell-prompt-style "$ …" for Bash. The
+            // ToolResult entry that follows continues the same black fill
+            // with "── Output" + the output body, so the two entries read as
+            // one seamless card even though they're rendered independently.
+            // For edit tools the real before/after diff arrives as a separate
+            // `FileEdit` entry (computed from the filesystem), so we never
+            // render the agent's claimed patch here.
+            let spans = if tool == "Bash" {
+                vec![Span::raw(format!("$ {detail}"))]
+            } else {
+                vec![
+                    Span::styled(tool.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("  {detail}")),
+                ]
+            };
+            vec![bg_fill_spans(spans, width, TOOL_CARD_BG)]
         }
 
         EntryKind::ToolResult { detail, success } => {
             let failed = *success == Some(false);
+            let fg = if failed {
+                Color::Rgb(230, 110, 110)
+            } else {
+                Color::Gray
+            };
             let body: Vec<&str> = detail.lines().collect();
             if !tool_result_boxed(detail) {
-                let color = if failed { Color::Red } else { Color::DarkGray };
                 let text = body.first().copied().unwrap_or("(no output)");
-                return vec![Line::from(Span::styled(
-                    truncate_str(text, 200),
-                    Style::default().fg(color),
-                ))];
+                return vec![bg_fill(truncate_str(text, 200), fg, width, TOOL_CARD_BG)];
             }
-            let border_color = if failed { Color::Red } else { Color::DarkGray };
-            let mut lines = vec![card_rule('╭', '╮', "", border_color, width)];
-            // "│ " is exactly CARD_BORDER_WIDTH columns wide.
-            let border = || Span::styled("│ ", Style::default().fg(border_color));
+            let divider = if failed {
+                "── Output (failed)"
+            } else {
+                "── Output"
+            };
+            let mut lines = vec![bg_fill(
+                divider.to_string(),
+                Color::DarkGray,
+                width,
+                TOOL_CARD_BG,
+            )];
             for line in &body {
-                lines.push(Line::from(vec![
-                    border(),
-                    Span::styled(truncate_str(line, 200), Style::default().fg(Color::Gray)),
-                ]));
+                lines.push(bg_fill(truncate_str(line, 200), fg, width, TOOL_CARD_BG));
             }
-            let bottom_label = if failed { "failed" } else { "" };
-            lines.push(card_rule('╰', '╯', bottom_label, border_color, width));
             lines.push(Line::default());
             lines
         }
@@ -1872,45 +1900,12 @@ fn render_entry(
 }
 
 /// Whether a [`EntryKind::ToolResult`]'s detail is substantial enough to
-/// deserve the bordered card treatment (multi-line output such as file
+/// deserve the black terminal-card treatment (multi-line output such as file
 /// contents or command stdout), versus a short one-line confirmation (e.g. a
 /// terse Edit-tool acknowledgement, since the real diff already rendered as a
-/// [`EntryKind::FileEdit`] card). Shared by [`render_entry`] and
-/// [`entry_hang`] so the boxed decision and its wrap indent never diverge.
+/// [`EntryKind::FileEdit`] block).
 fn tool_result_boxed(detail: &str) -> bool {
     detail.lines().count() > 1
-}
-
-/// Draws a full-width card rule with an optional embedded label, e.g.
-/// `╭─ failed ─────────────╮`. Used to frame tool-result and file-edit
-/// bodies. Degrades to a bare label when the content width can't fit the
-/// corners + label, mirroring [`render_iteration_divider`]'s narrow-width
-/// handling.
-fn card_rule(left: char, right: char, label: &str, color: Color, width: usize) -> Line<'static> {
-    let w = width.max(1);
-    let rule_style = Style::default().fg(color);
-    if label.is_empty() {
-        let dashes = w.saturating_sub(2);
-        return Line::from(Span::styled(
-            format!("{left}{}{right}", "─".repeat(dashes)),
-            rule_style,
-        ));
-    }
-    let label_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let label_w = UnicodeWidthStr::width(label);
-    // "{left}─ " (3) + label + " " (1) + dashes + "{right}" (1).
-    let fixed_w = 5 + label_w;
-    if w <= fixed_w {
-        return Line::from(vec![Span::styled(label.to_string(), label_style)]);
-    }
-    let dashes = w - fixed_w;
-    Line::from(vec![
-        Span::styled(format!("{left}─ "), rule_style),
-        Span::styled(label.to_string(), label_style),
-        Span::raw(" "),
-        Span::styled("─".repeat(dashes), rule_style),
-        Span::styled(right.to_string(), rule_style),
-    ])
 }
 
 /// Renders a full-width separator marking the start of an iteration, with the
@@ -1958,8 +1953,7 @@ fn gutter_width(num_width: usize) -> usize {
 /// never drifts from what's actually on screen.
 fn entry_hang(kind: &EntryKind) -> usize {
     match kind {
-        EntryKind::FileEdit(edit) => CARD_BORDER_WIDTH + gutter_width(line_number_width(edit)),
-        EntryKind::ToolResult { detail, .. } if tool_result_boxed(detail) => CARD_BORDER_WIDTH,
+        EntryKind::FileEdit(edit) => gutter_width(line_number_width(edit)),
         _ => 0,
     }
 }
@@ -1984,35 +1978,59 @@ fn line_number_width(edit: &FileEdit) -> usize {
 /// hanging-indent alignment is applied later in [`build_layout`].
 fn render_file_edit(
     edit: &FileEdit,
-    width: usize,
+    _width: usize,
     engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Card border colour follows the edit kind (green new, red deleted, cyan
-    // modified, …), so the whole card reads as one coloured unit rather than
-    // relying on an icon.
+    // Header: "{Verb}: {lang} {elided path}  {suffix or +N/-M stat}". Plain
+    // text, no card border — the gutter below already sets the block apart.
     let (color, suffix) = header_style(&edit.kind);
-    let label = match suffix {
-        Some(s) => format!("{}  {s}", edit.path),
-        None => edit.path.clone(),
-    };
-    lines.push(card_rule('╭', '╮', &label, color, width));
-    let border = || Span::styled("│ ", Style::default().fg(color));
+    let mut header = vec![Span::styled(
+        format!("{}: ", edit_verb(&edit.kind)),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    let lang = edit.syntax.syntect_hint();
+    if !lang.is_empty() {
+        header.push(Span::styled(
+            format!("{lang} "),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    header.push(Span::styled(
+        elide_middle(&edit.path, 64),
+        Style::default().fg(color),
+    ));
+    match suffix {
+        Some(s) => header.push(Span::styled(
+            format!("  {s}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        None => {
+            let (adds, dels) = diff_stat(edit);
+            if adds + dels > 0 {
+                header.push(Span::styled(
+                    format!("  (+{adds}/-{dels})"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+    }
+    lines.push(Line::from(header));
 
     match &edit.kind {
         FileEditKind::CaptureFailed { reason } => {
             lines.push(Line::from(vec![
-                border(),
+                Span::raw("  "),
                 Span::styled(
-                    format!("could not capture edit: {reason}"),
+                    format!("⚠ could not capture edit: {reason}"),
                     Style::default().fg(Color::Yellow),
                 ),
             ]));
         }
         FileEditKind::Binary => {
             lines.push(Line::from(vec![
-                border(),
+                Span::raw("  "),
                 Span::styled(
                     "binary file changed (contents not shown)",
                     Style::default()
@@ -2040,29 +2058,67 @@ fn render_file_edit(
                 if i > 0
                     && let Some(gap) = inter_hunk_gap(edit.hunks.get(i - 1), hunk)
                 {
-                    lines.push(dim_line(format!("⋯ {gap} lines ⋯"), color));
+                    lines.push(dim_line(format!("⋯ {gap} lines ⋯")));
                 }
-                for dl in &hunk.lines {
-                    let mut line = render_diff_line(dl, num_width, &highlighted, engine);
-                    line.spans.insert(0, border());
-                    lines.push(line);
-                }
+                lines.extend(render_hunk_lines(
+                    &hunk.lines,
+                    num_width,
+                    &highlighted,
+                    engine,
+                ));
             }
             if edit.omitted_lines > 0 {
-                lines.push(dim_line(
-                    format!(
-                        "⋯ {} lines omitted — full diff is in the run log ⋯",
-                        edit.omitted_lines
-                    ),
-                    color,
-                ));
+                lines.push(dim_line(format!(
+                    "⋯ {} lines omitted — full diff is in the run log ⋯",
+                    edit.omitted_lines
+                )));
             }
         }
     }
 
-    lines.push(card_rule('╰', '╯', "", color, width));
     lines.push(Line::default());
     lines
+}
+
+/// The verb a file-edit header reads with, matching the tool that produced it
+/// (`Write` for a brand-new file, `Delete` for a removal, `Edit` otherwise).
+const fn edit_verb(kind: &FileEditKind) -> &'static str {
+    match kind {
+        FileEditKind::Created => "Write",
+        FileEditKind::Deleted => "Delete",
+        FileEditKind::Modified | FileEditKind::Binary | FileEditKind::CaptureFailed { .. } => {
+            "Edit"
+        }
+    }
+}
+
+/// Total added/removed diff lines across all hunks, for the header's
+/// `(+N/-M)` stat.
+fn diff_stat(edit: &FileEdit) -> (usize, usize) {
+    let mut adds = 0usize;
+    let mut dels = 0usize;
+    for l in edit.hunks.iter().flat_map(|h| h.lines.iter()) {
+        match l.kind {
+            LineKind::Addition => adds += 1,
+            LineKind::Removal => dels += 1,
+            LineKind::Context => {}
+        }
+    }
+    (adds, dels)
+}
+
+/// Shortens `s` to at most `max` characters by ellipsis-eliding the middle,
+/// keeping the start and end (usually the most identifying parts of a path).
+fn elide_middle(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max || max < 5 {
+        return s.to_string();
+    }
+    let keep = (max - 1) / 2;
+    let chars: Vec<char> = s.chars().collect();
+    let head: String = chars[..keep].iter().collect();
+    let tail: String = chars[chars.len() - (max - 1 - keep)..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// `(path colour, optional status suffix)` for the file-edit header.
@@ -2294,16 +2350,34 @@ fn strip_term(s: &str) -> &str {
 /// sets background without touching foreground — so syntax colours survive on
 /// added/removed lines instead of being washed out by the green/red tint. The
 /// gutter (sign + line number + separator) is styled independently.
+/// A vivid background chip applied to the *specific tokens* an intraline word
+/// diff identified as changed, on top of the softer whole-line tint. Paired
+/// with a near-black foreground for contrast against either chip colour.
+const WORD_DIFF_ADD_BG: Color = Color::Rgb(46, 133, 64);
+const WORD_DIFF_DEL_BG: Color = Color::Rgb(178, 62, 88);
+const WORD_DIFF_FG: Color = Color::Rgb(15, 15, 15);
+
 fn render_diff_line(
     dl: &DiffLine,
     num_width: usize,
     highlighted: &HighlightedEdit,
     engine: &mut HighlightEngine,
+    emphasis: &[std::ops::Range<usize>],
 ) -> Line<'static> {
-    let (sign, sign_color, tint) = match dl.kind {
-        LineKind::Context => (" ", Color::DarkGray, None),
-        LineKind::Addition => ("+", Color::Green, Some(Color::Rgb(20, 40, 20))),
-        LineKind::Removal => ("-", Color::Red, Some(Color::Rgb(40, 20, 20))),
+    let (sign, sign_color, tint, emphasis_bg) = match dl.kind {
+        LineKind::Context => (" ", Color::DarkGray, None, None),
+        LineKind::Addition => (
+            "+",
+            Color::Green,
+            Some(Color::Rgb(20, 40, 20)),
+            Some(WORD_DIFF_ADD_BG),
+        ),
+        LineKind::Removal => (
+            "-",
+            Color::Red,
+            Some(Color::Rgb(40, 20, 20)),
+            Some(WORD_DIFF_DEL_BG),
+        ),
     };
     // Removals show the old number; additions/context show the new number.
     let lineno = dl.new_no.or(dl.old_no);
@@ -2316,17 +2390,34 @@ fn render_diff_line(
     let source_spans = highlighted.spans_for_line(dl, &expanded, engine);
     // Apply the diff tint as a *background* only: merge each span's foreground
     // token style with the tinted background. Style::patch keeps fg + modifiers
-    // from the left side and only fills in bg from the right.
-    let source: Vec<Span<'static>> = source_spans
-        .into_iter()
-        .map(|(content, fg_style)| {
+    // from the left side and only fills in bg from the right. Where an
+    // intraline word diff flagged a sub-range as the actual changed tokens,
+    // that sub-range gets the stronger emphasis chip instead of the tint.
+    let mut source: Vec<Span<'static>> = Vec::new();
+    let mut offset = 0usize;
+    for (content, fg_style) in source_spans {
+        let seg_len = content.len();
+        if emphasis.is_empty() {
             let mut style = fg_style;
             if let Some(bg) = tint {
                 style = style.bg(bg);
             }
-            Span::styled(content, style)
-        })
-        .collect();
+            source.push(Span::styled(content, style));
+        } else {
+            for (emphasized, piece) in split_by_emphasis(&content, offset, emphasis) {
+                let mut style = fg_style;
+                if emphasized {
+                    if let Some(bg) = emphasis_bg {
+                        style = style.bg(bg).fg(WORD_DIFF_FG);
+                    }
+                } else if let Some(bg) = tint {
+                    style = style.bg(bg);
+                }
+                source.push(Span::styled(piece, style));
+            }
+        }
+        offset += seg_len;
+    }
 
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -2340,6 +2431,225 @@ fn render_diff_line(
     ];
     spans.extend(source);
     Line::from(spans)
+}
+
+/// Splits `content` (which occupies `[base, base + content.len())` in the full
+/// line) into `(emphasized, piece)` runs against the sorted, non-overlapping
+/// `emphasis` ranges. Adjacent bytes with the same emphasis flag stay in one
+/// piece so runs of contiguous highlighted characters render as a single
+/// coloured chip rather than one span per byte.
+fn split_by_emphasis(
+    content: &str,
+    base: usize,
+    emphasis: &[std::ops::Range<usize>],
+) -> Vec<(bool, String)> {
+    let mut out: Vec<(bool, String)> = Vec::new();
+    let mut run_start = 0usize;
+    let mut run_flag: Option<bool> = None;
+    for (i, _) in content.char_indices() {
+        let flag = emphasis.iter().any(|r| r.contains(&(base + i)));
+        match run_flag {
+            None => run_flag = Some(flag),
+            Some(f) if f != flag => {
+                out.push((f, content[run_start..i].to_string()));
+                run_start = i;
+                run_flag = Some(flag);
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(f) = run_flag {
+        out.push((f, content[run_start..].to_string()));
+    }
+    out
+}
+
+/// Renders one hunk's lines, pairing an isolated `Removal` immediately
+/// followed by an isolated `Addition` (a single line replaced by another) so
+/// the two get an intraline word diff — the specific changed tokens get a
+/// vivid background chip on top of the usual soft red/green line tint.
+/// Anything else (context lines, unpaired or multi-line runs of +/-) renders
+/// with no emphasis, exactly as before.
+fn render_hunk_lines(
+    dls: &[DiffLine],
+    num_width: usize,
+    highlighted: &HighlightedEdit,
+    engine: &mut HighlightEngine,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < dls.len() {
+        let is_isolated_removal = dls[i].kind == LineKind::Removal
+            && i + 1 < dls.len()
+            && dls[i + 1].kind == LineKind::Addition
+            && (i == 0 || dls[i - 1].kind != LineKind::Removal)
+            && (i + 2 >= dls.len() || dls[i + 2].kind != LineKind::Addition);
+        if is_isolated_removal {
+            let (old_dl, new_dl) = (&dls[i], &dls[i + 1]);
+            let old_expanded = expand_tabs(&old_dl.text);
+            let new_expanded = expand_tabs(&new_dl.text);
+            let (old_emphasis, new_emphasis) = word_diff_emphasis(&old_expanded, &new_expanded);
+            out.push(render_diff_line(
+                old_dl,
+                num_width,
+                highlighted,
+                engine,
+                &old_emphasis,
+            ));
+            out.push(render_diff_line(
+                new_dl,
+                num_width,
+                highlighted,
+                engine,
+                &new_emphasis,
+            ));
+            i += 2;
+        } else {
+            out.push(render_diff_line(
+                &dls[i],
+                num_width,
+                highlighted,
+                engine,
+                &[],
+            ));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Computes intraline emphasis ranges for a single-line replacement: the byte
+/// ranges (in each side's tab-expanded text) that a token-level LCS diff
+/// identifies as actually changed. Returns `(old_ranges, new_ranges)`, both
+/// empty when the lines are too long to diff cheaply or share too little in
+/// common to read as a targeted edit (in which case the normal whole-line
+/// tint alone communicates the change better than a near-total highlight).
+fn word_diff_emphasis(
+    old_expanded: &str,
+    new_expanded: &str,
+) -> (Vec<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>) {
+    let old_tokens = tokenize(old_expanded);
+    let new_tokens = tokenize(new_expanded);
+    let (n, m) = (old_tokens.len(), new_tokens.len());
+    if n == 0 || m == 0 || n.saturating_mul(m) > 20_000 {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Classic LCS DP over token equality.
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old_tokens[i].1 == new_tokens[j].1 {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    let mut old_ranges = Vec::new();
+    let mut new_ranges = Vec::new();
+    // Matched *identifier* tokens only, for the relatedness gate below.
+    // Punctuation and whitespace tokens match trivially between almost any
+    // two code lines (every line has `(`, `.`, spaces, …), so counting them
+    // would make unrelated lines look related; only shared identifiers and
+    // keywords are real evidence the lines are "the same line, edited".
+    let mut word_matches = 0usize;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if old_tokens[i].1 == new_tokens[j].1 {
+            if is_word_token(old_tokens[i].1) {
+                word_matches += 1;
+            }
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            old_ranges.push(old_tokens[i].0.clone());
+            i += 1;
+        } else {
+            new_ranges.push(new_tokens[j].0.clone());
+            j += 1;
+        }
+    }
+    old_ranges.extend(old_tokens[i..].iter().map(|(r, _)| r.clone()));
+    new_ranges.extend(new_tokens[j..].iter().map(|(r, _)| r.clone()));
+
+    // Lines sharing too few identifiers (mostly a rewrite, not a targeted
+    // edit) read better with just the whole-line tint than a near-total
+    // emphasis chip.
+    let old_words = old_tokens.iter().filter(|(_, t)| is_word_token(t)).count();
+    let new_words = new_tokens.iter().filter(|(_, t)| is_word_token(t)).count();
+    let min_words = old_words.min(new_words);
+    if min_words > 0 && word_matches * 3 < min_words {
+        return (Vec::new(), Vec::new());
+    }
+
+    (
+        merge_ranges(old_ranges, old_expanded),
+        merge_ranges(new_ranges, new_expanded),
+    )
+}
+
+/// Whether `token` (as produced by [`tokenize`]) is an identifier/keyword
+/// token rather than a punctuation or whitespace token.
+fn is_word_token(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Splits `s` into `(byte_range, token)` pairs: a maximal run of
+/// identifier-ish characters (alphanumeric, `_`, `$`) is one token; every
+/// other character (punctuation, whitespace) is its own single-char token.
+/// This is the granularity word-diff tools conventionally use so e.g. adding
+/// one argument to a call doesn't get diffed character-by-character.
+fn tokenize(s: &str) -> Vec<(std::ops::Range<usize>, &str)> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let ch = s[i..]
+            .chars()
+            .next()
+            .expect("i < s.len() guarantees a char");
+        let start = i;
+        if is_word(ch) {
+            while let Some(c) = s[i..].chars().next() {
+                if is_word(c) {
+                    i += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+        } else {
+            i += ch.len_utf8();
+        }
+        out.push((start..i, &s[start..i]));
+    }
+    out
+}
+
+/// Merges adjacent/overlapping ranges into contiguous spans and drops any
+/// range whose text is pure whitespace (a highlighted blank has no visible
+/// glyph and just reads as a stray box).
+fn merge_ranges(
+    mut ranges: Vec<std::ops::Range<usize>>,
+    source: &str,
+) -> Vec<std::ops::Range<usize>> {
+    ranges.retain(|r| !source[r.clone()].trim().is_empty());
+    ranges.sort_by_key(|r| r.start);
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for r in ranges {
+        if let Some(last) = out.last_mut()
+            && r.start <= last.end
+        {
+            last.end = last.end.max(r.end);
+            continue;
+        }
+        out.push(r);
+    }
+    out
 }
 
 /// Number of source lines skipped between two consecutive hunks (for the gap
@@ -2360,14 +2670,12 @@ fn line_no_for_gap(l: &DiffLine) -> Option<usize> {
     l.old_no.or(l.new_no)
 }
 
-/// A dim, border-prefixed line used for inter-hunk gaps and truncation
-/// markers inside a file-edit card. `border_color` matches the enclosing
-/// card's rule colour so the "│ " prefix reads as part of the same border.
-fn dim_line(text: String, border_color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(border_color)),
-        Span::styled(text, Style::default().fg(Color::DarkGray)),
-    ])
+/// A dim, full-span line used for inter-hunk gaps and truncation markers.
+fn dim_line(text: String) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        text,
+        Style::default().fg(Color::DarkGray),
+    )])
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -2974,26 +3282,25 @@ mod render_tests {
         let kind = EntryKind::FileEdit(Box::new(edit));
         let rows = build_layout(&kind, Local::now(), 40, &mut engine);
 
-        // rows[0] = top card rule; rows[1] = first (bordered + guttered) row of
-        // the added line; rows[2..] = wrapped continuation rows.
+        // rows[0] = header; rows[1] = first (guttered) row of the added line;
+        // rows[2..] = wrapped continuation rows.
         assert!(
             rows.len() > 2,
             "a long line must wrap to multiple rows, got {}",
             rows.len()
         );
-        // The guttered row begins with the card border "│ " followed by the
-        // gutter " + 1 │ " (width 7 for a 1-digit line number: space + sign +
-        // space + num + " │ ").
+        // The guttered row begins with the gutter " + 1 │ " (width 7 for a
+        // 1-digit line number: space + sign + space + num + " │ ").
         let first = row_text(&rows[1]);
         assert!(
-            first.starts_with("│  + 1 │ "),
-            "first source row begins with the border + gutter, got {first:?}"
+            first.starts_with(" + 1 │ "),
+            "first source row begins with the gutter, got {first:?}"
         );
-        // The continuation row is indented by the border + gutter width (2 + 7
-        // = 9 columns) so it aligns beneath the source, not the border/gutter.
+        // The continuation row is indented by the gutter width (7 columns) so it
+        // aligns beneath the source, not beneath the line number/marker.
         let cont = row_text(&rows[2]);
         assert!(
-            cont.starts_with(&" ".repeat(9)),
+            cont.starts_with(&" ".repeat(7)),
             "wrapped continuation is indented to the source column, got {cont:?}"
         );
     }
@@ -3202,7 +3509,7 @@ mod render_tests {
             .flat_map(|h| h.lines.iter())
             .find(|l| l.kind == LineKind::Addition && l.text.contains("$derived"))
             .expect("an added $derived line exists");
-        let line = render_diff_line(added, num_width, &highlighted, &mut engine);
+        let line = render_diff_line(added, num_width, &highlighted, &mut engine, &[]);
 
         // Find a span covering a syntax token on the added line and assert it
         // has both fg (syntax) and the addition bg tint.
@@ -3230,7 +3537,7 @@ mod render_tests {
             .flat_map(|h| h.lines.iter())
             .find(|l| l.kind == LineKind::Removal)
             .expect("a removed line exists");
-        let line = render_diff_line(removed, num_width, &highlighted, &mut engine);
+        let line = render_diff_line(removed, num_width, &highlighted, &mut engine, &[]);
 
         let removal_bg = Color::Rgb(40, 20, 20);
         // At least some non-empty content on the removal line carries the bg.
@@ -3255,7 +3562,7 @@ mod render_tests {
             .flat_map(|h| h.lines.iter())
             .find(|l| l.kind == LineKind::Context)
             .expect("a context line exists");
-        let line = render_diff_line(ctx, num_width, &highlighted, &mut engine);
+        let line = render_diff_line(ctx, num_width, &highlighted, &mut engine, &[]);
         // No source span on a context line should carry a diff bg tint.
         let source_spans = &line.spans;
         assert!(
@@ -3318,5 +3625,246 @@ mod render_tests {
         // substring match, so the needles must land inside the intended token.
         assert_eq!(token_at("on:click"), Some(SemanticToken::Attribute));
         assert_eq!(token_at("bind:data-idx"), Some(SemanticToken::Attribute));
+    }
+
+    // ── Intraline word diff ───────────────────────────────────────────────────
+
+    #[test]
+    fn tokenize_splits_identifiers_from_punctuation() {
+        let toks: Vec<&str> = tokenize("foo(bar, $baz)")
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(toks, vec!["foo", "(", "bar", ",", " ", "$baz", ")"]);
+    }
+
+    #[test]
+    fn tokenize_reconstructs_the_source_exactly() {
+        let s = "import { Effect, Layer } from \"effect\";";
+        let joined: String = tokenize(s).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(joined, s);
+    }
+
+    #[test]
+    fn word_diff_emphasis_isolates_a_single_inserted_identifier() {
+        let old = "import { Effect, Layer, Queue, Schema } from \"effect\";";
+        let new = "import { Effect, Layer, Queue, Runtime, Schema } from \"effect\";";
+        let (old_ranges, new_ranges) = word_diff_emphasis(old, new);
+        // Nothing was removed from the old line.
+        assert!(
+            old_ranges.is_empty(),
+            "old side has no removed tokens: {old_ranges:?}"
+        );
+        // Exactly the inserted "Runtime, " (or a tight equivalent) is flagged —
+        // not the whole line — on the new side.
+        assert_eq!(
+            new_ranges.len(),
+            1,
+            "one contiguous inserted run: {new_ranges:?}"
+        );
+        let r = new_ranges[0].clone();
+        assert!(
+            new[r].contains("Runtime"),
+            "the flagged range must contain the new identifier"
+        );
+        assert!(
+            new_ranges[0].end - new_ranges[0].start < 12,
+            "the flagged range should be tight around the change, not the whole line"
+        );
+    }
+
+    #[test]
+    fn word_diff_emphasis_skips_when_lines_are_mostly_unrelated() {
+        let old = "Effect.runFork(";
+        let new = "Runtime.runFork(runtime)(";
+        // Real example from the reference: still shares enough (".runFork(")
+        // to pair, and the changed identifier gets flagged, not the whole line.
+        let (old_ranges, new_ranges) = word_diff_emphasis(old, new);
+        assert!(!old_ranges.is_empty() || !new_ranges.is_empty());
+
+        let unrelated_old = "const queue = yield* Effect.acquireRelease(";
+        let unrelated_new = "function pick(item: Item<string>): void {";
+        let (o, n) = word_diff_emphasis(unrelated_old, unrelated_new);
+        assert!(
+            o.is_empty() && n.is_empty(),
+            "unrelated lines get no emphasis: {o:?} {n:?}"
+        );
+    }
+
+    #[test]
+    fn word_diff_emphasis_drops_whitespace_only_ranges() {
+        let old = "let x = 1;";
+        let new = "let  x = 1;"; // one extra space only
+        let (old_ranges, new_ranges) = word_diff_emphasis(old, new);
+        assert!(
+            old_ranges.is_empty(),
+            "a pure whitespace diff must not be flagged: {old_ranges:?}"
+        );
+        assert!(
+            new_ranges.is_empty(),
+            "a pure whitespace diff must not be flagged: {new_ranges:?}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "a slice with one Range value, not a Vec-fill idiom"
+    )]
+    fn split_by_emphasis_groups_contiguous_runs() {
+        let parts = split_by_emphasis("Runtime, Schema", 0, &[0..8]);
+        assert_eq!(
+            parts,
+            vec![
+                (true, "Runtime,".to_string()),
+                (false, " Schema".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn split_by_emphasis_with_no_ranges_is_one_unemphasized_run() {
+        let parts = split_by_emphasis("plain text", 0, &[]);
+        assert_eq!(parts, vec![(false, "plain text".to_string())]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "a slice with one Range value, not a Vec-fill idiom"
+    )]
+    fn split_by_emphasis_respects_a_nonzero_base_offset() {
+        // "world" starts at byte 6 in the full line; emphasis range is
+        // expressed in full-line coordinates, base is this segment's offset.
+        let parts = split_by_emphasis("world", 6, &[6..11]);
+        assert_eq!(parts, vec![(true, "world".to_string())]);
+    }
+
+    #[test]
+    fn merge_ranges_joins_adjacent_and_drops_whitespace() {
+        let merged = merge_ranges(vec![0..3, 3..5, 10..11], "fooba x y  ");
+        // 0..3 ("foo") and 3..5 ("ba") touch, so they merge; 10..11 is a
+        // trailing space and gets dropped.
+        assert_eq!(merged, vec![0..5]);
+    }
+
+    #[test]
+    fn render_hunk_lines_emphasizes_an_isolated_replacement_pair() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let old = "import { Effect, Layer, Queue, Schema } from \"effect\";\nconst x = 1;\n";
+        let new =
+            "import { Effect, Layer, Queue, Runtime, Schema } from \"effect\";\nconst x = 1;\n";
+        let edit = velor_core::file_edit::compute_file_edit(
+            "src/lib.ts",
+            Some(old.as_bytes()),
+            Some(new.as_bytes()),
+            velor_core::file_edit::DEFAULT_MAX_DIFF_LINES,
+        )
+        .expect("a real change produces an edit");
+        let highlighted = HighlightedEdit::build(&mut engine, &edit);
+        let num_width = line_number_width(&edit);
+        let hunk = &edit.hunks[0];
+        let rows = render_hunk_lines(&hunk.lines, num_width, &highlighted, &mut engine);
+
+        let has_emphasis_chip = rows.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|s| s.style.bg == Some(WORD_DIFF_ADD_BG) && s.content.contains("Runtime"))
+        });
+        assert!(
+            has_emphasis_chip,
+            "the added identifier must carry the word-diff emphasis chip: {rows:?}"
+        );
+    }
+
+    // ── Tool-call / tool-result black card ─────────────────────────────────────
+
+    #[test]
+    fn bg_fill_pads_to_the_full_width_with_the_card_background() {
+        let line = bg_fill("hi".to_string(), Color::White, 10, TOOL_CARD_BG);
+        let total_w: usize = line
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        assert_eq!(total_w, 10);
+        assert!(line.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)));
+    }
+
+    #[test]
+    fn bash_tool_call_renders_as_a_shell_prompt_on_the_card_background() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolCall {
+            tool: "Bash".to_string(),
+            detail: "echo hi".to_string(),
+            input: serde_json::Value::Null,
+        };
+        let rows = render_entry(&kind, 40, &mut engine);
+        assert_eq!(rows.len(), 1);
+        let text = row_text(&rows[0]);
+        assert!(text.starts_with("$ echo hi"), "got {text:?}");
+        assert!(
+            rows[0]
+                .spans
+                .iter()
+                .all(|s| s.style.bg == Some(TOOL_CARD_BG))
+        );
+    }
+
+    #[test]
+    fn multiline_tool_result_gets_an_output_divider_on_the_card_background() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            detail: "line one\nline two".to_string(),
+            success: Some(true),
+        };
+        let rows = render_entry(&kind, 40, &mut engine);
+        assert_eq!(rows.len(), 4, "divider + 2 output lines + trailing blank");
+        assert!(row_text(&rows[0]).starts_with("── Output"));
+        assert!(
+            rows.iter()
+                .all(|l| l.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)))
+        );
+    }
+
+    #[test]
+    fn short_tool_result_stays_a_single_row_no_divider() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            detail: "ok".to_string(),
+            success: Some(true),
+        };
+        let rows = render_entry(&kind, 40, &mut engine);
+        assert_eq!(rows.len(), 1);
+        assert!(!row_text(&rows[0]).contains("Output"));
+    }
+
+    // ── File-edit header ─────────────────────────────────────────────────────
+
+    #[test]
+    fn elide_middle_keeps_short_strings_intact() {
+        assert_eq!(elide_middle("short.rs", 20), "short.rs");
+    }
+
+    #[test]
+    fn elide_middle_shortens_long_paths_around_an_ellipsis() {
+        let long = "a/very/long/repo/relative/path/that/keeps/going/lib.rs";
+        let elided = elide_middle(long, 20);
+        assert!(elided.chars().count() <= 20);
+        assert!(elided.contains('…'));
+        assert!(elided.starts_with("a/very"));
+        assert!(elided.ends_with("lib.rs"));
+    }
+
+    #[test]
+    fn diff_stat_counts_additions_and_removals() {
+        let edit = velor_core::file_edit::compute_file_edit(
+            "src/lib.rs",
+            Some(b"fn one() {}\nfn two() {}\nfn three() {}\n"),
+            Some(b"fn one() {}\nfn TWO() {}\nfn three() {}\n"),
+            velor_core::file_edit::DEFAULT_MAX_DIFF_LINES,
+        )
+        .expect("a real change produces an edit");
+        assert_eq!(diff_stat(&edit), (1, 1));
     }
 }
