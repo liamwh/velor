@@ -29,6 +29,13 @@ use crate::file_edit::{
 /// Maximum length of a single stream-json frame (line) before it is rejected.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum bytes of a `tool_result`'s content carried on
+/// [`crate::agent::AgentEvent::ToolResult::detail`]. Generous — this is the
+/// real output a user can expand to read in full, not a preview — the TUI's
+/// own transcript byte budget (`TuiLimits::max_bytes`) is the actual memory
+/// bound, not this constant.
+const TOOL_RESULT_DETAIL_MAX: usize = 20_000;
+
 /// Backstop grace for the streaming path: how long to wait for the subprocess to
 /// exit on its own after we close stdin (EOF) following the `result` frame.
 /// Claude Code normally exits promptly on that EOF, but if it ever lingers we
@@ -760,9 +767,14 @@ fn parse_claude_line(
                             });
                         }
                         "tool_result" => {
+                            // Generous: this is the actual output a user
+                            // reads in full via the TUI's expand toggle, not
+                            // a one-line call summary (`summarize_tool_input`
+                            // stays at 200 for that). The TUI's own transcript
+                            // byte budget is the real memory bound.
                             let detail = item
                                 .get("content")
-                                .map(|c| truncate_value(c, 200))
+                                .map(|c| truncate_value(c, TOOL_RESULT_DETAIL_MAX))
                                 .unwrap_or_default();
                             let matched = item
                                 .get("tool_use_id")

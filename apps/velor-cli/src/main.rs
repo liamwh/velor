@@ -20,6 +20,7 @@ mod projects;
 mod run_logger;
 mod serve;
 mod streaming_tui;
+mod theme;
 mod tracing_setup;
 mod tui;
 mod tui_transcript;
@@ -1441,6 +1442,9 @@ async fn run_auto(
         file_cfg.defaults.tui.max_transcript_bytes,
         file_cfg.defaults.tui.max_entry_lines,
     );
+    // Sets the process-wide active theme before the TUI renders its first
+    // frame. Must happen before rendering starts (see `theme::init`).
+    theme::init(file_cfg.defaults.tui.theme.as_deref());
     let tui_task = if no_tui {
         None
     } else {

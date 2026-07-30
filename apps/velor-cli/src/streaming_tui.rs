@@ -35,6 +35,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::highlight::theme::token_style;
 use crate::highlight::token::{SemanticSpan, SemanticToken};
 use crate::highlight::{HighlightEngine, HighlightRequest};
+use crate::theme;
 use crate::tui_transcript::{
     self, LiveEntry, RowMeter, ScrollState, Transcript, TuiLimits, Viewport,
 };
@@ -344,7 +345,7 @@ impl TuiState {
         Self {
             transcript: Transcript::new(limits),
             scroll: ScrollState::Tail,
-            cache: LayoutCache::new(CACHE_CAPACITY),
+            cache: LayoutCache::new(CACHE_CAPACITY, limits.max_entry_lines),
             prompt: None,
             log_path: None,
             show_prompt: false,
@@ -844,6 +845,10 @@ struct CacheKey {
     id: u64,
     rev: u64,
     width: u16,
+    /// Whether output was rendered expanded. Part of the key so toggling
+    /// `Ctrl+O` naturally invalidates every cached layout that differs
+    /// between the two states, without needing to touch entry revisions.
+    expand: bool,
 }
 
 /// The wrapped, timestamped display rows for one entry at one width.
@@ -852,8 +857,9 @@ struct CachedLayout {
 }
 
 /// A bounded FIFO cache of per-entry rendered layouts. Keyed by entry id +
-/// revision + width, so it naturally misses when an entry streams (rev bumps)
-/// or the terminal is resized (width changes). Capacity-bounded by eviction.
+/// revision + width + expand state, so it naturally misses when an entry
+/// streams (rev bumps), the terminal is resized (width changes), or the user
+/// toggles `Ctrl+O`. Capacity-bounded by eviction.
 struct LayoutCache {
     map: HashMap<CacheKey, CachedLayout>,
     order: VecDeque<CacheKey>,
@@ -862,17 +868,33 @@ struct LayoutCache {
     /// Entries rendered since construction (cache misses). Instrumented so tests
     /// can assert per-frame work is bounded by the viewport, not total history.
     renders: usize,
+    /// Collapsed-view line cap for a tool result's output body (from
+    /// [`TuiLimits::max_entry_lines`]), applied at render time so `Ctrl+O`
+    /// can reveal the full retained text instead of data lost at ingest.
+    max_entry_lines: usize,
+    /// Whether tool-result output currently renders expanded (full text) or
+    /// collapsed (head + tail), toggled by `Ctrl+O`.
+    expand_output: bool,
 }
 
 impl LayoutCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_entry_lines: usize) -> Self {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
             capacity,
             engine: HighlightEngine::new(),
             renders: 0,
+            max_entry_lines,
+            expand_output: false,
         }
+    }
+
+    /// Flips the expand-output state. The cache doesn't need clearing: the
+    /// new `expand` value simply produces a different [`CacheKey`], so old
+    /// entries just age out via normal eviction rather than being reused.
+    fn toggle_expand_output(&mut self) {
+        self.expand_output = !self.expand_output;
     }
 
     /// Ensures a layout exists for `entry` at `width`, returning its row count.
@@ -883,9 +905,14 @@ impl LayoutCache {
             id: entry.id.raw(),
             rev: entry.rev,
             width,
+            expand: self.expand_output,
         };
         if !self.map.contains_key(&key) {
-            let rows = build_layout(&entry.kind, entry.ts, width, &mut self.engine);
+            let opts = RenderOpts {
+                expand: self.expand_output,
+                max_entry_lines: self.max_entry_lines,
+            };
+            let rows = build_layout(&entry.kind, entry.ts, width, &mut self.engine, opts);
             self.insert(key.clone(), CachedLayout { rows });
             self.renders += 1;
         }
@@ -898,6 +925,7 @@ impl LayoutCache {
             id: entry.id.raw(),
             rev: entry.rev,
             width,
+            expand: self.expand_output,
         };
         self.map.get(&key).map(|c| c.rows.as_slice())
     }
@@ -929,13 +957,37 @@ impl RowMeter for LayoutCache {
 ///
 /// Iteration dividers are exempt from the timestamp prefix: they read as a clean
 /// full-width rule rather than a content line.
+/// Render-time options that affect an entry's rendered content (and so must
+/// be part of the layout cache key — see [`CacheKey`]), as opposed to purely
+/// structural inputs like width.
+#[derive(Debug, Clone, Copy)]
+struct RenderOpts {
+    /// Whether tool-result output renders full (`Ctrl+O`) or collapsed
+    /// (head + tail).
+    expand: bool,
+    /// Collapsed-view line cap for a tool result's output body.
+    max_entry_lines: usize,
+}
+
+impl Default for RenderOpts {
+    /// Collapsed, with [`TuiLimits::default`]'s line cap — the options a call
+    /// site not exercising expand/collapse behaviour reaches for.
+    fn default() -> Self {
+        Self {
+            expand: false,
+            max_entry_lines: TuiLimits::default().max_entry_lines,
+        }
+    }
+}
+
 fn build_layout(
     kind: &EntryKind,
     ts: DateTime<Local>,
     width: u16,
     engine: &mut HighlightEngine,
+    opts: RenderOpts,
 ) -> Vec<Line<'static>> {
-    let content_lines = render_entry(kind, width as usize, engine);
+    let content_lines = render_entry(kind, width as usize, engine, opts);
     // Dividers, file edits, and boxed tool-result cards read as clean
     // full-width rules/gutters/borders from column 0; a timestamp would break
     // the row. ToolCall is never boxed (see its render_entry arm) and
@@ -950,7 +1002,7 @@ fn build_layout(
     let hang = entry_hang(kind);
     let ts_span = Span::styled(
         ts.format("%H:%M:%S ").to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::active().dim),
     );
     let w = (width as usize).max(1);
     let mut rows: Vec<Line<'static>> = Vec::new();
@@ -1374,11 +1426,12 @@ fn handle_key(
         KeyCode::Char('l') => {
             state.open_log = true;
         }
-        // Ctrl+O is the same action, matching the "(Ctrl+O: Expand)" hint
-        // shown on truncated tool output/diffs — the full untruncated
-        // content lives in the run log, not in live memory.
+        // Ctrl+O expands every collapsed tool result in place to its full
+        // retained output (toggle — pressing again re-collapses), matching
+        // the "(Ctrl+O: Expand)" hint. Distinct from `l`: this reveals
+        // content inline rather than leaving the TUI for a pager.
         KeyCode::Char('o' | 'O') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.open_log = true;
+            state.cache.toggle_expand_output();
         }
         // `g` begins a prefix chord: `gg` → top of this iteration,
         // `gT` → absolute top of the chat, `gB` → absolute bottom (live tail).
@@ -1471,7 +1524,7 @@ fn render(
     let omitted = state.transcript.omitted();
     if vp.start == 0 && !omitted.is_empty() {
         let marker = Line::from(vec![
-            Span::styled("↑ ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑ ", Style::default().fg(theme::active().dim)),
             Span::styled(
                 format!(
                     "Earlier transcript content omitted from the live view — {} entries, ~{} KiB; full history remains in the run log.",
@@ -1479,7 +1532,7 @@ fn render(
                     omitted.bytes / 1024
                 ),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(theme::active().dim)
                     .add_modifier(Modifier::DIM),
             ),
         ]);
@@ -1494,7 +1547,7 @@ fn render(
     let (left_title, right_title) = build_title(state, entries.len(), error_count);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(theme::active().border))
         .title(Line::from(left_title))
         .title(Line::from(right_title).alignment(Alignment::Right));
     let para = Paragraph::new(visible_lines).block(block);
@@ -1549,8 +1602,9 @@ fn render_steering_modal(
     } else {
         (" 🎯  Steer (Enter=send · Esc=cancel) ", "steer › ")
     };
+    let theme = theme::active();
     let prompt_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line> = Vec::new();
     // Compose the input line, wrapping long buffers across rows.
@@ -1564,15 +1618,15 @@ fn render_steering_modal(
             } else {
                 "Sends one message to the active session. Not replayed in later iterations."
             },
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )),
         SubmissionState::Submitting => Line::from(Span::styled(
             "Submitting…",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         SubmissionState::Failed { message } => Line::from(vec![
-            Span::styled("✗ ", Style::default().fg(Color::Red)),
-            Span::styled(message.clone(), Style::default().fg(Color::Red)),
+            Span::styled("✗ ", Style::default().fg(theme.error)),
+            Span::styled(message.clone(), Style::default().fg(theme.error)),
         ]),
     };
     lines.push(Line::from(""));
@@ -1581,7 +1635,7 @@ fn render_steering_modal(
         Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(theme.border_accent)),
     );
     f.render_widget(para, popup);
 }
@@ -1592,9 +1646,10 @@ fn render_transient_status(f: &mut Frame, area: Rect, msg: &str) {
     let y = height.saturating_sub(3);
     let rect = Rect::new(area.x, area.y + y, area.width, 1);
     f.render_widget(Clear, rect);
+    let theme = theme::active();
     let line = Line::from(vec![
-        Span::styled("ⓘ ", Style::default().fg(Color::Cyan)),
-        Span::styled(msg.to_string(), Style::default().fg(Color::Gray)),
+        Span::styled("ⓘ ", Style::default().fg(theme.accent)),
+        Span::styled(msg.to_string(), Style::default().fg(theme.muted)),
     ]);
     f.render_widget(Paragraph::new(line), rect);
 }
@@ -1612,7 +1667,7 @@ fn build_title(
         Span::styled(" vel auto ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("› {} ", state.spinner_verb),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::active().muted),
         ),
     ];
 
@@ -1631,9 +1686,9 @@ fn build_title(
     }
     s += &format!(" · {scroll_label} ");
     let right_color = if error_count > 0 {
-        Color::Red
+        theme::active().error
     } else {
-        Color::Gray
+        theme::active().muted
     };
     let right = vec![Span::styled(s, Style::default().fg(right_color))];
     (left, right)
@@ -1681,15 +1736,18 @@ fn render_sticky_todo(f: &mut Frame, area: Rect, todo: &str) {
     };
     let mut lines: Vec<Line<'static>> = todo.lines().take(take).map(todo_line_span).collect();
     if truncated {
+        // Height-limited, not a data-collapse — there's no fuller view to
+        // expand into (unlike a tool result's Ctrl+O), just less panel space
+        // than todo lines.
         let hidden = total_lines - lines.len();
         lines.push(Line::from(Span::styled(
-            format!("… {hidden} more (Ctrl+O: Expand)"),
-            Style::default().fg(Color::DarkGray),
+            format!("… {hidden} more"),
+            Style::default().fg(theme::active().dim),
         )));
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(theme::active().border))
         .title(Line::from(Span::styled(
             " Todos ",
             Style::default().add_modifier(Modifier::BOLD),
@@ -1699,27 +1757,27 @@ fn render_sticky_todo(f: &mut Frame, area: Rect, todo: &str) {
 
 /// Colours one line of sticky todo content by its checklist marker, if any.
 fn todo_line_span(line: &str) -> Line<'static> {
-    let color = match line.trim_start() {
-        s if s.starts_with("[x]") => Color::Green,
-        s if s.starts_with("[~]") => Color::Yellow,
-        s if s.starts_with("[ ]") => Color::Gray,
-        _ => Color::White,
+    let theme = theme::active();
+    let style = match line.trim_start() {
+        s if s.starts_with("[x]") => Style::default().fg(theme.success),
+        s if s.starts_with("[~]") => Style::default().fg(theme.warning),
+        s if s.starts_with("[ ]") => Style::default().fg(theme.muted),
+        _ => theme.text_style(),
     };
-    Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
+    Line::from(Span::styled(line.to_string(), style))
 }
 
 fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
+    let theme = theme::active();
     let spinner = SPINNER[state.spinner_idx];
     let cached_pct = (state.cached_tokens * 100)
         .checked_div(state.input_tokens)
         .unwrap_or(0);
     let mut spans = vec![
-        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{spinner} "), Style::default().fg(theme.accent)),
         Span::styled(
             state.spinner_verb,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
         ),
         Span::raw("…  "),
         Span::styled(
@@ -1729,14 +1787,14 @@ fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
                 fmt_tokens(state.output_tokens),
                 cached_pct
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         ),
     ];
     if let Some((current, total)) = state.iteration {
         spans.push(Span::raw("  ·  "));
         spans.push(Span::styled(
             format!("iter {current}/{total}"),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme.muted),
         ));
     }
     // "Viewing iteration" — distinct from the running iteration above. Shown
@@ -1750,7 +1808,7 @@ fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
             spans.push(Span::styled(
                 format!("viewing iter {viewing}"),
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -1761,16 +1819,16 @@ fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
         spans.push(Span::raw("  ·  "));
         spans.push(Span::styled(
             format!("append: {preview}"),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme.success),
         ));
     }
     // Live-steering availability, shown only when relevant.
     if !matches!(state.live_steering_status, LiveSteeringStatus::Unsupported) {
         let (label, color) = match state.live_steering_status {
-            LiveSteeringStatus::Ready => ("steer: ready", Color::Green),
-            LiveSteeringStatus::Inactive => ("steer: idle", Color::DarkGray),
-            LiveSteeringStatus::Closing => ("steer: closing", Color::Yellow),
-            LiveSteeringStatus::Unsupported => ("", Color::DarkGray),
+            LiveSteeringStatus::Ready => ("steer: ready", theme.success),
+            LiveSteeringStatus::Inactive => ("steer: idle", theme.dim),
+            LiveSteeringStatus::Closing => ("steer: closing", theme.warning),
+            LiveSteeringStatus::Unsupported => ("", theme.dim),
         };
         spans.push(Span::raw("  ·  "));
         spans.push(Span::styled(label, Style::default().fg(color)));
@@ -1790,7 +1848,7 @@ fn render_hints(
         Span::styled(
             k.to_string(),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::active().accent)
                 .add_modifier(Modifier::BOLD),
         )
     };
@@ -1810,9 +1868,9 @@ fn render_hints(
         ]
     } else {
         let (label, color) = if error_count > 0 {
-            (format!(" errors:{} ", error_count), Color::Red)
+            (format!(" errors:{} ", error_count), theme::active().error)
         } else {
-            (" errors ".to_string(), Color::DarkGray)
+            (" errors ".to_string(), theme::active().dim)
         };
         vec![
             key("p"),
@@ -1862,22 +1920,11 @@ fn fmt_tokens(n: u64) -> String {
 
 // ── Per-entry rendering (content lines, pre-wrap) ────────────────────────────
 
-/// Background fill for the tool-call/result "terminal card": distinctly
-/// darker than the surrounding transcript so a command and its output read as
-/// one embedded terminal, command on top and output beneath it.
-const TOOL_CARD_BG: Color = Color::Rgb(8, 8, 10);
-/// Stroke colour for the box drawn around a tool card.
-const TOOL_CARD_BORDER: Color = Color::Rgb(110, 110, 122);
-/// Colour used for inline-code (backtick-quoted) spans in the agent's prose —
-/// a bright, distinctive green so a symbol the agent mentions in text stands
-/// out from the rest of the prose.
-const SYMBOL_GREEN: Color = Color::Rgb(0x00, 0xff, 0x88);
-
 /// The [`tui_markdown::StyleSheet`] used for the agent's own prose (assistant
 /// text and thinking): identical to the crate's stock theme (already used for
-/// the prompt modal) except inline code, which we recolour to
-/// [`SYMBOL_GREEN`] with no background — a symbol the agent mentions in
-/// prose should read like the same symbol in a diff, not sit in its own box.
+/// the prompt modal) except inline code, recoloured to the active theme's
+/// `mdCode` with no background — a symbol the agent mentions in prose should
+/// read like the same symbol in a diff, not sit in its own box.
 #[derive(Debug, Clone, Copy)]
 struct ProseStyleSheet;
 
@@ -1886,7 +1933,7 @@ impl tui_markdown::StyleSheet for ProseStyleSheet {
         tui_markdown::DefaultStyleSheet.heading(level)
     }
     fn code(&self) -> Style {
-        Style::default().fg(SYMBOL_GREEN)
+        Style::default().fg(theme::active().md_code)
     }
     fn link(&self) -> Style {
         tui_markdown::DefaultStyleSheet.link()
@@ -2081,14 +2128,15 @@ fn highlight_plain_line(
 }
 
 /// The top or bottom rule of a tool card's box, optionally with an embedded
-/// label (the command/target, on the opening rule). Filled with
-/// [`TOOL_CARD_BG`] so the rule reads as part of the same solid card as the
-/// content rows it opens/closes, stroked in [`TOOL_CARD_BORDER`]. Degrades to
-/// a bare label when the width can't fit the corners + label, mirroring
+/// label (the command/target, on the opening rule). Filled with `bg` so the
+/// rule reads as part of the same solid card as the content rows it
+/// opens/closes, stroked in the active theme's `border`. Degrades to a bare
+/// label when the width can't fit the corners + label, mirroring
 /// [`render_iteration_divider`]'s narrow-width handling.
-fn tool_card_rule(left: char, right: char, label: &str, width: usize) -> Line<'static> {
+fn tool_card_rule(left: char, right: char, label: &str, width: usize, bg: Color) -> Line<'static> {
+    let border = theme::active().border;
     let w = width.max(2);
-    let rule_style = Style::default().fg(TOOL_CARD_BORDER).bg(TOOL_CARD_BG);
+    let rule_style = Style::default().fg(border).bg(bg);
     if label.is_empty() {
         let dashes = w.saturating_sub(2);
         return Line::from(Span::styled(
@@ -2096,7 +2144,7 @@ fn tool_card_rule(left: char, right: char, label: &str, width: usize) -> Line<'s
             rule_style,
         ));
     }
-    let label_style = Style::default().fg(Color::White).bg(TOOL_CARD_BG);
+    let label_style = theme::active().text_style().bg(bg);
     let label_w = UnicodeWidthStr::width(label);
     // "{left}─ " (3) + label + " " (1) + dashes + "{right}" (1).
     let fixed_w = 5 + label_w;
@@ -2107,37 +2155,32 @@ fn tool_card_rule(left: char, right: char, label: &str, width: usize) -> Line<'s
     Line::from(vec![
         Span::styled(format!("{left}─ "), rule_style),
         Span::styled(label.to_string(), label_style),
-        Span::styled(" ", Style::default().bg(TOOL_CARD_BG)),
+        Span::styled(" ", Style::default().bg(bg)),
         Span::styled("─".repeat(dashes), rule_style),
         Span::styled(right.to_string(), rule_style),
     ])
 }
 
 /// One bordered content row inside a tool card: `"│ " + spans (padded) + " │"`,
-/// filled edge-to-edge with [`TOOL_CARD_BG`].
-fn tool_card_row(mut spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let border = || Span::styled("│ ", Style::default().fg(TOOL_CARD_BORDER).bg(TOOL_CARD_BG));
+/// filled edge-to-edge with `bg`.
+fn tool_card_row(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+    let border_color = theme::active().border;
+    let border = || Span::styled("│ ", Style::default().fg(border_color).bg(bg));
     let inner_w = width.saturating_sub(4); // "│ " + " │"
     let content_w: usize = spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     for s in &mut spans {
-        s.style = s.style.bg(TOOL_CARD_BG);
+        s.style = s.style.bg(bg);
     }
     let mut out = vec![border()];
     out.extend(spans);
     let pad = inner_w.saturating_sub(content_w);
     if pad > 0 {
-        out.push(Span::styled(
-            " ".repeat(pad),
-            Style::default().bg(TOOL_CARD_BG),
-        ));
+        out.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
     }
-    out.push(Span::styled(
-        " │",
-        Style::default().fg(TOOL_CARD_BORDER).bg(TOOL_CARD_BG),
-    ));
+    out.push(Span::styled(" │", Style::default().fg(border_color).bg(bg)));
     Line::from(out)
 }
 
@@ -2145,10 +2188,11 @@ fn render_entry(
     kind: &EntryKind,
     width: usize,
     engine: &mut HighlightEngine,
+    opts: RenderOpts,
 ) -> Vec<Line<'static>> {
     match kind {
         EntryKind::Text(text) => {
-            let mut lines = render_prose(text, Style::default().fg(Color::White));
+            let mut lines = render_prose(text, theme::active().text_style());
             // Trailing blank row gives paragraphs breathing room, matching the
             // document-like spacing of a prose-first transcript. Safe for the
             // viewport/cache row accounting: the blank row belongs to this
@@ -2160,7 +2204,7 @@ fn render_entry(
         EntryKind::Thinking(text) => render_prose(
             text,
             Style::default()
-                .fg(Color::Gray)
+                .fg(theme::active().thinking_text)
                 .add_modifier(Modifier::ITALIC),
         ),
 
@@ -2192,7 +2236,11 @@ fn render_entry(
         } => {
             let failed = *success == Some(false);
             if is_file_edit_tool(tool) {
-                let color = if failed { Color::Red } else { Color::DarkGray };
+                let color = if failed {
+                    theme::active().error
+                } else {
+                    theme::active().dim
+                };
                 let text = detail.lines().next().unwrap_or("(no output)");
                 return vec![Line::from(Span::styled(
                     truncate_str(text, 200),
@@ -2206,30 +2254,31 @@ fn render_entry(
             // tool name, when the provider let us correlate the two (see
             // `AgentEvent::ToolResult::command`) — that's the box's header,
             // matching what a real embedded terminal would show.
+            let theme = theme::active();
+            let card_bg = if failed {
+                theme.tool_error_bg
+            } else {
+                theme.tool_success_bg
+            };
             let label = match command.as_deref() {
                 Some(cmd) if tool == "Bash" => format!("$ {cmd}"),
                 Some(cmd) => format!("{tool}  {cmd}"),
                 None => tool.clone(),
             };
-            let mut lines = vec![tool_card_rule('╭', '╮', &label, width)];
+            let mut lines = vec![tool_card_rule('╭', '╮', &label, width, card_bg)];
             let body_fg = if failed {
-                Color::Rgb(230, 110, 110)
+                theme.error
             } else {
-                Color::Gray
+                theme.tool_output
             };
             let mut divider_spans = vec![
-                Span::styled("── ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Output",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("── ", Style::default().fg(theme.dim)),
+                Span::styled("Output", theme.text_style().add_modifier(Modifier::BOLD)),
             ];
             if failed {
-                divider_spans.push(Span::styled(" (failed)", Style::default().fg(Color::Red)));
+                divider_spans.push(Span::styled(" (failed)", Style::default().fg(theme.error)));
             }
-            lines.push(tool_card_row(divider_spans, width));
+            lines.push(tool_card_row(divider_spans, width, card_bg));
             let body: Vec<&str> = detail.lines().collect();
             // A failure's plain red already carries the signal that matters;
             // syntax colour would just compete with it, so only highlight on
@@ -2241,32 +2290,66 @@ fn render_entry(
             } else {
                 infer_output_syntax(tool, command.as_deref())
             };
+            // Expanded mode also relaxes the per-line truncation — a long
+            // line cut at 200 chars would still look truncated even with
+            // every line present. wrap_spans_indented handles the actual
+            // terminal wrapping either way.
+            let per_line_cap = if opts.expand { 4000 } else { 200 };
+            let render_line = |line: &str, engine: &mut HighlightEngine| -> Line<'static> {
+                let truncated = truncate_str(line, per_line_cap);
+                let spans = match syntax {
+                    Some(syn) => highlight_plain_line(&truncated, engine, syn, body_fg),
+                    None => vec![Span::styled(truncated, Style::default().fg(body_fg))],
+                };
+                tool_card_row(spans, width, card_bg)
+            };
             if body.is_empty() {
                 lines.push(tool_card_row(
                     vec![Span::styled(
                         "(no output)".to_string(),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.dim),
                     )],
                     width,
+                    card_bg,
                 ));
-            } else {
+            } else if opts.expand || body.len() <= opts.max_entry_lines {
                 for line in &body {
-                    let truncated = truncate_str(line, 200);
-                    let spans = match syntax {
-                        Some(syn) => highlight_plain_line(&truncated, engine, syn, body_fg),
-                        None => vec![Span::styled(truncated, Style::default().fg(body_fg))],
-                    };
-                    lines.push(tool_card_row(spans, width));
+                    lines.push(render_line(line, engine));
+                }
+            } else {
+                // Collapsed: head + tail, with the hidden middle both counted
+                // and — via Ctrl+O — recoverable, since `detail` above always
+                // holds the full text (never folded at ingest).
+                let keep = (opts.max_entry_lines.max(2) / 2).max(1);
+                let omitted = body.len() - 2 * keep;
+                for line in &body[..keep] {
+                    lines.push(render_line(line, engine));
+                }
+                lines.push(tool_card_row(
+                    vec![Span::styled(
+                        format!("… {omitted} more lines (Ctrl+O: Expand)"),
+                        Style::default().fg(theme.dim),
+                    )],
+                    width,
+                    card_bg,
+                ));
+                for line in &body[body.len() - keep..] {
+                    lines.push(render_line(line, engine));
                 }
             }
-            lines.push(tool_card_rule('╰', '╯', "", width));
+            lines.push(tool_card_rule('╰', '╯', "", width, card_bg));
             lines.push(Line::default());
             lines
         }
 
         EntryKind::Error(msg) => msg
             .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red))))
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(theme::active().error),
+                ))
+            })
             .collect(),
 
         EntryKind::Info(msg) => msg
@@ -2274,7 +2357,7 @@ fn render_entry(
             .map(|l| {
                 Line::from(Span::styled(
                     l.to_string(),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme::active().accent),
                 ))
             })
             .collect(),
@@ -2284,7 +2367,7 @@ fn render_entry(
             .map(|l| {
                 Line::from(Span::styled(
                     l.to_string(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme::active().warning),
                 ))
             })
             .collect(),
@@ -2307,9 +2390,10 @@ fn render_iteration_divider(number: u32, maximum: Option<u32>, width: usize) -> 
     };
     let label_w = UnicodeWidthStr::width(label.as_str());
     let w = width.max(1);
-    let rule_style = Style::default().fg(Color::DarkGray);
+    let theme = theme::active();
+    let rule_style = Style::default().fg(theme.border_muted);
     let label_style = Style::default()
-        .fg(Color::Gray)
+        .fg(theme.muted)
         .add_modifier(Modifier::BOLD);
     if w <= label_w {
         // Too narrow for any rule; show just the label.
@@ -2389,7 +2473,7 @@ fn render_file_edit(
     if !lang.is_empty() {
         header.push(Span::styled(
             format!("{lang} "),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::active().dim),
         ));
     }
     header.push(Span::styled(
@@ -2399,14 +2483,14 @@ fn render_file_edit(
     match suffix {
         Some(s) => header.push(Span::styled(
             format!("  {s}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::active().dim),
         )),
         None => {
             let (adds, dels) = diff_stat(edit);
             if adds + dels > 0 {
                 header.push(Span::styled(
                     format!("  (+{adds}/-{dels})"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::active().dim),
                 ));
             }
         }
@@ -2419,7 +2503,7 @@ fn render_file_edit(
                 Span::raw("  "),
                 Span::styled(
                     format!("⚠ could not capture edit: {reason}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme::active().warning),
                 ),
             ]));
         }
@@ -2429,7 +2513,7 @@ fn render_file_edit(
                 Span::styled(
                     "binary file changed (contents not shown)",
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(theme::active().dim)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -2463,8 +2547,12 @@ fn render_file_edit(
                 ));
             }
             if edit.omitted_lines > 0 {
+                // Unlike a tool result's output, a diff this large was
+                // already bounded (head + tail kept) when the edit was
+                // captured — the omitted middle never reached the TUI at
+                // all, so there's nothing `Ctrl+O` could reveal here.
                 lines.push(dim_line(format!(
-                    "… {} more lines (Ctrl+O: Expand)",
+                    "… {} more lines — full diff is in the run log",
                     edit.omitted_lines
                 )));
             }
@@ -2518,12 +2606,13 @@ fn elide_middle(s: &str, max: usize) -> String {
 
 /// `(path colour, optional status suffix)` for the file-edit header.
 fn header_style(kind: &FileEditKind) -> (Color, Option<&'static str>) {
+    let theme = theme::active();
     match kind {
-        FileEditKind::Created => (Color::Green, Some("new file")),
-        FileEditKind::Deleted => (Color::Red, Some("deleted")),
-        FileEditKind::Binary => (Color::Magenta, Some("binary")),
-        FileEditKind::CaptureFailed { .. } => (Color::Yellow, Some("capture failed")),
-        FileEditKind::Modified => (Color::Cyan, None),
+        FileEditKind::Created => (theme.diff_added, Some("new file")),
+        FileEditKind::Deleted => (theme.diff_removed, Some("deleted")),
+        FileEditKind::Binary => (theme.muted, Some("binary")),
+        FileEditKind::CaptureFailed { .. } => (theme.warning, Some("capture failed")),
+        FileEditKind::Modified => (theme.accent, None),
     }
 }
 
@@ -2745,11 +2834,9 @@ fn strip_term(s: &str) -> &str {
 /// sets background without touching foreground — so syntax colours survive on
 /// added/removed lines instead of being washed out by the green/red tint. The
 /// gutter (sign + line number + separator) is styled independently.
-/// A vivid background chip applied to the *specific tokens* an intraline word
-/// diff identified as changed, on top of the softer whole-line tint. Paired
-/// with a near-black foreground for contrast against either chip colour.
-const WORD_DIFF_ADD_BG: Color = Color::Rgb(46, 133, 64);
-const WORD_DIFF_DEL_BG: Color = Color::Rgb(178, 62, 88);
+/// Near-black foreground for the word-diff emphasis chip — fixed rather than
+/// theme-derived, since it needs to stay legible against either chip colour
+/// (the theme's own vivid `diff_added`/`diff_removed`) regardless of theme.
 const WORD_DIFF_FG: Color = Color::Rgb(15, 15, 15);
 
 fn render_diff_line(
@@ -2759,19 +2846,20 @@ fn render_diff_line(
     engine: &mut HighlightEngine,
     emphasis: &[std::ops::Range<usize>],
 ) -> Line<'static> {
+    let theme = theme::active();
     let (sign, sign_color, tint, emphasis_bg) = match dl.kind {
-        LineKind::Context => (" ", Color::DarkGray, None, None),
+        LineKind::Context => (" ", theme.diff_context, None, None),
         LineKind::Addition => (
             "+",
-            Color::Green,
-            Some(Color::Rgb(20, 40, 20)),
-            Some(WORD_DIFF_ADD_BG),
+            theme.diff_added,
+            Some(theme::Theme::dim_bg(theme.diff_added)),
+            Some(theme.diff_added),
         ),
         LineKind::Removal => (
             "-",
-            Color::Red,
-            Some(Color::Rgb(40, 20, 20)),
-            Some(WORD_DIFF_DEL_BG),
+            theme.diff_removed,
+            Some(theme::Theme::dim_bg(theme.diff_removed)),
+            Some(theme.diff_removed),
         ),
     };
     // Removals show the old number; additions/context show the new number.
@@ -2821,8 +2909,8 @@ fn render_diff_line(
             Style::default().fg(sign_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(lineno_str, Style::default().fg(Color::DarkGray)),
-        Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(lineno_str, Style::default().fg(theme.dim)),
+        Span::styled(" │ ".to_string(), Style::default().fg(theme.dim)),
     ];
     spans.extend(source);
     Line::from(spans)
@@ -3069,7 +3157,7 @@ fn line_no_for_gap(l: &DiffLine) -> Option<usize> {
 fn dim_line(text: String) -> Line<'static> {
     Line::from(vec![Span::styled(
         text,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::active().dim),
     )])
 }
 
@@ -3128,19 +3216,19 @@ fn render_error_modal(
             Span::styled(
                 format!("#{i}  "),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(theme::active().dim)
                     .add_modifier(Modifier::DIM),
             ),
-            Span::styled(format!("{ts} "), Style::default().fg(Color::DarkGray)),
-            Span::styled("❌ ", Style::default().fg(Color::Red)),
-            Span::styled(msg.to_string(), Style::default().fg(Color::Red)),
+            Span::styled(format!("{ts} "), Style::default().fg(theme::active().dim)),
+            Span::styled("❌ ", Style::default().fg(theme::active().error)),
+            Span::styled(msg.to_string(), Style::default().fg(theme::active().error)),
         ]));
     }
 
     if count == 0 {
         lines.push(Line::from(Span::styled(
             "No errors recorded so far.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::active().dim),
         )));
     } else if !omitted.is_empty() {
         lines.push(Line::from(""));
@@ -3149,9 +3237,7 @@ fn render_error_modal(
                 "Note: {} older entries were trimmed from the live view; see the run log for full history.",
                 omitted.entries
             ),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(theme::active().dim).add_modifier(Modifier::DIM),
         )));
     }
 
@@ -3168,9 +3254,9 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
 
     let key_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(theme::active().accent)
         .add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(Color::Gray);
+    let desc_style = Style::default().fg(theme::active().muted);
 
     let mut lines: Vec<Line> = Vec::new();
     for (k, desc) in [
@@ -3198,6 +3284,10 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
             "Edit the persistent append (folded into every later iteration)",
         ),
         ("l", "Open the JSONL run log in your pager"),
+        (
+            "Ctrl+O",
+            "Expand/collapse tool-result output in place (full text vs. head+tail)",
+        ),
         ("?", "Show this keybindings help"),
         (
             "q / Ctrl+C×2",
@@ -3213,7 +3303,7 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
     lines.push(Line::from(Span::styled(
         "Live view is bounded; the complete transcript is always in the run log.",
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(theme::active().dim)
             .add_modifier(Modifier::DIM),
     )));
 
@@ -3615,7 +3705,7 @@ mod render_tests {
     fn file_edit_layout_has_gutter_syntax_and_diff_styles() {
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::FileEdit(Box::new(one_line_replacement_edit()));
-        let rows = build_layout(&kind, Local::now(), 80, &mut engine);
+        let rows = build_layout(&kind, Local::now(), 80, &mut engine, RenderOpts::default());
         assert!(!rows.is_empty());
 
         // Flatten spans, checking for ANSI escapes and gathering evidence of
@@ -3626,31 +3716,37 @@ mod render_tests {
         let mut has_syntax_fg = false;
         let mut has_plus_sign = false;
         let mut has_minus_sign = false;
+        let theme = theme::active();
+        let addition_bg = theme::Theme::dim_bg(theme.diff_added);
+        let removal_bg = theme::Theme::dim_bg(theme.diff_removed);
         for line in &rows {
             for span in &line.spans {
                 text.push_str(&span.content);
                 let style = span.style;
-                if style.bg == Some(Color::Rgb(20, 40, 20)) {
+                if style.bg == Some(addition_bg) {
                     has_addition_bg = true;
                 }
-                if style.bg == Some(Color::Rgb(40, 20, 20)) {
+                if style.bg == Some(removal_bg) {
                     has_removal_bg = true;
                 }
                 if matches!(style.fg, Some(Color::Rgb(..))) {
                     has_syntax_fg = true;
                 }
-                if span.content == "+" && style.fg == Some(Color::Green) {
+                if span.content == "+" && style.fg == Some(theme.diff_added) {
                     has_plus_sign = true;
                 }
-                if span.content == "-" && style.fg == Some(Color::Red) {
+                if span.content == "-" && style.fg == Some(theme.diff_removed) {
                     has_minus_sign = true;
                 }
             }
         }
         assert!(!text.contains('\x1b'), "no ANSI escapes embedded in spans");
         assert!(text.contains("│"), "gutter separator present");
-        assert!(has_plus_sign, "added lines carry a green + gutter marker");
-        assert!(has_minus_sign, "removed lines carry a red - gutter marker");
+        assert!(has_plus_sign, "added lines carry a themed + gutter marker");
+        assert!(
+            has_minus_sign,
+            "removed lines carry a themed - gutter marker"
+        );
         assert!(
             has_addition_bg,
             "added line source keeps syntax fg with a green background tint"
@@ -3675,7 +3771,7 @@ mod render_tests {
         )
         .expect("created edit");
         let kind = EntryKind::FileEdit(Box::new(edit));
-        let rows = build_layout(&kind, Local::now(), 40, &mut engine);
+        let rows = build_layout(&kind, Local::now(), 40, &mut engine, RenderOpts::default());
 
         // rows[0] = header; rows[1] = first (guttered) row of the added line;
         // rows[2..] = wrapped continuation rows.
@@ -3908,7 +4004,7 @@ mod render_tests {
 
         // Find a span covering a syntax token on the added line and assert it
         // has both fg (syntax) and the addition bg tint.
-        let addition_bg = Color::Rgb(20, 40, 20);
+        let addition_bg = theme::Theme::dim_bg(theme::active().diff_added);
         let has_composed = line.spans.iter().any(|s| {
             s.style.bg == Some(addition_bg) && s.style.fg.is_some() && !s.content.trim().is_empty()
         });
@@ -3934,7 +4030,7 @@ mod render_tests {
             .expect("a removed line exists");
         let line = render_diff_line(removed, num_width, &highlighted, &mut engine, &[]);
 
-        let removal_bg = Color::Rgb(40, 20, 20);
+        let removal_bg = theme::Theme::dim_bg(theme::active().diff_removed);
         // At least some non-empty content on the removal line carries the bg.
         let has_bg = line
             .spans
@@ -3959,12 +4055,14 @@ mod render_tests {
             .expect("a context line exists");
         let line = render_diff_line(ctx, num_width, &highlighted, &mut engine, &[]);
         // No source span on a context line should carry a diff bg tint.
+        let theme = theme::active();
+        let addition_bg = theme::Theme::dim_bg(theme.diff_added);
+        let removal_bg = theme::Theme::dim_bg(theme.diff_removed);
         let source_spans = &line.spans;
         assert!(
-            source_spans.iter().all(|s| !matches!(
-                s.style.bg,
-                Some(Color::Rgb(20, 40, 20) | Color::Rgb(40, 20, 20))
-            )),
+            source_spans
+                .iter()
+                .all(|s| s.style.bg != Some(addition_bg) && s.style.bg != Some(removal_bg)),
             "context lines carry no diff background"
         );
     }
@@ -3986,6 +4084,7 @@ mod render_tests {
             Local::now(),
             100,
             &mut engine,
+            RenderOpts::default(),
         );
         // Reaching here = no panic on the full Svelte 5 construct set.
     }
@@ -4162,9 +4261,9 @@ mod render_tests {
         let rows = render_hunk_lines(&hunk.lines, num_width, &highlighted, &mut engine);
 
         let has_emphasis_chip = rows.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| s.style.bg == Some(WORD_DIFF_ADD_BG) && s.content.contains("Runtime"))
+            line.spans.iter().any(|s| {
+                s.style.bg == Some(theme::active().diff_added) && s.content.contains("Runtime")
+            })
         });
         assert!(
             has_emphasis_chip,
@@ -4176,26 +4275,28 @@ mod render_tests {
 
     #[test]
     fn tool_card_row_pads_to_the_full_width_with_the_card_background() {
-        let line = tool_card_row(vec![Span::styled("hi", Style::default())], 10);
+        let bg = theme::active().tool_success_bg;
+        let line = tool_card_row(vec![Span::styled("hi", Style::default())], 10, bg);
         let total_w: usize = line
             .spans
             .iter()
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum();
         assert_eq!(total_w, 10);
-        assert!(line.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)));
+        assert!(line.spans.iter().all(|s| s.style.bg == Some(bg)));
         assert!(row_text(&line).starts_with('│'));
         assert!(row_text(&line).ends_with('│'));
     }
 
     #[test]
     fn tool_card_rule_embeds_the_label_between_the_corners() {
-        let line = tool_card_rule('╭', '╮', "$ echo hi", 40);
+        let bg = theme::active().tool_success_bg;
+        let line = tool_card_rule('╭', '╮', "$ echo hi", 40, bg);
         let text = row_text(&line);
         assert!(text.starts_with('╭'), "got {text:?}");
         assert!(text.ends_with('╮'), "got {text:?}");
         assert!(text.contains("$ echo hi"), "got {text:?}");
-        assert!(line.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)));
+        assert!(line.spans.iter().all(|s| s.style.bg == Some(bg)));
     }
 
     #[test]
@@ -4214,7 +4315,7 @@ mod render_tests {
                 input: serde_json::Value::Null,
             };
             assert_eq!(
-                render_entry(&kind, 40, &mut engine),
+                render_entry(&kind, 40, &mut engine, RenderOpts::default()),
                 Vec::<Line>::new(),
                 "{tool} call should render nothing"
             );
@@ -4233,7 +4334,7 @@ mod render_tests {
             success: Some(true),
             command: None,
         };
-        let rows = render_entry(&kind, 40, &mut engine);
+        let rows = render_entry(&kind, 40, &mut engine, RenderOpts::default());
         // opening rule + divider + 1 output line + closing rule + trailing blank.
         assert_eq!(rows.len(), 5, "even a one-line result gets the full card");
         assert!(
@@ -4244,11 +4345,11 @@ mod render_tests {
         assert!(row_text(&rows[0]).contains("Bash"));
         assert!(row_text(&rows[1]).contains("Output"));
         assert!(row_text(&rows[3]).starts_with('╰'));
-        assert!(
-            rows[..4]
+        assert!(rows[..4].iter().all(|l| {
+            l.spans
                 .iter()
-                .all(|l| l.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)))
-        );
+                .all(|s| s.style.bg == Some(theme::active().tool_success_bg))
+        }));
     }
 
     #[test]
@@ -4260,16 +4361,118 @@ mod render_tests {
             success: Some(true),
             command: None,
         };
-        let rows = render_entry(&kind, 40, &mut engine);
+        let rows = render_entry(&kind, 40, &mut engine, RenderOpts::default());
         // opening rule + divider + 2 output lines + closing rule + trailing blank.
         assert_eq!(rows.len(), 6);
         assert!(row_text(&rows[0]).starts_with('╭'));
         assert!(row_text(&rows[1]).contains("── Output"));
         assert!(row_text(&rows[4]).starts_with('╰'));
-        assert!(
-            rows[..5]
+        assert!(rows[..5].iter().all(|l| {
+            l.spans
                 .iter()
-                .all(|l| l.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)))
+                .all(|s| s.style.bg == Some(theme::active().tool_success_bg))
+        }));
+    }
+
+    #[test]
+    fn collapsed_tool_result_shows_head_tail_and_an_expand_marker() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let body: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let kind = EntryKind::ToolResult {
+            tool: "Bash".to_string(),
+            detail: body.join("\n"),
+            success: Some(true),
+            command: None,
+        };
+        let opts = RenderOpts {
+            expand: false,
+            max_entry_lines: 4,
+        };
+        let rows = render_entry(&kind, 40, &mut engine, opts);
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("line 0"), "head is kept");
+        assert!(text.contains("line 1"), "head is kept");
+        assert!(text.contains("line 19"), "tail is kept");
+        assert!(text.contains("line 18"), "tail is kept");
+        assert!(
+            !text.contains("line 10"),
+            "middle is hidden while collapsed"
+        );
+        assert!(text.contains("16 more lines (Ctrl+O: Expand)"));
+    }
+
+    #[test]
+    fn expanded_tool_result_shows_the_full_body_with_no_marker() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let body: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let kind = EntryKind::ToolResult {
+            tool: "Bash".to_string(),
+            detail: body.join("\n"),
+            success: Some(true),
+            command: None,
+        };
+        let opts = RenderOpts {
+            expand: true,
+            max_entry_lines: 4,
+        };
+        let rows = render_entry(&kind, 40, &mut engine, opts);
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        for i in 0..20 {
+            assert!(
+                text.contains(&format!("line {i}")),
+                "line {i} missing when expanded"
+            );
+        }
+        assert!(
+            !text.contains("Ctrl+O"),
+            "no expand marker once already expanded"
+        );
+    }
+
+    #[test]
+    fn short_tool_result_never_folds_regardless_of_expand() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            tool: "Bash".to_string(),
+            detail: "only one line".to_string(),
+            success: Some(true),
+            command: None,
+        };
+        let opts = RenderOpts {
+            expand: false,
+            max_entry_lines: 4,
+        };
+        let rows = render_entry(&kind, 40, &mut engine, opts);
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("only one line"));
+        assert!(!text.contains("Ctrl+O"));
+    }
+
+    #[test]
+    fn layout_cache_toggle_expand_output_changes_the_cache_key() {
+        // The whole expand feature hinges on this: toggling must not return a
+        // stale cached (collapsed) layout for an entry already rendered once.
+        let mut cache = LayoutCache::new(64, 4);
+        let mut t = Transcript::new(TuiLimits::default());
+        t.ingest(TuiEntry::now(EntryKind::ToolResult {
+            tool: "Bash".to_string(),
+            detail: (0..20)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            success: Some(true),
+            command: None,
+        }));
+        let entry = &t.entries()[0];
+        cache.rows_for(entry, 40);
+        let collapsed = cache.layout(entry, 40).expect("cached").to_vec();
+        cache.toggle_expand_output();
+        cache.rows_for(entry, 40);
+        let expanded = cache.layout(entry, 40).expect("cached").to_vec();
+        assert_ne!(
+            collapsed.len(),
+            expanded.len(),
+            "expanded layout must differ from the collapsed one, not reuse a stale cache entry"
         );
     }
 
@@ -4306,10 +4509,13 @@ mod render_tests {
         // command instead), so their order/adjacency can't corrupt anything;
         // each result independently opens and closes its own box.
         for kind in [&read_call, &bash_call] {
-            assert_eq!(render_entry(kind, 40, &mut engine), Vec::<Line>::new());
+            assert_eq!(
+                render_entry(kind, 40, &mut engine, RenderOpts::default()),
+                Vec::<Line>::new()
+            );
         }
         for (kind, expected_header) in [(&read_result, "SPEC.md"), (&bash_result, "$ git diff")] {
-            let rows = render_entry(kind, 40, &mut engine);
+            let rows = render_entry(kind, 40, &mut engine, RenderOpts::default());
             assert!(row_text(&rows[0]).starts_with('╭'));
             // The correlated command is the box's own header — not a
             // separate, possibly-disconnected line above it.
@@ -4339,7 +4545,7 @@ mod render_tests {
             success: Some(true),
             command: None,
         };
-        let rows = render_entry(&kind, 40, &mut engine);
+        let rows = render_entry(&kind, 40, &mut engine, RenderOpts::default());
         assert_eq!(rows.len(), 1);
         assert!(!row_text(&rows[0]).contains("Output"));
         assert!(rows[0].spans.iter().all(|s| s.style.bg.is_none()));
@@ -4365,7 +4571,7 @@ mod render_tests {
             .iter()
             .find(|s| s.content.as_ref() == "FeatureSnapshot::new")
             .expect("code span present");
-        assert_eq!(code.style.fg, Some(SYMBOL_GREEN));
+        assert_eq!(code.style.fg, Some(theme::active().md_code));
     }
 
     #[test]
@@ -4414,7 +4620,7 @@ mod render_tests {
             .iter()
             .find(|s| s.content.as_ref() == "FeatureValues")
             .expect("code span present");
-        assert_eq!(code.style.fg, Some(SYMBOL_GREEN));
+        assert_eq!(code.style.fg, Some(theme::active().md_code));
         assert!(code.style.add_modifier.contains(Modifier::ITALIC));
     }
 
@@ -4530,7 +4736,7 @@ mod render_tests {
             success: Some(true),
             command: Some("src/lib.rs".to_string()),
         };
-        let rows = render_entry(&kind, 60, &mut engine);
+        let rows = render_entry(&kind, 60, &mut engine, RenderOpts::default());
         // Row 2 is the (only) output line: rule, divider, output, rule, blank.
         let has_keyword_colour = rows[2]
             .spans
@@ -4553,7 +4759,7 @@ mod render_tests {
             success: Some(false),
             command: Some("src/lib.rs".to_string()),
         };
-        let rows = render_entry(&kind, 60, &mut engine);
+        let rows = render_entry(&kind, 60, &mut engine, RenderOpts::default());
         // Unhighlighted output is a single content span (not split into
         // per-token pieces like the highlighted case), styled entirely red.
         let content = rows[2]
@@ -4561,7 +4767,7 @@ mod render_tests {
             .iter()
             .find(|s| s.content.as_ref() == "fn main() {}")
             .expect("the whole line is one unsplit span");
-        assert_eq!(content.style.fg, Some(Color::Rgb(230, 110, 110)));
+        assert_eq!(content.style.fg, Some(theme::active().error));
     }
 
     // ── Sticky todo panel ────────────────────────────────────────────────────
@@ -4644,21 +4850,22 @@ mod render_tests {
 
     #[test]
     fn todo_line_span_colours_by_checklist_marker() {
+        let theme = theme::active();
         assert_eq!(
             todo_line_span("[x] done").spans[0].style.fg,
-            Some(Color::Green)
+            Some(theme.success)
         );
         assert_eq!(
             todo_line_span("[~] in progress").spans[0].style.fg,
-            Some(Color::Yellow)
+            Some(theme.warning)
         );
         assert_eq!(
             todo_line_span("[ ] pending").spans[0].style.fg,
-            Some(Color::Gray)
+            Some(theme.muted)
         );
         assert_eq!(
             todo_line_span("Remaining items (1):").spans[0].style.fg,
-            Some(Color::White)
+            theme.text
         );
     }
 

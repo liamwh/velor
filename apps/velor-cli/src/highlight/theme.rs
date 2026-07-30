@@ -11,9 +11,10 @@
 //! loaded) so the migration is colour-neutral for languages that already
 //! highlighted correctly.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use super::token::SemanticToken;
+use crate::theme;
 
 /// The `base16-ocean.dark` palette as flat `(r, g, b)` tuples, in declaration
 /// order. Centralising it here lets [`token_style`] colour tokens and lets the
@@ -82,46 +83,45 @@ impl Palette {
     }
 }
 
-/// The foreground style for a semantic token: colour plus any font modifiers.
+/// The foreground style for a semantic token: colour plus any font modifiers,
+/// sourced from the active UI theme's `syntax*` roles (see
+/// `crate::theme::Theme`) so code highlighting matches the rest of the TUI's
+/// palette rather than a fixed built-in scheme.
 ///
 /// Returns `Style::default()` (no fg, no modifiers) for [`SemanticToken::Text`]
-/// so the terminal default foreground shows — identical to the prior behaviour
-/// where syntect's unspecified-colour sentinel mapped to no ratatui fg.
+/// so the terminal default foreground shows.
 #[must_use]
 pub fn token_style(token: SemanticToken) -> Style {
-    // base16-ocean.dark palette (RGB), matching the old syntect theme so
-    // existing languages keep their colours.
-    const RED: Color = Color::Rgb(0xbf, 0x61, 0x6a);
-    const GREEN: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
-    const YELLOW: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
-    const BLUE: Color = Color::Rgb(0x8f, 0xa1, 0xb3);
-    const MAGENTA: Color = Color::Rgb(0xb4, 0x8e, 0xad);
-    const CYAN: Color = Color::Rgb(0x96, 0xb5, 0xb4);
-    const ORANGE: Color = Color::Rgb(0xd0, 0x87, 0x70);
-
+    let t = theme::active();
     let mut style = Style::default();
     match token {
         SemanticToken::Text => {} // terminal default foreground
-        SemanticToken::Comment => style = style.fg(BLUE).add_modifier(Modifier::ITALIC),
-        // Keywords: purple, control-flow slightly bolder.
-        SemanticToken::Keyword => style = style.fg(MAGENTA),
-        SemanticToken::Control => style = style.fg(MAGENTA).add_modifier(Modifier::BOLD),
-        SemanticToken::String => style = style.fg(GREEN),
-        SemanticToken::Number => style = style.fg(ORANGE),
-        SemanticToken::Constant => style = style.fg(YELLOW),
-        SemanticToken::Function => style = style.fg(BLUE),
-        // Types: teal; built-in type qualifier via bold.
-        SemanticToken::Type => style = style.fg(CYAN),
-        SemanticToken::Tag => style = style.fg(RED),
-        // Attributes: orange/yellow to stand out from tags.
-        SemanticToken::Attribute => style = style.fg(YELLOW),
-        SemanticToken::Property => style = style.fg(YELLOW),
-        SemanticToken::Variable => style = style.fg(Color::Reset),
-        SemanticToken::VariableBuiltin => style = style.fg(RED).add_modifier(Modifier::ITALIC),
-        SemanticToken::Punctuation => style = style.fg(Color::Reset),
-        SemanticToken::Operator => style = style.fg(Color::Reset),
-        // Labels (svelte blocks, decorators): magenta + bold so {#if}/{@render} read.
-        SemanticToken::Label => style = style.fg(MAGENTA).add_modifier(Modifier::BOLD),
+        SemanticToken::Comment => style = style.fg(t.syntax_comment).add_modifier(Modifier::ITALIC),
+        SemanticToken::Keyword => style = style.fg(t.syntax_keyword),
+        // Control-flow keywords: same hue, bolder.
+        SemanticToken::Control => style = style.fg(t.syntax_keyword).add_modifier(Modifier::BOLD),
+        SemanticToken::String => style = style.fg(t.syntax_string),
+        SemanticToken::Number => style = style.fg(t.syntax_number),
+        // No dedicated "constant" role in the theme schema; constants read as
+        // literal values, same as numbers.
+        SemanticToken::Constant => style = style.fg(t.syntax_number),
+        SemanticToken::Function => style = style.fg(t.syntax_function),
+        SemanticToken::Type => style = style.fg(t.syntax_type),
+        // No dedicated "tag" role; an HTML/XML tag reads like a keyword.
+        SemanticToken::Tag => style = style.fg(t.syntax_keyword),
+        // No dedicated attribute/property role; distinct from both keywords
+        // and plain variables.
+        SemanticToken::Attribute => style = style.fg(t.syntax_variable),
+        SemanticToken::Property => style = style.fg(t.syntax_variable),
+        SemanticToken::Variable => style = style.fg(t.syntax_variable),
+        SemanticToken::VariableBuiltin => {
+            style = style.fg(t.syntax_keyword).add_modifier(Modifier::ITALIC);
+        }
+        SemanticToken::Punctuation => style = style.fg(t.syntax_punctuation),
+        SemanticToken::Operator => style = style.fg(t.syntax_operator),
+        // Labels (svelte blocks, decorators): keyword hue + bold so
+        // {#if}/{@render} read.
+        SemanticToken::Label => style = style.fg(t.syntax_keyword).add_modifier(Modifier::BOLD),
     }
     style
 }

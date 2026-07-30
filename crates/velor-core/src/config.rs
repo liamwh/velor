@@ -557,6 +557,11 @@ pub struct TuiConfig {
     /// tail kept, middle folded — full content stays in the run log).
     #[serde(default)]
     pub max_entry_lines: Option<usize>,
+
+    /// Colour theme name (see `apps/velor-cli/src/theme.rs` for built-ins).
+    /// Unset or unrecognised falls back to the default theme ("titanium").
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 impl TuiConfig {
@@ -569,6 +574,7 @@ impl TuiConfig {
                 .or(self.max_transcript_entries),
             max_transcript_bytes: overlay.max_transcript_bytes.or(self.max_transcript_bytes),
             max_entry_lines: overlay.max_entry_lines.or(self.max_entry_lines),
+            theme: overlay.theme.or(self.theme),
         }
     }
 }

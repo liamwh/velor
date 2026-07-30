@@ -372,25 +372,24 @@ fn cap_streamed_text(s: &mut String, max_bytes: usize) {
     let omitted = s.len() - head_end - (s.len() - tail_start);
     let head = &s[..head_end];
     let tail = &s[tail_start..];
-    *s = format!("{head}\n ⋯ {omitted} more bytes (Ctrl+O: Expand) ⋯\n{tail}");
+    // Unlike tool-result output, streamed text/thinking isn't covered by the
+    // Ctrl+O expand toggle — the omitted middle is discarded right here,
+    // before the entry is even stored.
+    *s = format!("{head}\n ⋯ {omitted} more bytes — full text is in the run log ⋯\n{tail}");
 }
 
-/// Bounds an oversized tool result or Edit/Write diff so one entry cannot hold
-/// tens of thousands of live lines. Returns the (possibly folded) kind.
+/// Bounds an oversized Edit/Write diff input so one entry cannot hold tens of
+/// thousands of live lines. Returns the (possibly folded) kind.
+///
+/// `ToolResult` output is deliberately *not* folded here: the TUI renders it
+/// collapsed (head + tail) by default and expands to the full retained text
+/// on demand (the `Ctrl+O` toggle — see `streaming_tui::LayoutCache`), so
+/// discarding the middle at ingest would make expansion show nothing more
+/// than the collapsed view. The full transcript byte budget
+/// (`TuiLimits::max_bytes`) remains the memory bound.
 fn bound_oversized(kind: EntryKind, max_lines: usize) -> EntryKind {
     let max_lines = max_lines.max(2);
     match kind {
-        EntryKind::ToolResult {
-            tool,
-            detail,
-            success,
-            command,
-        } => EntryKind::ToolResult {
-            tool,
-            detail: fold_multiline(&detail, max_lines),
-            success,
-            command,
-        },
         EntryKind::ToolCall {
             tool,
             detail,
