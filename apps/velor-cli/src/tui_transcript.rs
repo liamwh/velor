@@ -41,6 +41,11 @@ pub enum EntryKind {
         tool: String,
         detail: String,
         success: Option<bool>,
+        /// The originating call's `detail` (command/path), when the provider
+        /// exposed a correlating call id. Drives the box's opening-rule label
+        /// and output-syntax inference at render time. `None` when the
+        /// provider can't correlate (e.g. no id in the protocol).
+        command: Option<String>,
     },
     /// A captured file edit: the real before/after diff for a file the agent
     /// modified (syntax-highlighted when rendered). Boxed to keep the enum small;
@@ -379,10 +384,12 @@ fn bound_oversized(kind: EntryKind, max_lines: usize) -> EntryKind {
             tool,
             detail,
             success,
+            command,
         } => EntryKind::ToolResult {
             tool,
             detail: fold_multiline(&detail, max_lines),
             success,
+            command,
         },
         EntryKind::ToolCall {
             tool,

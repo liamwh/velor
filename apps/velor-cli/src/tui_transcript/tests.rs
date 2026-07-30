@@ -170,6 +170,7 @@ fn oversized_tool_result_is_folded_with_marker() {
         tool: "Bash".to_string(),
         detail: huge,
         success: Some(true),
+        command: None,
     }));
     let EntryKind::ToolResult { detail, .. } = &t.entries()[0].kind else {
         panic!("expected ToolResult");

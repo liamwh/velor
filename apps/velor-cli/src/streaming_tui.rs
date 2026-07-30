@@ -180,10 +180,12 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
             tool,
             detail,
             success,
+            command,
         } => Some(TuiEntry::now(EntryKind::ToolResult {
             tool: tool.clone(),
             detail: detail.clone(),
             success: *success,
+            command: command.clone(),
         })),
         AgentEvent::FileEdit { edit } => {
             Some(TuiEntry::now(EntryKind::FileEdit(Box::new(edit.clone()))))
@@ -1867,9 +1869,9 @@ const TOOL_CARD_BG: Color = Color::Rgb(8, 8, 10);
 /// Stroke colour for the box drawn around a tool card.
 const TOOL_CARD_BORDER: Color = Color::Rgb(110, 110, 122);
 /// Colour used for inline-code (backtick-quoted) spans in the agent's prose —
-/// matches the syntax highlighter's own string/green so a symbol the agent
-/// mentions in text reads consistently with the same symbol in a diff.
-const SYMBOL_GREEN: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
+/// a bright, distinctive green so a symbol the agent mentions in text stands
+/// out from the rest of the prose.
+const SYMBOL_GREEN: Color = Color::Rgb(0x00, 0xff, 0x88);
 
 /// The [`tui_markdown::StyleSheet`] used for the agent's own prose (assistant
 /// text and thinking): identical to the crate's stock theme (already used for
@@ -1976,6 +1978,80 @@ fn todo_summary_from_input(input: &serde_json::Value) -> Option<String> {
 fn is_substantial_todo_summary(detail: &str) -> bool {
     let detail = detail.trim();
     !detail.is_empty() && (detail.lines().count() > 1 || detail.len() > 60)
+}
+
+/// Infers a [`velor_core::file_edit::SyntaxKind`] for a tool result's output
+/// body from the correlated call, when there's enough signal to be confident:
+/// a Read call's `command` *is* the file path, so its extension is used
+/// directly; a Bash `cat`/`bat <path>` invocation is unwrapped the same way.
+/// Everything else (arbitrary shell output, `git diff`, JSON blobs, …)
+/// returns `None` — guessing wrong would mis-colour output, which reads worse
+/// than the plain text it replaces.
+fn infer_output_syntax(
+    tool: &str,
+    command: Option<&str>,
+) -> Option<velor_core::file_edit::SyntaxKind> {
+    let command = command?;
+    match tool.to_ascii_lowercase().as_str() {
+        "read" => Some(velor_core::file_edit::infer_syntax(command)),
+        "bash" | "command_execution" => {
+            let trimmed = command.trim();
+            ["cat ", "bat "].iter().find_map(|prefix| {
+                trimmed.strip_prefix(prefix).and_then(|rest| {
+                    rest.split_whitespace()
+                        .find(|w| !w.starts_with('-'))
+                        .map(velor_core::file_edit::infer_syntax)
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Syntax-highlights one already-truncated output line in isolation (no
+/// surrounding-file state — output bodies don't carry one), falling back to
+/// `default_fg` for any span the highlighter doesn't classify (plain text,
+/// punctuation, …) so unclassified text still matches the card's palette
+/// instead of the terminal's raw default foreground.
+fn highlight_plain_line(
+    line: &str,
+    engine: &mut HighlightEngine,
+    syntax: velor_core::file_edit::SyntaxKind,
+    default_fg: Color,
+) -> Vec<Span<'static>> {
+    let spans = engine.highlight(&HighlightRequest::full(syntax, line));
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    let styled = |slice: &str, style: Style| Span::styled(slice.to_string(), style);
+    let default_style = Style::default().fg(default_fg);
+    for s in &spans {
+        if s.start > cursor
+            && let Some(slice) = line.get(cursor..s.start)
+            && !slice.is_empty()
+        {
+            out.push(styled(slice, default_style));
+        }
+        if let Some(slice) = line.get(s.start..s.end)
+            && !slice.is_empty()
+        {
+            let mut style = token_style(s.token);
+            if style.fg.is_none() {
+                style = style.fg(default_fg);
+            }
+            out.push(styled(slice, style));
+        }
+        cursor = s.end;
+    }
+    if cursor < line.len()
+        && let Some(slice) = line.get(cursor..)
+        && !slice.is_empty()
+    {
+        out.push(styled(slice, default_style));
+    }
+    if out.is_empty() && !line.is_empty() {
+        out.push(styled(line, default_style));
+    }
+    out
 }
 
 /// The top or bottom rule of a tool card's box, optionally with an embedded
@@ -2087,6 +2163,7 @@ fn render_entry(
             tool,
             detail,
             success,
+            command,
         } => {
             let failed = *success == Some(false);
             if is_file_edit_tool(tool) {
@@ -2100,9 +2177,16 @@ fn render_entry(
             // Fully self-contained box — never relies on a neighbouring
             // ToolCall to open it, so it renders correctly regardless of how
             // many other calls/results are interleaved around it in the
-            // stream. The tool name on the opening rule is what lets the
-            // reader match this box back to its call.
-            let mut lines = vec![tool_card_rule('╭', '╮', tool, width)];
+            // stream. The opening rule embeds the *command*, not just the
+            // tool name, when the provider let us correlate the two (see
+            // `AgentEvent::ToolResult::command`) — that's the box's header,
+            // matching what a real embedded terminal would show.
+            let label = match command.as_deref() {
+                Some(cmd) if tool == "Bash" => format!("$ {cmd}"),
+                Some(cmd) => format!("{tool}  {cmd}"),
+                None => tool.clone(),
+            };
+            let mut lines = vec![tool_card_rule('╭', '╮', &label, width)];
             let body_fg = if failed {
                 Color::Rgb(230, 110, 110)
             } else {
@@ -2122,6 +2206,16 @@ fn render_entry(
             }
             lines.push(tool_card_row(divider_spans, width));
             let body: Vec<&str> = detail.lines().collect();
+            // A failure's plain red already carries the signal that matters;
+            // syntax colour would just compete with it, so only highlight on
+            // success. `infer_output_syntax` returns `None` for anything it
+            // can't confidently place a language on (most Bash output), which
+            // keeps that case exactly as before: plain body_fg text.
+            let syntax = if failed {
+                None
+            } else {
+                infer_output_syntax(tool, command.as_deref())
+            };
             if body.is_empty() {
                 lines.push(tool_card_row(
                     vec![Span::styled(
@@ -2132,13 +2226,12 @@ fn render_entry(
                 ));
             } else {
                 for line in &body {
-                    lines.push(tool_card_row(
-                        vec![Span::styled(
-                            truncate_str(line, 200),
-                            Style::default().fg(body_fg),
-                        )],
-                        width,
-                    ));
+                    let truncated = truncate_str(line, 200);
+                    let spans = match syntax {
+                        Some(syn) => highlight_plain_line(&truncated, engine, syn, body_fg),
+                        None => vec![Span::styled(truncated, Style::default().fg(body_fg))],
+                    };
+                    lines.push(tool_card_row(spans, width));
                 }
             }
             lines.push(tool_card_rule('╰', '╯', "", width));
@@ -4124,6 +4217,7 @@ mod render_tests {
             tool: "Bash".to_string(),
             detail: "ok".to_string(),
             success: Some(true),
+            command: None,
         };
         let rows = render_entry(&kind, 40, &mut engine);
         // opening rule + divider + 1 output line + closing rule + trailing blank.
@@ -4150,6 +4244,7 @@ mod render_tests {
             tool: "Bash".to_string(),
             detail: "line one\nline two".to_string(),
             success: Some(true),
+            command: None,
         };
         let rows = render_entry(&kind, 40, &mut engine);
         // opening rule + divider + 2 output lines + closing rule + trailing blank.
@@ -4185,11 +4280,13 @@ mod render_tests {
             tool: "Read".to_string(),
             detail: "line one\nline two".to_string(),
             success: Some(true),
+            command: Some("SPEC.md".to_string()),
         };
         let bash_result = EntryKind::ToolResult {
             tool: "Bash".to_string(),
             detail: "diff output".to_string(),
             success: Some(true),
+            command: Some("git diff".to_string()),
         };
         // Neither call opens a box, so their order/adjacency can't corrupt
         // anything; each result independently opens and closes its own.
@@ -4198,9 +4295,16 @@ mod render_tests {
             assert_eq!(rows.len(), 1);
             assert!(!row_text(&rows[0]).starts_with('╭'));
         }
-        for kind in [&read_result, &bash_result] {
+        for (kind, expected_header) in [(&read_result, "SPEC.md"), (&bash_result, "$ git diff")] {
             let rows = render_entry(kind, 40, &mut engine);
             assert!(row_text(&rows[0]).starts_with('╭'));
+            // The correlated command is the box's own header — not a
+            // separate, possibly-disconnected line above it.
+            assert!(
+                row_text(&rows[0]).contains(expected_header),
+                "got {:?}",
+                row_text(&rows[0])
+            );
             // Last row is the trailing spacer blank; the one before it closes the box.
             let close = &rows[rows.len() - 2];
             assert!(
@@ -4220,6 +4324,7 @@ mod render_tests {
             tool: "Edit".to_string(),
             detail: "[src/lib.rs#abcd]".to_string(),
             success: Some(true),
+            command: None,
         };
         let rows = render_entry(&kind, 40, &mut engine);
         assert_eq!(rows.len(), 1);
@@ -4308,6 +4413,112 @@ mod render_tests {
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(joined.contains("dangling"));
         assert!(joined.contains("backtick with no close"));
+    }
+
+    // ── Tool-result output syntax inference/highlighting ────────────────────
+
+    #[test]
+    fn infer_output_syntax_uses_the_read_path_directly() {
+        assert_eq!(
+            infer_output_syntax("Read", Some("src/lib.rs")),
+            Some(velor_core::file_edit::SyntaxKind::Rust)
+        );
+    }
+
+    #[test]
+    fn infer_output_syntax_unwraps_a_cat_command() {
+        assert_eq!(
+            infer_output_syntax("Bash", Some("cat src/lib.rs")),
+            Some(velor_core::file_edit::SyntaxKind::Rust)
+        );
+        assert_eq!(
+            infer_output_syntax("Bash", Some("bat -n src/lib.rs")),
+            Some(velor_core::file_edit::SyntaxKind::Rust)
+        );
+    }
+
+    #[test]
+    fn infer_output_syntax_is_none_for_unrecognised_commands() {
+        assert_eq!(infer_output_syntax("Bash", Some("git diff")), None);
+        assert_eq!(infer_output_syntax("Grep", Some("TODO")), None);
+        assert_eq!(infer_output_syntax("Bash", None), None);
+    }
+
+    #[test]
+    fn highlight_plain_line_classifies_rust_keywords() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let spans = highlight_plain_line(
+            "fn main() {}",
+            &mut engine,
+            velor_core::file_edit::SyntaxKind::Rust,
+            Color::Gray,
+        );
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "fn main() {}", "no bytes lost/reordered");
+        let kw = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "fn")
+            .expect("the `fn` keyword is its own span");
+        assert_ne!(
+            kw.style.fg,
+            Some(Color::Gray),
+            "a keyword gets a real colour"
+        );
+    }
+
+    #[test]
+    fn highlight_plain_line_falls_back_to_default_fg_for_unclassified_text() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let spans = highlight_plain_line(
+            "plain text, no code",
+            &mut engine,
+            velor_core::file_edit::SyntaxKind::PlainText,
+            Color::Gray,
+        );
+        assert!(spans.iter().all(|s| s.style.fg == Some(Color::Gray)));
+    }
+
+    #[test]
+    fn read_tool_result_output_is_syntax_highlighted() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            tool: "Read".to_string(),
+            detail: "fn main() {}".to_string(),
+            success: Some(true),
+            command: Some("src/lib.rs".to_string()),
+        };
+        let rows = render_entry(&kind, 60, &mut engine);
+        // Row 2 is the (only) output line: rule, divider, output, rule, blank.
+        let has_keyword_colour = rows[2]
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref() == "fn" && s.style.fg != Some(Color::Gray));
+        assert!(
+            has_keyword_colour,
+            "expected a highlighted `fn` span: {:?}",
+            rows[2]
+        );
+    }
+
+    #[test]
+    fn failed_tool_result_output_is_not_syntax_highlighted() {
+        // The plain-red failure signal shouldn't compete with syntax colour.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            tool: "Read".to_string(),
+            detail: "fn main() {}".to_string(),
+            success: Some(false),
+            command: Some("src/lib.rs".to_string()),
+        };
+        let rows = render_entry(&kind, 60, &mut engine);
+        // Unhighlighted output is a single content span (not split into
+        // per-token pieces like the highlighted case), styled entirely red.
+        let content = rows[2]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "fn main() {}")
+            .expect("the whole line is one unsplit span");
+        assert_eq!(content.style.fg, Some(Color::Rgb(230, 110, 110)));
     }
 
     // ── Sticky todo panel ────────────────────────────────────────────────────

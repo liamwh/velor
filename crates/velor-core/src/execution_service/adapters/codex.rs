@@ -282,6 +282,10 @@ fn parse_codex_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                         tool: "command_execution".to_string(),
                         detail,
                         success,
+                        // Codex reports the whole item (command + result)
+                        // together in this one event, so no cross-event
+                        // correlation is needed here.
+                        command: Some(command.to_string()),
                     });
                 }
             }
