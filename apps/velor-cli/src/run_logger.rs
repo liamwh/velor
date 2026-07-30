@@ -126,6 +126,7 @@ impl RunLogger {
                 tool,
                 detail,
                 success,
+                command,
             } => {
                 self.log(
                     "tool_result",
@@ -133,6 +134,7 @@ impl RunLogger {
                         "tool": tool,
                         "detail": truncate(detail, 4000),
                         "success": success,
+                        "command": command,
                     }),
                 );
             }

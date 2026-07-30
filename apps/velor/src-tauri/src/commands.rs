@@ -816,6 +816,7 @@ async fn apply_agent_event(
                 tool,
                 detail,
                 success,
+                ..
             } => record.record_activity(ExecutionActivity {
                 provider: provider.to_string(),
                 kind: ExecutionActivityKind::ToolResult,

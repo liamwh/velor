@@ -24,6 +24,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -188,6 +189,10 @@ async fn run_omp_stream(
     let mut collected = String::new();
     let mut structured_error: Option<String> = None;
     let mut close_sent = false;
+    // Tool-call summary keyed by call id, so the matching `tool_execution_end`
+    // (which only carries `toolCallId`, not the original command/path) can
+    // recover it. See `parse_omp_line`.
+    let mut pending_tool_calls: HashMap<String, String> = HashMap::new();
 
     while let Some(event) = process.next_event().await {
         match event {
@@ -199,7 +204,9 @@ async fn run_omp_stream(
                     if frame_is_agent_end(&text) {
                         saw_agent_end = true;
                     }
-                    for agent_event in parse_omp_line(&text, &mut collected) {
+                    for agent_event in
+                        parse_omp_line(&text, &mut collected, &mut pending_tool_calls)
+                    {
                         if structured_error.is_none()
                             && let AgentEvent::Error { message } = &agent_event
                         {
@@ -238,7 +245,7 @@ async fn run_omp_stream(
 
     if let Some(remainder) = decoder.flush_remainder()? {
         let text = String::from_utf8_lossy(&remainder);
-        for agent_event in parse_omp_line(&text, &mut collected) {
+        for agent_event in parse_omp_line(&text, &mut collected, &mut pending_tool_calls) {
             sink.emit(agent_event)
                 .await
                 .map_err(|_| AgentExecutionError::Cancelled)?;
@@ -284,7 +291,11 @@ fn frame_is_agent_end(line: &str) -> bool {
 
 /// Parses one omp JSONL line into zero or more [`AgentEvent`]s, appending
 /// streamed assistant text to `collected`.
-fn parse_omp_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
+fn parse_omp_line(
+    line: &str,
+    collected: &mut String,
+    pending_tool_calls: &mut HashMap<String, String>,
+) -> Vec<AgentEvent> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
@@ -348,6 +359,12 @@ fn parse_omp_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                                 .to_string();
                             let args = tool_call.get("arguments").cloned().unwrap_or_default();
                             let detail = summarize_tool_input(&name, &args);
+                            // Remembered so the matching `tool_execution_end`
+                            // (which only carries `toolCallId`, not the
+                            // original command/path) can recover it.
+                            if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
+                                pending_tool_calls.insert(id.to_string(), detail.clone());
+                            }
                             events.push(AgentEvent::ToolCall {
                                 tool: name,
                                 detail,
@@ -384,10 +401,15 @@ fn parse_omp_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                 })
                 .map(|s| truncate(s, 240))
                 .unwrap_or_default();
+            let command = value
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .and_then(|id| pending_tool_calls.remove(id));
             events.push(AgentEvent::ToolResult {
                 tool,
                 detail,
                 success: Some(!is_error),
+                command,
             });
         }
         "agent_end" => {
@@ -459,6 +481,7 @@ mod tests {
         let events = parse_omp_line(
             r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"BANANA"}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert_eq!(collected, "BANANA");
         assert!(
@@ -474,6 +497,7 @@ mod tests {
         let events = parse_omp_line(
             r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"hm"}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(collected.is_empty());
         assert!(
@@ -489,6 +513,7 @@ mod tests {
         let events = parse_omp_line(
             r#"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1,"toolCall":{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"echo hi"}}}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(events.iter().any(|e| matches!(
             e,
@@ -519,6 +544,7 @@ mod tests {
         let events = parse_omp_line(
             r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"hello-omp\n"}]},"isError":false}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(events.iter().any(|e| matches!(
             e,
@@ -528,11 +554,58 @@ mod tests {
     }
 
     #[test]
+    fn tool_execution_end_recovers_the_command_via_id_correlation() {
+        let mut collected = String::new();
+        let mut pending = HashMap::new();
+        let _ = parse_omp_line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","toolCall":{"id":"c1","name":"bash","arguments":{"command":"echo hi"}}}}"#,
+            &mut collected,
+            &mut pending,
+        );
+        let events = parse_omp_line(
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"hi\n"}]},"isError":false}"#,
+            &mut collected,
+            &mut pending,
+        );
+        let AgentEvent::ToolResult { command, .. } = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolResult { .. }))
+            .expect("a ToolResult event")
+        else {
+            unreachable!()
+        };
+        assert_eq!(command.as_deref(), Some("echo hi"));
+        assert!(
+            pending.is_empty(),
+            "the pending entry is consumed, not leaked"
+        );
+    }
+
+    #[test]
+    fn tool_execution_end_without_a_matching_id_has_no_command() {
+        let mut collected = String::new();
+        let events = parse_omp_line(
+            r#"{"type":"tool_execution_end","toolCallId":"unknown","toolName":"bash","result":{"content":[]},"isError":false}"#,
+            &mut collected,
+            &mut HashMap::new(),
+        );
+        let AgentEvent::ToolResult { command, .. } = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolResult { .. }))
+            .expect("a ToolResult event")
+        else {
+            unreachable!()
+        };
+        assert!(command.is_none());
+    }
+
+    #[test]
     fn parses_usage_from_turn_end() {
         let mut collected = String::new();
         let events = parse_omp_line(
             r#"{"type":"turn_end","message":{"usage":{"input":10,"output":20,"cacheRead":5}}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(events.iter().any(|e| matches!(
             e,
@@ -550,6 +623,7 @@ mod tests {
         let events = parse_omp_line(
             r#"{"id":"vel","type":"response","command":"prompt","success":false,"error":"invalid api key"}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(events.iter().any(
             |e| matches!(e, AgentEvent::Error { message } if message.contains("invalid api key"))
@@ -562,6 +636,7 @@ mod tests {
         let _ = parse_omp_line(
             r#"{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"q"}]},{"role":"assistant","content":[{"type":"text","text":"answer"}]}]}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert_eq!(collected, "answer");
     }
@@ -580,11 +655,12 @@ mod tests {
         assert!(
             parse_omp_line(
                 r#"{"type":"available_commands_update","commands":[]}"#,
-                &mut collected
+                &mut collected,
+                &mut HashMap::new()
             )
             .is_empty()
         );
-        assert!(parse_omp_line("nope", &mut collected).is_empty());
+        assert!(parse_omp_line("nope", &mut collected, &mut HashMap::new()).is_empty());
     }
 
     #[test]

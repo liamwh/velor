@@ -70,6 +70,12 @@ pub enum AgentEvent {
         detail: String,
         /// Whether the tool execution succeeded if known.
         success: Option<bool>,
+        /// The originating [`AgentEvent::ToolCall`]'s `detail` (the command,
+        /// file path, etc.), when the adapter can correlate the two via the
+        /// provider's own call id. `None` when the provider doesn't expose a
+        /// correlating id or the matching call wasn't seen (e.g. truncated
+        /// history) — callers must not assume this is always populated.
+        command: Option<String>,
     },
     /// A captured file edit — the real before/after diff for a file the agent
     /// modified, computed from the filesystem (not the agent's claimed patch).

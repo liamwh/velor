@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -340,6 +341,9 @@ async fn run_claude_stream(
     // is observed (before the edit lands) and diffed against the post-edit file
     // when the tool result arrives. See [`process_event`].
     let mut pending_edits: Vec<(String, ReadState)> = Vec::new();
+    // Tool name + summary keyed by tool_use id, so the matching `tool_result`
+    // (which only carries the id) can recover both. See `parse_claude_line`.
+    let mut pending_tool_calls: HashMap<String, (String, String)> = HashMap::new();
 
     while let Some(event) = process.next_event().await {
         match event {
@@ -351,7 +355,9 @@ async fn run_claude_stream(
                     if streaming_close.is_some() && frame_is_result(&text) {
                         saw_result = true;
                     }
-                    for agent_event in parse_claude_line(&text, &mut collected) {
+                    for agent_event in
+                        parse_claude_line(&text, &mut collected, &mut pending_tool_calls)
+                    {
                         if let Some(msg) =
                             process_event(sink, cwd, &mut pending_edits, agent_event).await?
                             && structured_error.is_none()
@@ -392,7 +398,7 @@ async fn run_claude_stream(
     // Flush any trailing frame without a newline.
     if let Some(remainder) = decoder.flush_remainder()? {
         let text = String::from_utf8_lossy(&remainder);
-        for agent_event in parse_claude_line(&text, &mut collected) {
+        for agent_event in parse_claude_line(&text, &mut collected, &mut pending_tool_calls) {
             if let Some(msg) = process_event(sink, cwd, &mut pending_edits, agent_event).await?
                 && structured_error.is_none()
             {
@@ -651,7 +657,11 @@ fn frame_is_result(line: &str) -> bool {
 ///
 /// This is the canonical home for Claude stream parsing (the legacy copy in
 /// `agent::process_stream_line` is removed once consumers migrate).
-fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
+fn parse_claude_line(
+    line: &str,
+    collected: &mut String,
+    pending_tool_calls: &mut HashMap<String, (String, String)>,
+) -> Vec<AgentEvent> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
@@ -732,6 +742,13 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                                 .unwrap_or("tool")
                                 .to_string();
                             let detail = summarize_tool_input(&name, item.get("input"));
+                            // Remembered so the matching `tool_result` (which
+                            // only carries `tool_use_id`, not the tool name or
+                            // input) can recover both — see `tool_result` below.
+                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                                pending_tool_calls
+                                    .insert(id.to_string(), (name.clone(), detail.clone()));
+                            }
                             let input = item
                                 .get("input")
                                 .cloned()
@@ -747,10 +764,19 @@ fn parse_claude_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
                                 .get("content")
                                 .map(|c| truncate_value(c, 200))
                                 .unwrap_or_default();
+                            let matched = item
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .and_then(|id| pending_tool_calls.remove(id));
+                            let (tool, command) = match matched {
+                                Some((name, call_detail)) => (name, Some(call_detail)),
+                                None => ("tool".to_string(), None),
+                            };
                             events.push(AgentEvent::ToolResult {
-                                tool: "tool".to_string(),
+                                tool,
                                 detail,
                                 success: None,
+                                command,
                             });
                         }
                         _ => {}
@@ -853,6 +879,7 @@ mod tests {
         let events = parse_claude_line(
             r#"{"type":"content_block_delta","delta":{"text":"hello"}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert_eq!(collected, "hello");
         assert!(matches!(events[0], AgentEvent::TextDelta { .. }));
@@ -864,6 +891,7 @@ mod tests {
         let events = parse_claude_line(
             r#"{"type":"content_block_delta","delta":{"thinking":"reasoning here"}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         // Thinking must NOT be collected into assistant output.
         assert!(collected.is_empty());
@@ -879,6 +907,7 @@ mod tests {
         let events = parse_claude_line(
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(matches!(events[0], AgentEvent::ToolCall { .. }));
         if let AgentEvent::ToolCall { tool, detail, .. } = &events[0] {
@@ -888,11 +917,64 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_recovers_the_tool_name_and_command_via_id_correlation() {
+        // Regression: `tool_result` blocks only carry `tool_use_id`, not the
+        // tool name or input — before correlation the tool name fell back to
+        // the literal string "tool" and there was no way to show the command
+        // that produced the output.
+        let mut collected = String::new();
+        let mut pending = HashMap::new();
+        let _ = parse_claude_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]}}"#,
+            &mut collected,
+            &mut pending,
+        );
+        let events = parse_claude_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hi\n"}]}}"#,
+            &mut collected,
+            &mut pending,
+        );
+        let result = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolResult { .. }))
+            .expect("a ToolResult event");
+        let AgentEvent::ToolResult { tool, command, .. } = result else {
+            unreachable!()
+        };
+        assert_eq!(tool, "Bash");
+        assert_eq!(command.as_deref(), Some("echo hi"));
+        assert!(
+            pending.is_empty(),
+            "the pending entry is consumed, not leaked"
+        );
+    }
+
+    #[test]
+    fn tool_result_without_a_matching_id_falls_back_gracefully() {
+        let mut collected = String::new();
+        let events = parse_claude_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"unknown","content":"x"}]}}"#,
+            &mut collected,
+            &mut HashMap::new(),
+        );
+        let AgentEvent::ToolResult { tool, command, .. } = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolResult { .. }))
+            .expect("a ToolResult event")
+        else {
+            unreachable!()
+        };
+        assert_eq!(tool, "tool");
+        assert!(command.is_none());
+    }
+
+    #[test]
     fn parses_usage_from_result() {
         let mut collected = String::new();
         let events = parse_claude_line(
             r#"{"type":"result","usage":{"input_tokens":10,"output_tokens":20}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
     }
@@ -900,7 +982,7 @@ mod tests {
     #[test]
     fn ignores_garbage_line() {
         let mut collected = String::new();
-        let events = parse_claude_line("not json", &mut collected);
+        let events = parse_claude_line("not json", &mut collected, &mut HashMap::new());
         assert!(events.is_empty());
         assert!(collected.is_empty());
     }
@@ -915,6 +997,7 @@ mod tests {
         let events = parse_claude_line(
             r#"{"type":"user","message":{"content":[{"type":"text","text":"If done, output exactly: <promise>COMPLETE</promise>"}]}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert!(
             collected.is_empty(),
@@ -938,6 +1021,7 @@ mod tests {
         let _ = parse_claude_line(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"<promise>COMPLETE</promise>"}]}}"#,
             &mut collected,
+            &mut HashMap::new(),
         );
         assert_eq!(collected, "<promise>COMPLETE</promise>");
     }
