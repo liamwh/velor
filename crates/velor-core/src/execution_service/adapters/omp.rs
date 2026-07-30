@@ -421,13 +421,20 @@ fn parse_omp_line(line: &str, collected: &mut String) -> Vec<AgentEvent> {
     events
 }
 
-/// Builds a one-line summary of a tool-call's input, special-casing `bash`/
-/// `shell`-style commands which carry a `command` field.
+/// Builds a one-line summary of a tool-call's input. omp's tool schema isn't
+/// fully known ahead of time, so this tries the field names real tools carry
+/// — a shell command, a file/read path, a search pattern — in priority order
+/// before falling back to a raw JSON dump. Without this, unrecognised tools
+/// (e.g. a `read` call whose args are `{"i": "<intent>", "path": "..."}`)
+/// would show their whole input JSON instead of the one field a human
+/// actually wants to see.
 fn summarize_tool_input(name: &str, args: &serde_json::Value) -> String {
-    if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-        return truncate(cmd, 200);
-    }
     let _ = name;
+    for key in ["command", "path", "file_path", "pattern", "query", "url"] {
+        if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
+            return truncate(s, 200);
+        }
+    }
     truncate(&args.to_string(), 200)
 }
 
@@ -488,6 +495,22 @@ mod tests {
             AgentEvent::ToolCall { tool, detail, .. }
             if tool.as_str() == "bash" && detail.contains("echo hi")
         )));
+    }
+
+    #[test]
+    fn summarize_tool_input_prefers_path_over_a_raw_json_dump() {
+        // Regression: a `read`-style tool whose args are `{"i": "<intent>",
+        // "path": "..."}` must summarise to the path, not the whole JSON blob
+        // (the `"i"` field has no special meaning to a human reading the
+        // transcript — it was leaking through verbatim).
+        let args = serde_json::json!({"i": "Read last handoff", "path": "SPEC.md.progress.md"});
+        assert_eq!(summarize_tool_input("read", &args), "SPEC.md.progress.md");
+    }
+
+    #[test]
+    fn summarize_tool_input_falls_back_to_json_for_unknown_shapes() {
+        let args = serde_json::json!({"foo": "bar"});
+        assert_eq!(summarize_tool_input("mystery", &args), args.to_string());
     }
 
     #[test]
