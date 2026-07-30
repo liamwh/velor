@@ -957,6 +957,12 @@ impl RowMeter for LayoutCache {
 ///
 /// Iteration dividers are exempt from the timestamp prefix: they read as a clean
 /// full-width rule rather than a content line.
+/// Default collapsed-view line count for a tool result's output body — small
+/// enough that collapsing is actually visible for typical output (a few
+/// hundred lines is common for a file read), independent of how generous
+/// [`TuiLimits::max_entry_lines`] is configured as a hard safety cap.
+const COLLAPSED_PREVIEW_LINES: usize = 20;
+
 /// Render-time options that affect an entry's rendered content (and so must
 /// be part of the layout cache key — see [`CacheKey`]), as opposed to purely
 /// structural inputs like width.
@@ -2279,7 +2285,6 @@ fn render_entry(
                 divider_spans.push(Span::styled(" (failed)", Style::default().fg(theme.error)));
             }
             lines.push(tool_card_row(divider_spans, width, card_bg));
-            let body: Vec<&str> = detail.lines().collect();
             // A failure's plain red already carries the signal that matters;
             // syntax colour would just compete with it, so only highlight on
             // success. `infer_output_syntax` returns `None` for anything it
@@ -2290,20 +2295,41 @@ fn render_entry(
             } else {
                 infer_output_syntax(tool, command.as_deref())
             };
-            // Expanded mode also relaxes the per-line truncation — a long
-            // line cut at 200 chars would still look truncated even with
-            // every line present. wrap_spans_indented handles the actual
-            // terminal wrapping either way.
-            let per_line_cap = if opts.expand { 4000 } else { 200 };
-            let render_line = |line: &str, engine: &mut HighlightEngine| -> Line<'static> {
-                let truncated = truncate_str(line, per_line_cap);
-                let spans = match syntax {
-                    Some(syn) => highlight_plain_line(&truncated, engine, syn, body_fg),
-                    None => vec![Span::styled(truncated, Style::default().fg(body_fg))],
-                };
-                tool_card_row(spans, width, card_bg)
+            // A markdown file's content renders as markdown (headings, bold,
+            // inline code, …) rather than as a wall of `**`/`` ` `` — the same
+            // renderer the agent's own prose uses, just over the tool output.
+            let is_markdown = syntax == Some(velor_core::file_edit::SyntaxKind::Markdown);
+            let body_lines: Vec<Line<'static>> = if is_markdown {
+                render_prose(detail, Style::default().fg(body_fg))
+            } else {
+                // Expanded mode also relaxes the per-line truncation — a long
+                // line cut at 200 chars would still look truncated even with
+                // every line present. wrap_spans_indented handles the actual
+                // terminal wrapping either way.
+                let per_line_cap = if opts.expand { 4000 } else { 200 };
+                detail
+                    .lines()
+                    .map(|line| {
+                        let truncated = truncate_str(line, per_line_cap);
+                        let spans = match syntax {
+                            Some(syn) => highlight_plain_line(&truncated, engine, syn, body_fg),
+                            None => vec![Span::styled(truncated, Style::default().fg(body_fg))],
+                        };
+                        Line::from(spans)
+                    })
+                    .collect()
             };
-            if body.is_empty() {
+            // Collapsed by default at a small preview size regardless of how
+            // generous `max_entry_lines` is configured — that limit is a hard
+            // safety cap (still applied even expanded, so one pathological
+            // output can't freeze rendering), not a "nice preview" size.
+            let collapsed_cap = COLLAPSED_PREVIEW_LINES.min(opts.max_entry_lines);
+            let cap = if opts.expand {
+                opts.max_entry_lines
+            } else {
+                collapsed_cap
+            };
+            if body_lines.is_empty() {
                 lines.push(tool_card_row(
                     vec![Span::styled(
                         "(no output)".to_string(),
@@ -2312,29 +2338,32 @@ fn render_entry(
                     width,
                     card_bg,
                 ));
-            } else if opts.expand || body.len() <= opts.max_entry_lines {
-                for line in &body {
-                    lines.push(render_line(line, engine));
+            } else if body_lines.len() <= cap {
+                for line in body_lines {
+                    lines.push(tool_card_row(line.spans, width, card_bg));
                 }
             } else {
-                // Collapsed: head + tail, with the hidden middle both counted
-                // and — via Ctrl+O — recoverable, since `detail` above always
-                // holds the full text (never folded at ingest).
-                let keep = (opts.max_entry_lines.max(2) / 2).max(1);
-                let omitted = body.len() - 2 * keep;
-                for line in &body[..keep] {
-                    lines.push(render_line(line, engine));
+                // Head + tail, with the hidden middle both counted and
+                // recoverable: collapsed, via Ctrl+O; expanded-but-still-over
+                // the hard cap, only via the run log (a real safety limit,
+                // not a preview — Ctrl+O has nothing further to reveal).
+                let keep = (cap.max(2) / 2).max(1);
+                let omitted = body_lines.len() - 2 * keep;
+                let marker = if opts.expand {
+                    format!("… {omitted} more lines — full text is in the run log")
+                } else {
+                    format!("… {omitted} more lines (Ctrl+O: Expand)")
+                };
+                for line in &body_lines[..keep] {
+                    lines.push(tool_card_row(line.spans.clone(), width, card_bg));
                 }
                 lines.push(tool_card_row(
-                    vec![Span::styled(
-                        format!("… {omitted} more lines (Ctrl+O: Expand)"),
-                        Style::default().fg(theme.dim),
-                    )],
+                    vec![Span::styled(marker, Style::default().fg(theme.dim))],
                     width,
                     card_bg,
                 ));
-                for line in &body[body.len() - keep..] {
-                    lines.push(render_line(line, engine));
+                for line in &body_lines[body_lines.len() - keep..] {
+                    lines.push(tool_card_row(line.spans.clone(), width, card_bg));
                 }
             }
             lines.push(tool_card_rule('╰', '╯', "", width, card_bg));
@@ -4411,9 +4440,13 @@ mod render_tests {
             success: Some(true),
             command: None,
         };
+        // max_entry_lines is the hard safety cap even while expanded, so it
+        // must exceed the body for "expanded shows everything" to hold —
+        // unlike the collapsed-view test, which deliberately uses a tiny cap
+        // to force folding.
         let opts = RenderOpts {
             expand: true,
-            max_entry_lines: 4,
+            max_entry_lines: 400,
         };
         let rows = render_entry(&kind, 40, &mut engine, opts);
         let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
@@ -4426,6 +4459,60 @@ mod render_tests {
         assert!(
             !text.contains("Ctrl+O"),
             "no expand marker once already expanded"
+        );
+    }
+
+    #[test]
+    fn expanded_tool_result_still_folds_past_the_hard_safety_cap() {
+        // max_entry_lines is a real safety limit, not just a preview size —
+        // even Ctrl+O can't reveal more than this, so the marker must not
+        // claim it can.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let body: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let kind = EntryKind::ToolResult {
+            tool: "Bash".to_string(),
+            detail: body.join("\n"),
+            success: Some(true),
+            command: None,
+        };
+        let opts = RenderOpts {
+            expand: true,
+            max_entry_lines: 4,
+        };
+        let rows = render_entry(&kind, 40, &mut engine, opts);
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("16 more lines"));
+        assert!(
+            !text.contains("Ctrl+O"),
+            "must not claim Ctrl+O can reveal more once already expanded: {text:?}"
+        );
+        assert!(text.contains("run log"));
+    }
+
+    #[test]
+    fn default_options_collapse_a_typical_multi_hundred_line_file_read() {
+        // Regression: RenderOpts::default() used to use TuiLimits::default's
+        // max_entry_lines (400) directly as the collapse threshold, so any
+        // real file read under ~400 lines never actually collapsed and
+        // Ctrl+O had nothing visible to toggle. The default collapse size is
+        // now independent of that (much larger) hard safety cap.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let body: Vec<String> = (0..120).map(|i| format!("line {i}")).collect();
+        let kind = EntryKind::ToolResult {
+            tool: "Bash".to_string(),
+            detail: body.join("\n"),
+            success: Some(true),
+            command: None,
+        };
+        let rows = render_entry(&kind, 40, &mut engine, RenderOpts::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("Ctrl+O: Expand"),
+            "a 120-line read must collapse by default"
+        );
+        assert!(
+            !text.contains("line 60"),
+            "the middle must be hidden while collapsed"
         );
     }
 
@@ -4747,6 +4834,56 @@ mod render_tests {
             "expected a highlighted `fn` span: {:?}",
             rows[2]
         );
+    }
+
+    #[test]
+    fn read_tool_result_of_a_markdown_file_renders_as_markdown() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            tool: "Read".to_string(),
+            detail: "# Heading\n\ncall `FeatureSnapshot::new` and **be careful**.".to_string(),
+            success: Some(true),
+            command: Some("SPEC.md".to_string()),
+        };
+        let rows = render_entry(&kind, 80, &mut engine, RenderOpts::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !text.contains('*'),
+            "bold markers must be stripped, got {text:?}"
+        );
+        assert!(
+            !text.contains('`'),
+            "code markers must be stripped, got {text:?}"
+        );
+        assert!(text.contains("FeatureSnapshot::new"));
+        assert!(text.contains("be careful"));
+        // The inline-code span still gets the theme's code colour, same as
+        // in the agent's own prose.
+        let has_code_colour = rows.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.as_ref() == "FeatureSnapshot::new"
+                && s.style.fg == Some(theme::active().md_code)
+        });
+        assert!(
+            has_code_colour,
+            "expected the inline-code span to use md_code"
+        );
+    }
+
+    #[test]
+    fn read_tool_result_of_a_non_markdown_file_keeps_raw_syntax_highlighting() {
+        // Regression: markdown detection must not accidentally swallow code
+        // files — a Rust file's `//` comment or `fn` keyword must not be
+        // run through the markdown inline parser.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            tool: "Read".to_string(),
+            detail: "fn main() {}".to_string(),
+            success: Some(true),
+            command: Some("src/lib.rs".to_string()),
+        };
+        let rows = render_entry(&kind, 60, &mut engine, RenderOpts::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("fn main() {}"));
     }
 
     #[test]
