@@ -177,8 +177,11 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
             input: input.clone(),
         })),
         AgentEvent::ToolResult {
-            detail, success, ..
+            tool,
+            detail,
+            success,
         } => Some(TuiEntry::now(EntryKind::ToolResult {
+            tool: tool.clone(),
             detail: detail.clone(),
             success: *success,
         })),
@@ -925,18 +928,18 @@ fn build_layout(
     engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
     let content_lines = render_entry(kind, width as usize, engine);
-    // Dividers and file edits read as clean full-width rules/gutters; tool
-    // calls/results fill a black background from column 0 — none of these
-    // want a timestamp breaking the row.
+    // Dividers, file edits, and boxed tool cards read as clean full-width
+    // rules/gutters/borders from column 0; a timestamp would break the row.
+    // Edit-tool calls/results stay a plain unboxed label (the real content is
+    // the FileEdit card), so they keep their timestamp like prose does.
     let no_timestamp = matches!(
         kind,
-        EntryKind::IterationDivider { .. }
-            | EntryKind::FileEdit(_)
-            | EntryKind::ToolCall { .. }
-            | EntryKind::ToolResult { .. }
-    );
-    // File-edit lines carry a gutter; their wrapped continuation rows indent
-    // to align beneath the source rather than the gutter.
+        EntryKind::IterationDivider { .. } | EntryKind::FileEdit(_)
+    ) || matches!(kind, EntryKind::ToolCall { tool, .. } if !is_file_edit_tool(tool))
+        || matches!(kind, EntryKind::ToolResult { tool, .. } if !is_file_edit_tool(tool));
+    // File-edit lines carry a gutter, and boxed tool-result lines carry a
+    // border; their wrapped continuation rows indent to match so they align
+    // beneath the source/content rather than the gutter or border.
     let hang = entry_hang(kind);
     let ts_span = Span::styled(
         ts.format("%H:%M:%S ").to_string(),
@@ -1343,7 +1346,14 @@ fn handle_key(
         KeyCode::Char('?') => {
             state.show_help = true;
         }
+        // `l` opens the full run log.
         KeyCode::Char('l') => {
+            state.open_log = true;
+        }
+        // Ctrl+O is the same action, matching the "(Ctrl+O: Expand)" hint
+        // shown on truncated tool output/diffs — the full untruncated
+        // content lives in the run log, not in live memory.
+        KeyCode::Char('o' | 'O') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.open_log = true;
         }
         // `g` begins a prefix chord: `gg` → top of this iteration,
@@ -1754,28 +1764,134 @@ fn fmt_tokens(n: u64) -> String {
 /// darker than the surrounding transcript so a command and its output read as
 /// one embedded terminal, command on top and output beneath it.
 const TOOL_CARD_BG: Color = Color::Rgb(8, 8, 10);
+/// Stroke colour for the box drawn around a tool card.
+const TOOL_CARD_BORDER: Color = Color::Rgb(110, 110, 122);
+/// Colour used for inline-code (backtick-quoted) spans in the agent's prose —
+/// matches the syntax highlighter's own string/green so a symbol the agent
+/// mentions in text reads consistently with the same symbol in a diff.
+const SYMBOL_GREEN: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
 
-/// Applies `bg` to every span in `spans`, then right-pads with a trailing
-/// bg-filled span so the fill reads edge-to-edge at `width` columns rather
-/// than stopping wherever the text ends.
-fn bg_fill_spans(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+/// The [`tui_markdown::StyleSheet`] used for the agent's own prose (assistant
+/// text and thinking): identical to the crate's stock theme (already used for
+/// the prompt modal) except inline code, which we recolour to
+/// [`SYMBOL_GREEN`] with no background — a symbol the agent mentions in
+/// prose should read like the same symbol in a diff, not sit in its own box.
+#[derive(Debug, Clone, Copy)]
+struct ProseStyleSheet;
+
+impl tui_markdown::StyleSheet for ProseStyleSheet {
+    fn heading(&self, level: u8) -> Style {
+        tui_markdown::DefaultStyleSheet.heading(level)
+    }
+    fn code(&self) -> Style {
+        Style::default().fg(SYMBOL_GREEN)
+    }
+    fn link(&self) -> Style {
+        tui_markdown::DefaultStyleSheet.link()
+    }
+    fn blockquote(&self) -> Style {
+        tui_markdown::DefaultStyleSheet.blockquote()
+    }
+    fn heading_meta(&self) -> Style {
+        tui_markdown::DefaultStyleSheet.heading_meta()
+    }
+    fn metadata_block(&self) -> Style {
+        tui_markdown::DefaultStyleSheet.metadata_block()
+    }
+}
+
+/// Renders the agent's own prose (assistant text or thinking) as Markdown —
+/// reusing the same `tui_markdown` parser the prompt modal already renders
+/// with — patched onto `base_style` so plain text keeps the entry's usual
+/// colour/italics while inline code, bold, headings, etc. layer their own
+/// styling on top (`Style::patch` fills fg/bg from the Markdown span only
+/// where it sets one, and unions modifiers, so Thinking's italic survives
+/// under a bold or code span rather than being replaced by it).
+fn render_prose(text: &str, base_style: Style) -> Vec<Line<'static>> {
+    let options = tui_markdown::Options::new(ProseStyleSheet);
+    let rendered = tui_markdown::from_str_with_options(text, &options);
+    rendered
+        .lines
+        .into_iter()
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.content.into_owned(), base_style.patch(s.style)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+/// Whether `tool` is a first-class file-edit tool (Edit/Write/MultiEdit/
+/// NotebookEdit) whose real content arrives as a separate [`EntryKind::FileEdit`]
+/// card. These stay a lightweight, unboxed label rather than getting the
+/// terminal-card treatment, so the diff isn't sandwiched inside an unrelated
+/// box.
+fn is_file_edit_tool(tool: &str) -> bool {
+    matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+}
+
+/// The top or bottom rule of a tool card's box, optionally with an embedded
+/// label (the command/target, on the opening rule). Filled with
+/// [`TOOL_CARD_BG`] so the rule reads as part of the same solid card as the
+/// content rows it opens/closes, stroked in [`TOOL_CARD_BORDER`]. Degrades to
+/// a bare label when the width can't fit the corners + label, mirroring
+/// [`render_iteration_divider`]'s narrow-width handling.
+fn tool_card_rule(left: char, right: char, label: &str, width: usize) -> Line<'static> {
+    let w = width.max(2);
+    let rule_style = Style::default().fg(TOOL_CARD_BORDER).bg(TOOL_CARD_BG);
+    if label.is_empty() {
+        let dashes = w.saturating_sub(2);
+        return Line::from(Span::styled(
+            format!("{left}{}{right}", "─".repeat(dashes)),
+            rule_style,
+        ));
+    }
+    let label_style = Style::default().fg(Color::White).bg(TOOL_CARD_BG);
+    let label_w = UnicodeWidthStr::width(label);
+    // "{left}─ " (3) + label + " " (1) + dashes + "{right}" (1).
+    let fixed_w = 5 + label_w;
+    if w <= fixed_w {
+        return Line::from(vec![Span::styled(label.to_string(), label_style)]);
+    }
+    let dashes = w - fixed_w;
+    Line::from(vec![
+        Span::styled(format!("{left}─ "), rule_style),
+        Span::styled(label.to_string(), label_style),
+        Span::styled(" ", Style::default().bg(TOOL_CARD_BG)),
+        Span::styled("─".repeat(dashes), rule_style),
+        Span::styled(right.to_string(), rule_style),
+    ])
+}
+
+/// One bordered content row inside a tool card: `"│ " + spans (padded) + " │"`,
+/// filled edge-to-edge with [`TOOL_CARD_BG`].
+fn tool_card_row(mut spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let border = || Span::styled("│ ", Style::default().fg(TOOL_CARD_BORDER).bg(TOOL_CARD_BG));
+    let inner_w = width.saturating_sub(4); // "│ " + " │"
     let content_w: usize = spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     for s in &mut spans {
-        s.style = s.style.bg(bg);
+        s.style = s.style.bg(TOOL_CARD_BG);
     }
-    let pad = width.saturating_sub(content_w);
+    let mut out = vec![border()];
+    out.extend(spans);
+    let pad = inner_w.saturating_sub(content_w);
     if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+        out.push(Span::styled(
+            " ".repeat(pad),
+            Style::default().bg(TOOL_CARD_BG),
+        ));
     }
-    Line::from(spans)
-}
-
-/// Single-span convenience wrapper over [`bg_fill_spans`].
-fn bg_fill(text: String, fg: Color, width: usize, bg: Color) -> Line<'static> {
-    bg_fill_spans(vec![Span::styled(text, Style::default().fg(fg))], width, bg)
+    out.push(Span::styled(
+        " │",
+        Style::default().fg(TOOL_CARD_BORDER).bg(TOOL_CARD_BG),
+    ));
+    Line::from(out)
 }
 
 fn render_entry(
@@ -1785,15 +1901,7 @@ fn render_entry(
 ) -> Vec<Line<'static>> {
     match kind {
         EntryKind::Text(text) => {
-            let mut lines: Vec<Line<'static>> = text
-                .lines()
-                .map(|l| {
-                    Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default().fg(Color::White),
-                    ))
-                })
-                .collect();
+            let mut lines = render_prose(text, Style::default().fg(Color::White));
             // Trailing blank row gives paragraphs breathing room, matching the
             // document-like spacing of a prose-first transcript. Safe for the
             // viewport/cache row accounting: the blank row belongs to this
@@ -1802,66 +1910,92 @@ fn render_entry(
             lines
         }
 
-        EntryKind::Thinking(text) => text
-            .lines()
-            .map(|l| {
-                Line::from(Span::styled(
-                    l.to_string(),
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::ITALIC),
-                ))
-            })
-            .collect(),
+        EntryKind::Thinking(text) => render_prose(
+            text,
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::ITALIC),
+        ),
 
         EntryKind::Usage { .. } => Vec::new(),
 
         EntryKind::ToolCall { tool, detail, .. } => {
-            // The top of the terminal card: the command/target on a black
-            // background, e.g. a shell-prompt-style "$ …" for Bash. The
-            // ToolResult entry that follows continues the same black fill
-            // with "── Output" + the output body, so the two entries read as
-            // one seamless card even though they're rendered independently.
-            // For edit tools the real before/after diff arrives as a separate
-            // `FileEdit` entry (computed from the filesystem), so we never
-            // render the agent's claimed patch here.
-            let spans = if tool == "Bash" {
-                vec![Span::raw(format!("$ {detail}"))]
-            } else {
-                vec![
+            // The opening rule of the terminal-card box: the command/target
+            // embedded as the rule's label, e.g. a shell-prompt-style "$ …"
+            // for Bash or "• {Tool} {target}" otherwise. The ToolResult entry
+            // that follows continues the same box (border + background) with
+            // "── Output" + the output body, then closes it — so the two
+            // entries read as one seamless card even though they're rendered
+            // independently. For edit tools the real before/after diff
+            // arrives as a separate `FileEdit` entry (computed from the
+            // filesystem), so they stay a plain unboxed label instead.
+            if is_file_edit_tool(tool) {
+                return vec![Line::from(vec![
                     Span::styled(tool.clone(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::raw(format!("  {detail}")),
-                ]
+                ])];
+            }
+            let label = if tool == "Bash" {
+                format!("$ {detail}")
+            } else {
+                format!("• {tool} {detail}")
             };
-            vec![bg_fill_spans(spans, width, TOOL_CARD_BG)]
+            vec![tool_card_rule('╭', '╮', &label, width)]
         }
 
-        EntryKind::ToolResult { detail, success } => {
+        EntryKind::ToolResult {
+            tool,
+            detail,
+            success,
+        } => {
             let failed = *success == Some(false);
-            let fg = if failed {
+            if is_file_edit_tool(tool) {
+                let color = if failed { Color::Red } else { Color::DarkGray };
+                let text = detail.lines().next().unwrap_or("(no output)");
+                return vec![Line::from(Span::styled(
+                    truncate_str(text, 200),
+                    Style::default().fg(color),
+                ))];
+            }
+            let body_fg = if failed {
                 Color::Rgb(230, 110, 110)
             } else {
                 Color::Gray
             };
+            let mut divider_spans = vec![
+                Span::styled("── ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Output",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if failed {
+                divider_spans.push(Span::styled(" (failed)", Style::default().fg(Color::Red)));
+            }
+            let mut lines = vec![tool_card_row(divider_spans, width)];
             let body: Vec<&str> = detail.lines().collect();
-            if !tool_result_boxed(detail) {
-                let text = body.first().copied().unwrap_or("(no output)");
-                return vec![bg_fill(truncate_str(text, 200), fg, width, TOOL_CARD_BG)];
-            }
-            let divider = if failed {
-                "── Output (failed)"
+            if body.is_empty() {
+                lines.push(tool_card_row(
+                    vec![Span::styled(
+                        "(no output)".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )],
+                    width,
+                ));
             } else {
-                "── Output"
-            };
-            let mut lines = vec![bg_fill(
-                divider.to_string(),
-                Color::DarkGray,
-                width,
-                TOOL_CARD_BG,
-            )];
-            for line in &body {
-                lines.push(bg_fill(truncate_str(line, 200), fg, width, TOOL_CARD_BG));
+                for line in &body {
+                    lines.push(tool_card_row(
+                        vec![Span::styled(
+                            truncate_str(line, 200),
+                            Style::default().fg(body_fg),
+                        )],
+                        width,
+                    ));
+                }
             }
+            lines.push(tool_card_rule('╰', '╯', "", width));
             lines.push(Line::default());
             lines
         }
@@ -1897,15 +2031,6 @@ fn render_entry(
 
         EntryKind::FileEdit(edit) => render_file_edit(edit, width, engine),
     }
-}
-
-/// Whether a [`EntryKind::ToolResult`]'s detail is substantial enough to
-/// deserve the black terminal-card treatment (multi-line output such as file
-/// contents or command stdout), versus a short one-line confirmation (e.g. a
-/// terse Edit-tool acknowledgement, since the real diff already rendered as a
-/// [`EntryKind::FileEdit`] block).
-fn tool_result_boxed(detail: &str) -> bool {
-    detail.lines().count() > 1
 }
 
 /// Renders a full-width separator marking the start of an iteration, with the
@@ -1954,9 +2079,15 @@ fn gutter_width(num_width: usize) -> usize {
 fn entry_hang(kind: &EntryKind) -> usize {
     match kind {
         EntryKind::FileEdit(edit) => gutter_width(line_number_width(edit)),
+        EntryKind::ToolResult { tool, .. } if !is_file_edit_tool(tool) => TOOL_CARD_ROW_HANG,
         _ => 0,
     }
 }
+
+/// Width of a tool card's left border ("│ "), for aligning wrapped
+/// continuation rows of an over-long body line beneath the content rather
+/// than the border.
+const TOOL_CARD_ROW_HANG: usize = 2;
 
 /// Widest line-number digit count across the edit's hunks (minimum 1).
 fn line_number_width(edit: &FileEdit) -> usize {
@@ -2069,7 +2200,7 @@ fn render_file_edit(
             }
             if edit.omitted_lines > 0 {
                 lines.push(dim_line(format!(
-                    "⋯ {} lines omitted — full diff is in the run log ⋯",
+                    "… {} more lines (Ctrl+O: Expand)",
                     edit.omitted_lines
                 )));
             }
@@ -3777,11 +3908,11 @@ mod render_tests {
         );
     }
 
-    // ── Tool-call / tool-result black card ─────────────────────────────────────
+    // ── Tool-call / tool-result terminal card ───────────────────────────────────
 
     #[test]
-    fn bg_fill_pads_to_the_full_width_with_the_card_background() {
-        let line = bg_fill("hi".to_string(), Color::White, 10, TOOL_CARD_BG);
+    fn tool_card_row_pads_to_the_full_width_with_the_card_background() {
+        let line = tool_card_row(vec![Span::styled("hi", Style::default())], 10);
         let total_w: usize = line
             .spans
             .iter()
@@ -3789,10 +3920,22 @@ mod render_tests {
             .sum();
         assert_eq!(total_w, 10);
         assert!(line.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)));
+        assert!(row_text(&line).starts_with('│'));
+        assert!(row_text(&line).ends_with('│'));
     }
 
     #[test]
-    fn bash_tool_call_renders_as_a_shell_prompt_on_the_card_background() {
+    fn tool_card_rule_embeds_the_label_between_the_corners() {
+        let line = tool_card_rule('╭', '╮', "$ echo hi", 40);
+        let text = row_text(&line);
+        assert!(text.starts_with('╭'), "got {text:?}");
+        assert!(text.ends_with('╮'), "got {text:?}");
+        assert!(text.contains("$ echo hi"), "got {text:?}");
+        assert!(line.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)));
+    }
+
+    #[test]
+    fn bash_tool_call_opens_a_card_with_a_shell_prompt_label() {
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::ToolCall {
             tool: "Bash".to_string(),
@@ -3800,43 +3943,163 @@ mod render_tests {
             input: serde_json::Value::Null,
         };
         let rows = render_entry(&kind, 40, &mut engine);
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 1, "just the opening rule");
         let text = row_text(&rows[0]);
-        assert!(text.starts_with("$ echo hi"), "got {text:?}");
-        assert!(
-            rows[0]
-                .spans
-                .iter()
-                .all(|s| s.style.bg == Some(TOOL_CARD_BG))
-        );
+        assert!(text.starts_with('╭'), "got {text:?}");
+        assert!(text.contains("$ echo hi"), "got {text:?}");
     }
 
     #[test]
-    fn multiline_tool_result_gets_an_output_divider_on_the_card_background() {
+    fn read_tool_call_opens_a_card_with_a_bullet_and_the_path() {
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolCall {
+            tool: "Read".to_string(),
+            detail: "src/lib.rs".to_string(),
+            input: serde_json::Value::Null,
+        };
+        let rows = render_entry(&kind, 40, &mut engine);
+        assert_eq!(rows.len(), 1);
+        let text = row_text(&rows[0]);
+        assert!(text.contains("• Read src/lib.rs"), "got {text:?}");
+    }
+
+    #[test]
+    fn tool_result_always_gets_a_boxed_output_card_even_for_one_line() {
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::ToolResult {
-            detail: "line one\nline two".to_string(),
+            tool: "Bash".to_string(),
+            detail: "ok".to_string(),
             success: Some(true),
         };
         let rows = render_entry(&kind, 40, &mut engine);
-        assert_eq!(rows.len(), 4, "divider + 2 output lines + trailing blank");
-        assert!(row_text(&rows[0]).starts_with("── Output"));
+        // divider + 1 output line + closing rule + trailing blank.
+        assert_eq!(rows.len(), 4, "even a one-line result gets the full card");
+        assert!(row_text(&rows[0]).contains("Output"));
+        assert!(row_text(&rows[2]).starts_with('╰'));
         assert!(
-            rows.iter()
+            rows[..3]
+                .iter()
                 .all(|l| l.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)))
         );
     }
 
     #[test]
-    fn short_tool_result_stays_a_single_row_no_divider() {
+    fn multiline_tool_result_gets_an_output_divider_and_closing_rule() {
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::ToolResult {
-            detail: "ok".to_string(),
+            tool: "Bash".to_string(),
+            detail: "line one\nline two".to_string(),
+            success: Some(true),
+        };
+        let rows = render_entry(&kind, 40, &mut engine);
+        // divider + 2 output lines + closing rule + trailing blank.
+        assert_eq!(rows.len(), 5);
+        assert!(row_text(&rows[0]).contains("── Output"));
+        assert!(row_text(&rows[3]).starts_with('╰'));
+        assert!(
+            rows[..4]
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.style.bg == Some(TOOL_CARD_BG)))
+        );
+    }
+
+    #[test]
+    fn edit_tool_result_stays_a_plain_unboxed_line() {
+        // The real diff renders as its own FileEdit card; the Edit tool's own
+        // result should stay a lightweight confirmation, not a second box.
+        let mut engine = crate::highlight::HighlightEngine::new();
+        let kind = EntryKind::ToolResult {
+            tool: "Edit".to_string(),
+            detail: "[src/lib.rs#abcd]".to_string(),
             success: Some(true),
         };
         let rows = render_entry(&kind, 40, &mut engine);
         assert_eq!(rows.len(), 1);
         assert!(!row_text(&rows[0]).contains("Output"));
+        assert!(rows[0].spans.iter().all(|s| s.style.bg.is_none()));
+    }
+
+    // ── Inline prose Markdown (render_prose) ────────────────────────────────────
+
+    fn all_spans<'a>(lines: &'a [Line<'a>]) -> Vec<&'a Span<'a>> {
+        lines.iter().flat_map(|l| l.spans.iter()).collect()
+    }
+
+    #[test]
+    fn render_prose_colors_backtick_code_and_strips_the_markers() {
+        let base = Style::default().fg(Color::White);
+        let lines = render_prose("call `FeatureSnapshot::new` now", base);
+        let spans = all_spans(&lines);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            joined, "call FeatureSnapshot::new now",
+            "backticks are stripped"
+        );
+        let code = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "FeatureSnapshot::new")
+            .expect("code span present");
+        assert_eq!(code.style.fg, Some(SYMBOL_GREEN));
+    }
+
+    #[test]
+    fn render_prose_bolds_double_asterisk_and_strips_the_markers() {
+        let base = Style::default().fg(Color::White);
+        let lines = render_prose("this is **important** context", base);
+        let spans = all_spans(&lines);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "this is important context");
+        let bold = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "important")
+            .expect("bold span present");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            bold.style.fg,
+            Some(Color::White),
+            "bold keeps the base colour"
+        );
+    }
+
+    #[test]
+    fn render_prose_preserves_the_base_style_on_plain_text() {
+        let base = Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::ITALIC);
+        let lines = render_prose("plain sentence, no markdown", base);
+        let spans = all_spans(&lines);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style, base);
+        assert_eq!(spans[0].content.as_ref(), "plain sentence, no markdown");
+    }
+
+    #[test]
+    fn render_prose_code_span_keeps_italic_from_thinking_style() {
+        // Thinking text is italic; a `code` span inside it should stay
+        // italic while swapping only the foreground to green — Style::patch
+        // fills fg from the code style but unions modifiers, so the base
+        // italic survives.
+        let base = Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::ITALIC);
+        let lines = render_prose("still thinking about `FeatureValues`", base);
+        let spans = all_spans(&lines);
+        let code = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "FeatureValues")
+            .expect("code span present");
+        assert_eq!(code.style.fg, Some(SYMBOL_GREEN));
+        assert!(code.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn render_prose_handles_an_unterminated_marker_without_panicking() {
+        let base = Style::default().fg(Color::White);
+        let lines = render_prose("dangling `backtick with no close", base);
+        let spans = all_spans(&lines);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("dangling"));
+        assert!(joined.contains("backtick with no close"));
     }
 
     // ── File-edit header ─────────────────────────────────────────────────────

@@ -167,16 +167,14 @@ fn oversized_tool_result_is_folded_with_marker() {
         .collect::<Vec<_>>()
         .join("\n");
     t.ingest(TuiEntry::now(EntryKind::ToolResult {
+        tool: "Bash".to_string(),
         detail: huge,
         success: Some(true),
     }));
     let EntryKind::ToolResult { detail, .. } = &t.entries()[0].kind else {
         panic!("expected ToolResult");
     };
-    assert!(
-        detail.contains("lines omitted"),
-        "fold marker must be present"
-    );
+    assert!(detail.contains("more lines"), "fold marker must be present");
     let kept_lines = detail.lines().count();
     assert!(
         kept_lines <= 11,
@@ -210,7 +208,7 @@ fn oversized_edit_diff_input_is_bounded() {
         panic!("expected ToolCall");
     };
     let old = input.get("old_string").unwrap().as_str().unwrap();
-    assert!(old.contains("lines omitted"));
+    assert!(old.contains("more lines"));
     assert!(old.lines().count() <= 11);
 }
 
