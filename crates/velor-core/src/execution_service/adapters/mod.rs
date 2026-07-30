@@ -16,4 +16,5 @@ pub mod acp;
 pub mod claude;
 pub mod claude_stream;
 pub mod codex;
+mod edit_capture;
 pub mod omp;

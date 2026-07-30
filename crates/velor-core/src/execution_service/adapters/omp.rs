@@ -25,13 +25,16 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentEvent, AgentRunResult};
 use crate::config::OmpConfig;
 use crate::execution_service::adapter::{AgentAdapter, AgentEventSink, LineDecoder};
 use crate::execution_service::adapters::claude::map_outcome;
+use crate::execution_service::adapters::edit_capture::{
+    ReadState, drain_pending_edits, note_pending, read_file_state,
+};
 use crate::execution_service::classify::ProviderKind;
 use crate::execution_service::error::AgentExecutionError;
 use crate::execution_service::supervisor::{
@@ -182,7 +185,7 @@ impl AgentAdapter for OmpSubprocessAdapter {
         let process: RunningProcess =
             crate::execution_service::supervisor::spawn(spec, self.params.cancellation.clone())
                 .await?;
-        run_omp_stream(process, sink).await
+        run_omp_stream(process, sink, &self.params.working_directory).await
     }
 }
 
@@ -191,6 +194,7 @@ impl AgentAdapter for OmpSubprocessAdapter {
 async fn run_omp_stream(
     mut process: RunningProcess,
     sink: &mut dyn AgentEventSink,
+    cwd: &Path,
 ) -> Result<AgentRunResult, AgentExecutionError> {
     let mut decoder = LineDecoder::new(MAX_FRAME_BYTES);
     let mut collected = String::new();
@@ -200,6 +204,8 @@ async fn run_omp_stream(
     // (which only carries `toolCallId`, not the original command/path) can
     // recover it. See `parse_omp_line`.
     let mut pending_tool_calls: HashMap<String, String> = HashMap::new();
+    // Pre-edit snapshots for first-class edit tools. See [`process_event`].
+    let mut pending_edits: Vec<(String, ReadState)> = Vec::new();
 
     while let Some(event) = process.next_event().await {
         match event {
@@ -214,14 +220,12 @@ async fn run_omp_stream(
                     for agent_event in
                         parse_omp_line(&text, &mut collected, &mut pending_tool_calls)
                     {
-                        if structured_error.is_none()
-                            && let AgentEvent::Error { message } = &agent_event
+                        if let Some(msg) =
+                            process_event(sink, cwd, &mut pending_edits, agent_event).await?
+                            && structured_error.is_none()
                         {
-                            structured_error = Some(message.clone());
+                            structured_error = Some(msg);
                         }
-                        sink.emit(agent_event)
-                            .await
-                            .map_err(|_| AgentExecutionError::Cancelled)?;
                     }
                 }
                 // The prompt is fully handled: send EOF so omp exits, then stop
@@ -253,11 +257,17 @@ async fn run_omp_stream(
     if let Some(remainder) = decoder.flush_remainder()? {
         let text = String::from_utf8_lossy(&remainder);
         for agent_event in parse_omp_line(&text, &mut collected, &mut pending_tool_calls) {
-            sink.emit(agent_event)
-                .await
-                .map_err(|_| AgentExecutionError::Cancelled)?;
+            if let Some(msg) = process_event(sink, cwd, &mut pending_edits, agent_event).await?
+                && structured_error.is_none()
+            {
+                structured_error = Some(msg);
+            }
         }
     }
+
+    // Best-effort: emit diffs for any edits whose result frame we never
+    // observed (e.g. the process ended mid-turn). Reads the final on-disk state.
+    drain_pending_edits(cwd, &mut pending_edits, sink).await?;
 
     if close_sent {
         return finalize_streaming(process, collected, structured_error).await;
@@ -286,6 +296,92 @@ async fn finalize_streaming(
             Ok(AgentRunResult { stdout: collected })
         }
     }
+}
+
+// ── File-edit capture ───────────────────────────────────────────────────────
+//
+// omp executes its own tools; Velor only sees the RPC event stream. To show
+// the *real* resulting edit (not the agent's claimed patch) we snapshot a
+// file's contents when its edit `toolcall_end` is observed — before the edit
+// lands — and diff it against the post-edit contents once the matching
+// `tool_execution_end` arrives (by which point the edit is on disk). Only
+// first-class edit tools (`edit`/`write`) are observed; shell-driven file
+// mutations via `bash` are not reliably observable and are intentionally
+// excluded.
+
+/// Processes one parsed agent event: snapshots pre-edit contents for edit-tool
+/// calls, emits the real `FileEdit` diff when a tool result arrives, then emits
+/// the event itself. Returns the message if `event` is an [`AgentEvent::Error`]
+/// so the caller can track the structured error.
+async fn process_event(
+    sink: &mut dyn AgentEventSink,
+    cwd: &Path,
+    pending: &mut Vec<(String, ReadState)>,
+    event: AgentEvent,
+) -> Result<Option<String>, AgentExecutionError> {
+    let err_msg = match &event {
+        AgentEvent::Error { message } => Some(message.clone()),
+        _ => None,
+    };
+    // Snapshot the pre-edit state when a first-class edit tool is invoked. The
+    // tool has not executed yet (its result has not been emitted).
+    if let AgentEvent::ToolCall { tool, input, .. } = &event
+        && let Some(path) = edit_target_path(tool, input)
+    {
+        let state = read_file_state(cwd, &path).await;
+        note_pending(pending, path, state);
+    }
+    // A tool result means the preceding edit(s) have landed on disk: read the
+    // resulting state, compute the real diff, and emit it before the result so
+    // the diff appears between the tool call and its result.
+    if matches!(event, AgentEvent::ToolResult { .. }) {
+        drain_pending_edits(cwd, pending, sink).await?;
+    }
+    sink.emit(event)
+        .await
+        .map_err(|_| AgentExecutionError::Cancelled)?;
+    Ok(err_msg)
+}
+
+/// Whether `tool` is a first-class file-edit tool whose filesystem result Velor
+/// can observe by reading the file before and after the result arrives.
+fn is_file_edit_tool(tool: &str) -> bool {
+    matches!(tool, "edit" | "write")
+}
+
+/// The target file path for a first-class edit tool's input, if any.
+///
+/// `write`'s args carry an explicit `path`. `edit`'s schema isn't a stable
+/// Velor contract — its `input` is a compact patch DSL of `SWAP` hunks that
+/// this crate does not parse — but every observed call opens with a
+/// `[<path>#<hash>]` marker line, so the path is read off that marker rather
+/// than attempting to understand the patch itself. Reading the real file
+/// before and after (see [`process_event`]) means the patch DSL never needs
+/// parsing at all: the diff shown is always what's actually on disk.
+fn edit_target_path(tool: &str, input: &serde_json::Value) -> Option<String> {
+    if !is_file_edit_tool(tool) {
+        return None;
+    }
+    match tool {
+        "write" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty()),
+        "edit" => input
+            .get("input")
+            .and_then(|v| v.as_str())
+            .and_then(leading_bracketed_path),
+        _ => None,
+    }
+}
+
+/// Extracts `path` from a leading `[path#hash]` marker line, if present.
+fn leading_bracketed_path(patch: &str) -> Option<String> {
+    let first_line = patch.lines().next()?;
+    let inner = first_line.strip_prefix('[')?.strip_suffix(']')?;
+    let path = inner.rsplit_once('#').map_or(inner, |(p, _)| p);
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 /// Cheap check: is this line the terminal `agent_end` frame?
@@ -683,5 +779,141 @@ mod tests {
         assert_eq!(value["type"], "prompt");
         assert_eq!(value["message"], "hello\nworld");
         assert_eq!(value["id"], "vel");
+    }
+
+    // ── File-edit capture ───────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct CollectingSink {
+        events: Vec<AgentEvent>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AgentEventSink for CollectingSink {
+        async fn emit(
+            &mut self,
+            event: AgentEvent,
+        ) -> Result<(), crate::execution_service::adapter::AgentSinkError> {
+            self.events.push(event);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn detects_first_class_edit_tools() {
+        assert!(is_file_edit_tool("edit"));
+        assert!(is_file_edit_tool("write"));
+        assert!(!is_file_edit_tool("read"));
+        assert!(!is_file_edit_tool("bash"));
+        assert!(!is_file_edit_tool("grep"));
+        assert!(!is_file_edit_tool("todo"));
+    }
+
+    #[test]
+    fn edit_target_path_reads_write_s_explicit_path() {
+        let input = serde_json::json!({"i": "intent", "path": "src/lib.rs"});
+        assert_eq!(
+            edit_target_path("write", &input).as_deref(),
+            Some("src/lib.rs")
+        );
+
+        // Non-edit tools never report a target even with a path.
+        assert!(edit_target_path("read", &input).is_none());
+
+        // Empty path is ignored.
+        let empty = serde_json::json!({"path": ""});
+        assert!(edit_target_path("write", &empty).is_none());
+    }
+
+    #[test]
+    fn edit_target_path_reads_edit_s_leading_bracketed_marker() {
+        let input = serde_json::json!({
+            "i": "Replace iter().copied().collect() with to_vec()",
+            "input": "[crates/domain/aq-feature-domain/src/quality_gathering.rs#72DB]\nSWAP 36.=36:\nuse crate::quality_features::{QualityEvaluation, QualityFeatureError, evaluate_quality};",
+        });
+        assert_eq!(
+            edit_target_path("edit", &input).as_deref(),
+            Some("crates/domain/aq-feature-domain/src/quality_gathering.rs")
+        );
+    }
+
+    #[test]
+    fn edit_target_path_ignores_edit_input_missing_a_marker() {
+        let input = serde_json::json!({"i": "intent", "input": "no marker here\nSWAP 1.=1:\nx"});
+        assert!(edit_target_path("edit", &input).is_none());
+    }
+
+    #[tokio::test]
+    async fn omp_edit_reports_the_real_modified_diff_ignoring_the_patch_dsl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let path = "src/lib.rs";
+        std::fs::create_dir_all(cwd.join("src")).expect("mkdir");
+        std::fs::write(cwd.join(path), "fn main() {}\n").expect("write pre");
+
+        let mut collected = String::new();
+        let mut pending_tool_calls = HashMap::new();
+        let mut pending_edits = Vec::new();
+        let sink = &mut CollectingSink::default();
+
+        let call_events = parse_omp_line(
+            &serde_json::json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_end",
+                    "toolCall": {
+                        "id": "c1",
+                        "name": "edit",
+                        "arguments": {
+                            "i": "swap body",
+                            "input": "[src/lib.rs#AAAA]\nSWAP 1.=1:\nfn main() { todo!() }",
+                        },
+                    },
+                },
+            })
+            .to_string(),
+            &mut collected,
+            &mut pending_tool_calls,
+        );
+        for event in call_events {
+            process_event(sink, cwd, &mut pending_edits, event)
+                .await
+                .expect("process call event");
+        }
+
+        // The agent's tool lands the real edit on disk before its result frame.
+        std::fs::write(cwd.join(path), "fn main() { todo!() }\n").expect("write post");
+
+        let result_events = parse_omp_line(
+            &serde_json::json!({
+                "type": "tool_execution_end",
+                "toolCallId": "c1",
+                "toolName": "edit",
+                "isError": false,
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+            })
+            .to_string(),
+            &mut collected,
+            &mut pending_tool_calls,
+        );
+        for event in result_events {
+            process_event(sink, cwd, &mut pending_edits, event)
+                .await
+                .expect("process result event");
+        }
+
+        let edit = sink
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::FileEdit { edit } => Some(edit),
+                _ => None,
+            })
+            .expect("a FileEdit event derived from the real on-disk change");
+        assert_eq!(edit.path, path);
+        assert!(matches!(
+            edit.kind,
+            crate::file_edit::FileEditKind::Modified
+        ));
     }
 }
