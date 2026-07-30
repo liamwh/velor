@@ -24,7 +24,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
@@ -925,15 +925,17 @@ fn build_layout(
     engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
     let content_lines = render_entry(kind, width as usize, engine);
-    // Dividers read as a clean full-width rule; file edits render their own
-    // gutter and must skip the timestamp so wrapped rows align under the source.
+    // Dividers and file edits read as clean full-width rules/gutters; boxed
+    // tool results open on a full-width card rule too — none of these want a
+    // timestamp eating into column 0.
     let no_timestamp = matches!(
         kind,
         EntryKind::IterationDivider { .. } | EntryKind::FileEdit(_)
-    );
-    // File-edit lines carry a gutter; their wrapped continuation rows indent by
-    // the gutter width so they align beneath the source, not the line number.
-    let hang = file_edit_hang(kind);
+    ) || matches!(kind, EntryKind::ToolResult { detail, .. } if tool_result_boxed(detail));
+    // File-edit lines carry a gutter, and boxed tool-result lines carry a
+    // border; their wrapped continuation rows indent to match so they align
+    // beneath the source/content rather than the gutter or border.
+    let hang = entry_hang(kind);
     let ts_span = Span::styled(
         ts.format("%H:%M:%S ").to_string(),
         Style::default().fg(Color::DarkGray),
@@ -1450,9 +1452,13 @@ fn render(
         .filter(|e| matches!(e.kind, EntryKind::Error(_)))
         .count();
 
-    let title = build_title(state, entries.len(), error_count);
-    let para =
-        Paragraph::new(visible_lines).block(Block::default().borders(Borders::ALL).title(title));
+    let (left_title, right_title) = build_title(state, entries.len(), error_count);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(left_title))
+        .title(Line::from(right_title).alignment(Alignment::Right));
+    let para = Paragraph::new(visible_lines).block(block);
     f.render_widget(para, log_area);
 
     render_spinner(f, state, spinner_area);
@@ -1548,25 +1554,44 @@ fn render_transient_status(f: &mut Frame, area: Rect, msg: &str) {
     f.render_widget(Paragraph::new(line), rect);
 }
 
-/// Builds the log-area title: event count, scroll state, retained size, and
-/// compact omitted/error indicators.
-fn build_title(state: &TuiState, n: usize, error_count: usize) -> String {
+/// Builds the log-area title as a `(left, right)` pair rendered on the same
+/// border row: a breadcrumb of current activity on the left, and a compact
+/// position/size summary on the right — mirroring a single-row terminal
+/// header rather than a separate content line.
+fn build_title(
+    state: &TuiState,
+    n: usize,
+    error_count: usize,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let left = vec![
+        Span::styled(" vel auto ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("› {} ", state.spinner_verb),
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+
     let scroll_label = match state.scroll {
         ScrollState::Tail => "live",
         ScrollState::Anchored { .. } => "history",
     };
     let kib = state.transcript.retained_bytes() / 1024;
-    let mut s = format!(" vel auto — {n} events · {kib} KiB live ");
+    let mut s = format!("{n} events · {kib} KiB");
     if error_count > 0 {
-        s += &format!("· ⚠ {error_count} err ");
+        s += &format!(" · {error_count} err");
     }
     let omitted = state.transcript.omitted();
     if !omitted.is_empty() {
-        s += &format!("· {} trimmed (in log) ", omitted.entries);
+        s += &format!(" · {} trimmed", omitted.entries);
     }
-    s += scroll_label;
-    s.push(' ');
-    s
+    s += &format!(" · {scroll_label} ");
+    let right_color = if error_count > 0 {
+        Color::Red
+    } else {
+        Color::Gray
+    };
+    let right = vec![Span::styled(s, Style::default().fg(right_color))];
+    (left, right)
 }
 
 fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
@@ -1596,20 +1621,20 @@ fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
     if let Some((current, total)) = state.iteration {
         spans.push(Span::raw("  ·  "));
         spans.push(Span::styled(
-            format!("🔁 {current}/{total}"),
-            Style::default().fg(Color::Yellow),
+            format!("iter {current}/{total}"),
+            Style::default().fg(Color::Gray),
         ));
     }
-    // "Viewing iteration" — distinct from the running iteration (🔁 above).
-    // Shown only when the reader has scrolled into a different iteration than
-    // the one currently running, so they can tell e.g. they are reading
-    // iteration 2 while the agent works on iteration 3.
+    // "Viewing iteration" — distinct from the running iteration above. Shown
+    // only when the reader has scrolled into a different iteration than the
+    // one currently running, so they can tell e.g. they are reading iteration
+    // 2 while the agent works on iteration 3.
     if let Some(viewing) = state.viewing_iteration_number() {
         let running = state.iteration.map(|(c, _)| c);
         if running.is_some_and(|r| r != viewing) {
             spans.push(Span::raw("  ·  "));
             spans.push(Span::styled(
-                format!("👁 viewing iter {viewing}"),
+                format!("viewing iter {viewing}"),
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
@@ -1621,7 +1646,7 @@ fn render_spinner(f: &mut Frame, state: &TuiState, area: Rect) {
         let preview: String = append.as_str().chars().take(20).collect();
         spans.push(Span::raw("  ·  "));
         spans.push(Span::styled(
-            format!("✎ append: {preview}"),
+            format!("append: {preview}"),
             Style::default().fg(Color::Green),
         ));
     }
@@ -1723,137 +1748,169 @@ fn fmt_tokens(n: u64) -> String {
 
 // ── Per-entry rendering (content lines, pre-wrap) ────────────────────────────
 
+/// Display width of the "│ " left border prefixed to every body row of a
+/// bordered card (tool-result output, file-edit gutters). Shared by the
+/// border span constructors and [`entry_hang`] so continuation rows always
+/// align under the content, never under the border.
+const CARD_BORDER_WIDTH: usize = 2;
+
 fn render_entry(
     kind: &EntryKind,
-    _width: usize,
+    width: usize,
     engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
     match kind {
-        EntryKind::Text(text) => text
-            .lines()
-            .map(|l| {
-                Line::from(vec![
-                    Span::styled("› ", Style::default().fg(Color::Gray)),
-                    Span::styled(l.to_string(), Style::default().fg(Color::Gray)),
-                ])
-            })
-            .collect(),
+        EntryKind::Text(text) => {
+            let mut lines: Vec<Line<'static>> = text
+                .lines()
+                .map(|l| {
+                    Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(Color::White),
+                    ))
+                })
+                .collect();
+            // Trailing blank row gives paragraphs breathing room, matching the
+            // document-like spacing of a prose-first transcript. Safe for the
+            // viewport/cache row accounting: the blank row belongs to this
+            // entry, so it's counted like any other row.
+            lines.push(Line::default());
+            lines
+        }
 
         EntryKind::Thinking(text) => text
             .lines()
             .map(|l| {
-                Line::from(vec![
-                    Span::styled(
-                        "💭 ",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::DIM),
-                    ),
-                    Span::styled(
-                        l.to_string(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ])
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                ))
             })
             .collect(),
 
         EntryKind::Usage { .. } => Vec::new(),
 
         EntryKind::ToolCall { tool, detail, .. } => {
-            // The header line only — for edit tools the real before/after diff
-            // arrives as a separate `FileEdit` entry (computed from the
-            // filesystem), so we never render the agent's claimed patch here.
+            // A lightweight, unboxed label — the substantial content (output,
+            // diffs) arrives in the ToolResult/FileEdit entries that follow and
+            // get the bordered card treatment. For edit tools the real
+            // before/after diff arrives as a separate `FileEdit` entry
+            // (computed from the filesystem), so we never render the agent's
+            // claimed patch here.
             vec![Line::from(vec![
-                Span::styled(
-                    "🔧 ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
                 Span::styled(
                     tool.clone(),
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(": "),
+                Span::raw("  "),
                 Span::styled(detail.clone(), Style::default().fg(Color::DarkGray)),
             ])]
         }
 
         EntryKind::ToolResult { detail, success } => {
-            let (icon, color) = if success == &Some(false) {
-                ("⚠️", Color::Red)
-            } else {
-                ("✅", Color::Green)
-            };
-            let mut lines = Vec::new();
-            for (i, line) in detail.lines().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{icon} "), Style::default().fg(color)),
-                        Span::styled(
-                            truncate_str(line, 200),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(
-                            truncate_str(line, 200),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                }
-            }
-            if lines.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("{icon} (no output)"),
+            let failed = *success == Some(false);
+            let body: Vec<&str> = detail.lines().collect();
+            if !tool_result_boxed(detail) {
+                let color = if failed { Color::Red } else { Color::DarkGray };
+                let text = body.first().copied().unwrap_or("(no output)");
+                return vec![Line::from(Span::styled(
+                    truncate_str(text, 200),
                     Style::default().fg(color),
-                )));
+                ))];
             }
+            let border_color = if failed { Color::Red } else { Color::DarkGray };
+            let mut lines = vec![card_rule('╭', '╮', "", border_color, width)];
+            // "│ " is exactly CARD_BORDER_WIDTH columns wide.
+            let border = || Span::styled("│ ", Style::default().fg(border_color));
+            for line in &body {
+                lines.push(Line::from(vec![
+                    border(),
+                    Span::styled(truncate_str(line, 200), Style::default().fg(Color::Gray)),
+                ]));
+            }
+            let bottom_label = if failed { "failed" } else { "" };
+            lines.push(card_rule('╰', '╯', bottom_label, border_color, width));
+            lines.push(Line::default());
             lines
         }
 
         EntryKind::Error(msg) => msg
             .lines()
-            .map(|l| {
-                Line::from(vec![
-                    Span::styled("❌ ", Style::default().fg(Color::Red)),
-                    Span::styled(l.to_string(), Style::default().fg(Color::Red)),
-                ])
-            })
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red))))
             .collect(),
 
         EntryKind::Info(msg) => msg
             .lines()
             .map(|l| {
-                Line::from(vec![
-                    Span::styled("ℹ️ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(l.to_string(), Style::default().fg(Color::Cyan)),
-                ])
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(Color::Cyan),
+                ))
             })
             .collect(),
 
         EntryKind::Warning(msg) => msg
             .lines()
             .map(|l| {
-                Line::from(vec![
-                    Span::styled("⚠️ ", Style::default().fg(Color::Yellow)),
-                    Span::styled(l.to_string(), Style::default().fg(Color::Yellow)),
-                ])
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ))
             })
             .collect(),
 
         EntryKind::IterationDivider { number, maximum } => {
-            vec![render_iteration_divider(*number, *maximum, _width)]
+            vec![render_iteration_divider(*number, *maximum, width)]
         }
 
-        EntryKind::FileEdit(edit) => render_file_edit(edit, _width, engine),
+        EntryKind::FileEdit(edit) => render_file_edit(edit, width, engine),
     }
+}
+
+/// Whether a [`EntryKind::ToolResult`]'s detail is substantial enough to
+/// deserve the bordered card treatment (multi-line output such as file
+/// contents or command stdout), versus a short one-line confirmation (e.g. a
+/// terse Edit-tool acknowledgement, since the real diff already rendered as a
+/// [`EntryKind::FileEdit`] card). Shared by [`render_entry`] and
+/// [`entry_hang`] so the boxed decision and its wrap indent never diverge.
+fn tool_result_boxed(detail: &str) -> bool {
+    detail.lines().count() > 1
+}
+
+/// Draws a full-width card rule with an optional embedded label, e.g.
+/// `╭─ failed ─────────────╮`. Used to frame tool-result and file-edit
+/// bodies. Degrades to a bare label when the content width can't fit the
+/// corners + label, mirroring [`render_iteration_divider`]'s narrow-width
+/// handling.
+fn card_rule(left: char, right: char, label: &str, color: Color, width: usize) -> Line<'static> {
+    let w = width.max(1);
+    let rule_style = Style::default().fg(color);
+    if label.is_empty() {
+        let dashes = w.saturating_sub(2);
+        return Line::from(Span::styled(
+            format!("{left}{}{right}", "─".repeat(dashes)),
+            rule_style,
+        ));
+    }
+    let label_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let label_w = UnicodeWidthStr::width(label);
+    // "{left}─ " (3) + label + " " (1) + dashes + "{right}" (1).
+    let fixed_w = 5 + label_w;
+    if w <= fixed_w {
+        return Line::from(vec![Span::styled(label.to_string(), label_style)]);
+    }
+    let dashes = w - fixed_w;
+    Line::from(vec![
+        Span::styled(format!("{left}─ "), rule_style),
+        Span::styled(label.to_string(), label_style),
+        Span::raw(" "),
+        Span::styled("─".repeat(dashes), rule_style),
+        Span::styled(right.to_string(), rule_style),
+    ])
 }
 
 /// Renders a full-width separator marking the start of an iteration, with the
@@ -1888,18 +1945,21 @@ fn render_iteration_divider(number: u32, maximum: Option<u32>, width: usize) -> 
 
 /// The display width of a file-edit line's gutter: the sign column, spacing,
 /// the line number, and the separator. Shared by [`render_diff_line`] (which
-/// lays it out) and [`file_edit_hang`] (which sizes the hanging indent so
-/// wrapped rows align beneath the source).
+/// lays it out) and [`entry_hang`] (which sizes the hanging indent so wrapped
+/// rows align beneath the source).
 fn gutter_width(num_width: usize) -> usize {
     num_width + 6
 }
 
-/// The hanging-indent width for a `FileEdit` entry's wrapped rows, or `0` for
-/// any other entry kind. Sourced from the edit's widest line number so it always
-/// matches the gutter [`render_diff_line`] emits.
-fn file_edit_hang(kind: &EntryKind) -> usize {
+/// The hanging-indent width for an entry's wrapped rows, or `0` for entries
+/// with no gutter/border. A `FileEdit`'s body carries the card border plus
+/// its gutter; a boxed `ToolResult`'s body carries just the border — both
+/// sourced from the same constants their own renderers use, so the indent
+/// never drifts from what's actually on screen.
+fn entry_hang(kind: &EntryKind) -> usize {
     match kind {
-        EntryKind::FileEdit(edit) => gutter_width(line_number_width(edit)),
+        EntryKind::FileEdit(edit) => CARD_BORDER_WIDTH + gutter_width(line_number_width(edit)),
+        EntryKind::ToolResult { detail, .. } if tool_result_boxed(detail) => CARD_BORDER_WIDTH,
         _ => 0,
     }
 }
@@ -1924,44 +1984,35 @@ fn line_number_width(edit: &FileEdit) -> usize {
 /// hanging-indent alignment is applied later in [`build_layout`].
 fn render_file_edit(
     edit: &FileEdit,
-    _width: usize,
+    width: usize,
     engine: &mut HighlightEngine,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Header: icon + path (kind-coloured) + optional status suffix.
-    let (path_color, suffix) = header_style(&edit.kind);
-    let mut header = vec![
-        Span::styled(
-            "✎ ".to_string(),
-            Style::default().fg(path_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            edit.path.clone(),
-            Style::default().fg(path_color).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(s) = suffix {
-        header.push(Span::styled(
-            format!("  {s}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    lines.push(Line::from(header));
+    // Card border colour follows the edit kind (green new, red deleted, cyan
+    // modified, …), so the whole card reads as one coloured unit rather than
+    // relying on an icon.
+    let (color, suffix) = header_style(&edit.kind);
+    let label = match suffix {
+        Some(s) => format!("{}  {s}", edit.path),
+        None => edit.path.clone(),
+    };
+    lines.push(card_rule('╭', '╮', &label, color, width));
+    let border = || Span::styled("│ ", Style::default().fg(color));
 
     match &edit.kind {
         FileEditKind::CaptureFailed { reason } => {
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                border(),
                 Span::styled(
-                    format!("⚠ could not capture edit: {reason}"),
+                    format!("could not capture edit: {reason}"),
                     Style::default().fg(Color::Yellow),
                 ),
             ]));
         }
         FileEditKind::Binary => {
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                border(),
                 Span::styled(
                     "binary file changed (contents not shown)",
                     Style::default()
@@ -1989,21 +2040,28 @@ fn render_file_edit(
                 if i > 0
                     && let Some(gap) = inter_hunk_gap(edit.hunks.get(i - 1), hunk)
                 {
-                    lines.push(dim_line(format!("  ⋯ {gap} lines ⋯")));
+                    lines.push(dim_line(format!("⋯ {gap} lines ⋯"), color));
                 }
                 for dl in &hunk.lines {
-                    lines.push(render_diff_line(dl, num_width, &highlighted, engine));
+                    let mut line = render_diff_line(dl, num_width, &highlighted, engine);
+                    line.spans.insert(0, border());
+                    lines.push(line);
                 }
             }
             if edit.omitted_lines > 0 {
-                lines.push(dim_line(format!(
-                    "  ⋯ {} lines omitted — full diff is in the run log ⋯",
-                    edit.omitted_lines
-                )));
+                lines.push(dim_line(
+                    format!(
+                        "⋯ {} lines omitted — full diff is in the run log ⋯",
+                        edit.omitted_lines
+                    ),
+                    color,
+                ));
             }
         }
     }
 
+    lines.push(card_rule('╰', '╯', "", color, width));
+    lines.push(Line::default());
     lines
 }
 
@@ -2302,12 +2360,14 @@ fn line_no_for_gap(l: &DiffLine) -> Option<usize> {
     l.old_no.or(l.new_no)
 }
 
-/// A dim, full-span line used for inter-hunk gaps and truncation markers.
-fn dim_line(text: String) -> Line<'static> {
-    Line::from(vec![Span::styled(
-        text,
-        Style::default().fg(Color::DarkGray),
-    )])
+/// A dim, border-prefixed line used for inter-hunk gaps and truncation
+/// markers inside a file-edit card. `border_color` matches the enclosing
+/// card's rule colour so the "│ " prefix reads as part of the same border.
+fn dim_line(text: String, border_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("│ ", Style::default().fg(border_color)),
+        Span::styled(text, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -2914,25 +2974,26 @@ mod render_tests {
         let kind = EntryKind::FileEdit(Box::new(edit));
         let rows = build_layout(&kind, Local::now(), 40, &mut engine);
 
-        // rows[0] = header; rows[1] = first (guttered) row of the added line;
-        // rows[2..] = wrapped continuation rows.
+        // rows[0] = top card rule; rows[1] = first (bordered + guttered) row of
+        // the added line; rows[2..] = wrapped continuation rows.
         assert!(
             rows.len() > 2,
             "a long line must wrap to multiple rows, got {}",
             rows.len()
         );
-        // The guttered row begins with the gutter " + 1 │ " (width 7 for a
-        // 1-digit line number: space + sign + space + num + " │ ").
+        // The guttered row begins with the card border "│ " followed by the
+        // gutter " + 1 │ " (width 7 for a 1-digit line number: space + sign +
+        // space + num + " │ ").
         let first = row_text(&rows[1]);
         assert!(
-            first.starts_with(" + 1 │ "),
-            "first source row begins with the gutter, got {first:?}"
+            first.starts_with("│  + 1 │ "),
+            "first source row begins with the border + gutter, got {first:?}"
         );
-        // The continuation row is indented by the gutter width (7 columns) so it
-        // aligns beneath the source, not beneath the line number/marker.
+        // The continuation row is indented by the border + gutter width (2 + 7
+        // = 9 columns) so it aligns beneath the source, not the border/gutter.
         let cont = row_text(&rows[2]);
         assert!(
-            cont.starts_with("       "),
+            cont.starts_with(&" ".repeat(9)),
             "wrapped continuation is indented to the source column, got {cont:?}"
         );
     }
