@@ -338,6 +338,9 @@ struct TuiState {
     /// todo-tool call/result carries a new snapshot; never cleared mid-run
     /// (the last known state is more useful than nothing while idle).
     sticky_todo: Option<String>,
+    /// Whether the sticky todo panel renders at its expanded height (showing
+    /// the whole board) or its small default preview. Toggled by `Ctrl+T`.
+    sticky_todo_expanded: bool,
 }
 
 impl TuiState {
@@ -376,6 +379,7 @@ impl TuiState {
             pending_append_ack: None,
             transient_status: None,
             sticky_todo: None,
+            sticky_todo_expanded: false,
         }
     }
 
@@ -1409,6 +1413,14 @@ fn handle_key(
             state.show_prompt = true;
             state.prompt_scroll = 0;
         }
+        // Ctrl+T toggles the sticky todo panel between its small default
+        // preview and an expanded height that can actually show a long
+        // board. Guarded and placed before the plain `t` arm below (toggle
+        // thinking display), which would otherwise also match Ctrl+T since
+        // crossterm reports the same `Char('t')` regardless of modifiers.
+        KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.sticky_todo_expanded = !state.sticky_todo_expanded;
+        }
         KeyCode::Char('t') => {
             state.show_thinking = !state.show_thinking;
             // The layout cache key is width/rev-based, not view-setting-based, so
@@ -1463,7 +1475,11 @@ fn render(
 ) {
     let area = f.area();
 
-    let sticky_height = sticky_todo_height(state.sticky_todo.as_deref(), area.height);
+    let sticky_height = sticky_todo_height(
+        state.sticky_todo.as_deref(),
+        area.height,
+        state.sticky_todo_expanded,
+    );
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1562,7 +1578,7 @@ fn render(
     if sticky_area.height > 0
         && let Some(todo) = &state.sticky_todo
     {
-        render_sticky_todo(f, sticky_area, todo);
+        render_sticky_todo(f, sticky_area, todo, state.sticky_todo_expanded);
     }
 
     render_spinner(f, state, spinner_area);
@@ -1700,23 +1716,32 @@ fn build_title(
     (left, right)
 }
 
-/// Max lines of todo content shown in the sticky panel before truncating with
-/// a "N more" marker — keeps the panel from dominating a tall terminal even
-/// when the board itself is long.
-const MAX_STICKY_TODO_LINES: usize = 6;
+/// Max lines of todo content shown in the sticky panel's default (collapsed)
+/// preview before truncating with a "N more (Ctrl+T: Expand)" marker — keeps
+/// the panel small most of the time even when the board is long.
+const MAX_STICKY_TODO_LINES_COLLAPSED: usize = 6;
+/// Max lines shown once the panel is expanded (`Ctrl+T`) — generous enough to
+/// read a real board, still bounded so a huge one can't consume the whole
+/// terminal (the log area keeps its own guaranteed minimum regardless).
+const MAX_STICKY_TODO_LINES_EXPANDED: usize = 30;
 
 /// Row height (including the top/bottom border) for the sticky todo panel:
 /// `0` collapses it entirely when there's nothing to show. Bounded so it can
 /// never crowd out the log area's guaranteed minimum or the spinner/hints
 /// rows on a short terminal.
-fn sticky_todo_height(todo: Option<&str>, terminal_height: u16) -> u16 {
+fn sticky_todo_height(todo: Option<&str>, terminal_height: u16, expanded: bool) -> u16 {
     let Some(todo) = todo else {
         return 0;
     };
     if todo.trim().is_empty() {
         return 0;
     }
-    let content_lines = todo.lines().count().clamp(1, MAX_STICKY_TODO_LINES);
+    let cap = if expanded {
+        MAX_STICKY_TODO_LINES_EXPANDED
+    } else {
+        MAX_STICKY_TODO_LINES_COLLAPSED
+    };
+    let content_lines = todo.lines().count().clamp(1, cap);
     let desired = (content_lines + 2) as u16; // + top/bottom border
     let reserved_for_log_and_footer = 3 + 1 + 1; // log's Constraint::Min(3) + spinner + hints
     let budget = terminal_height.saturating_sub(reserved_for_log_and_footer);
@@ -1727,8 +1752,11 @@ fn sticky_todo_height(todo: Option<&str>, terminal_height: u16) -> u16 {
 /// spinner/hints rows so the current task list stays visible regardless of
 /// scroll position. Checklist-style lines (`[x]`/`[~]`/`[ ]`, as produced by
 /// [`todo_summary_from_input`]) are colour-coded by status; free-text board
-/// summaries (as reported directly by some providers) render plain.
-fn render_sticky_todo(f: &mut Frame, area: Rect, todo: &str) {
+/// summaries (as reported directly by some providers) render plain. `expanded`
+/// (toggled by `Ctrl+T`) mirrors the taller area [`sticky_todo_height`]
+/// already reserved when true, so the truncation marker only offers the
+/// expand hint when expanding would actually reveal more.
+fn render_sticky_todo(f: &mut Frame, area: Rect, todo: &str, expanded: bool) {
     let visible_budget = area.height.saturating_sub(2) as usize;
     if visible_budget == 0 {
         return;
@@ -1742,20 +1770,30 @@ fn render_sticky_todo(f: &mut Frame, area: Rect, todo: &str) {
     };
     let mut lines: Vec<Line<'static>> = todo.lines().take(take).map(todo_line_span).collect();
     if truncated {
-        // Height-limited, not a data-collapse — there's no fuller view to
-        // expand into (unlike a tool result's Ctrl+O), just less panel space
-        // than todo lines.
         let hidden = total_lines - lines.len();
+        // Expanded but still truncated means the panel is genuinely
+        // height-limited (a very short terminal) — Ctrl+T has nothing left
+        // to reveal, so don't claim it does.
+        let marker = if expanded {
+            format!("… {hidden} more")
+        } else {
+            format!("… {hidden} more (Ctrl+T: Expand)")
+        };
         lines.push(Line::from(Span::styled(
-            format!("… {hidden} more"),
+            marker,
             Style::default().fg(theme::active().dim),
         )));
     }
+    let title_text = if expanded {
+        " Todos (Ctrl+T: Collapse) "
+    } else {
+        " Todos "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::active().border))
         .title(Line::from(Span::styled(
-            " Todos ",
+            title_text,
             Style::default().add_modifier(Modifier::BOLD),
         )));
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -3316,6 +3354,10 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         (
             "Ctrl+O",
             "Expand/collapse tool-result output in place (full text vs. head+tail)",
+        ),
+        (
+            "Ctrl+T",
+            "Expand/collapse the sticky todo panel (small preview vs. full board)",
         ),
         ("?", "Show this keybindings help"),
         (
@@ -4953,14 +4995,18 @@ mod render_tests {
 
     #[test]
     fn sticky_todo_height_is_zero_with_no_todo() {
-        assert_eq!(sticky_todo_height(None, 40), 0);
-        assert_eq!(sticky_todo_height(Some(""), 40), 0);
-        assert_eq!(sticky_todo_height(Some("   "), 40), 0);
+        assert_eq!(sticky_todo_height(None, 40, false), 0);
+        assert_eq!(sticky_todo_height(Some(""), 40, false), 0);
+        assert_eq!(sticky_todo_height(Some("   "), 40, false), 0);
+        assert_eq!(sticky_todo_height(None, 40, true), 0);
     }
 
     #[test]
     fn sticky_todo_height_fits_short_content_plus_border() {
-        assert_eq!(sticky_todo_height(Some("[x] one\n[ ] two"), 40), 4);
+        assert_eq!(sticky_todo_height(Some("[x] one\n[ ] two"), 40, false), 4);
+        // Short content fits the same either way — expanding only matters
+        // once the board exceeds the collapsed cap.
+        assert_eq!(sticky_todo_height(Some("[x] one\n[ ] two"), 40, true), 4);
     }
 
     #[test]
@@ -4970,9 +5016,21 @@ mod render_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(
-            sticky_todo_height(Some(&long), 40),
-            (MAX_STICKY_TODO_LINES + 2) as u16
+            sticky_todo_height(Some(&long), 40, false),
+            (MAX_STICKY_TODO_LINES_COLLAPSED + 2) as u16
         );
+    }
+
+    #[test]
+    fn sticky_todo_height_expanded_shows_more_but_is_still_capped() {
+        let long = (0..50)
+            .map(|i| format!("[ ] item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expanded = sticky_todo_height(Some(&long), 40, true);
+        let collapsed = sticky_todo_height(Some(&long), 40, false);
+        assert!(expanded > collapsed, "Ctrl+T must actually show more");
+        assert_eq!(expanded, (MAX_STICKY_TODO_LINES_EXPANDED + 2) as u16);
     }
 
     #[test]
@@ -4982,7 +5040,10 @@ mod render_tests {
             .map(|i| format!("[ ] item {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(sticky_todo_height(Some(&long), 10), 5);
+        assert_eq!(sticky_todo_height(Some(&long), 10, false), 5);
+        // The budget caps expanded height too — it can't crowd out the log
+        // area's guaranteed minimum even when the user asks for more.
+        assert_eq!(sticky_todo_height(Some(&long), 10, true), 5);
     }
 
     #[test]
