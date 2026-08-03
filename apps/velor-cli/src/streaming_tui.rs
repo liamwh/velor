@@ -1613,6 +1613,13 @@ fn render(
 }
 
 /// Renders the `c` steering / `a` append editor modal.
+/// Minimum/maximum inner (content) rows for the steer/append popup. The
+/// popup grows with the buffer so a long line wraps across visible rows
+/// instead of being clipped; past `MAX_MODAL_INNER_ROWS` it scrolls to keep
+/// the tail of the input (where the cursor is) and the footer in view.
+const MIN_MODAL_INNER_ROWS: u16 = 7;
+const MAX_MODAL_INNER_ROWS_PCT: u16 = 70;
+
 fn render_steering_modal(
     f: &mut Frame,
     area: Rect,
@@ -1620,8 +1627,6 @@ fn render_steering_modal(
     submission: &SubmissionState,
     is_append: bool,
 ) {
-    let popup = center_rect(area, 80, 9);
-    f.render_widget(Clear, popup);
     let (title, prefix) = if is_append {
         (" ✏️  Append (Enter=save · Esc=cancel) ", "append › ")
     } else {
@@ -1631,37 +1636,68 @@ fn render_steering_modal(
     let prompt_style = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let mut lines: Vec<Line> = Vec::new();
-    // Compose the input line, wrapping long buffers across rows.
+
+    // Popup width is a fixed share of the screen; height grows with content
+    // (in exact rows, not a percentage, so it works at any terminal size).
+    let pop_w = area.width.saturating_mul(80) / 100;
+    let content_width = pop_w.saturating_sub(2).max(1) as usize; // account for left/right borders
+
+    // Pre-wrap the input and footer ourselves (rather than relying on the
+    // Paragraph widget's own wrap pass) so we know the exact row count up
+    // front and can size/scroll the popup to it.
     let input = format!("{prefix}{buffer}");
-    let input_line = Line::from(vec![Span::styled(input, prompt_style)]);
-    lines.push(input_line);
-    let footer = match submission {
-        SubmissionState::Editing => Line::from(Span::styled(
+    let input_spans = [Span::styled(input, prompt_style)];
+    let hang = UnicodeWidthStr::width(prefix);
+    let mut lines = wrap_spans_indented(&input_spans, content_width, hang);
+    let footer_spans: Vec<Span<'static>> = match submission {
+        SubmissionState::Editing => vec![Span::styled(
             if is_append {
                 "Empty clears the append. It is folded into every later iteration."
             } else {
                 "Sends one message to the active session. Not replayed in later iterations."
             },
             Style::default().fg(theme.dim),
-        )),
-        SubmissionState::Submitting => Line::from(Span::styled(
+        )],
+        SubmissionState::Submitting => vec![Span::styled(
             "Submitting…",
             Style::default().fg(theme.warning),
-        )),
-        SubmissionState::Failed { message } => Line::from(vec![
+        )],
+        SubmissionState::Failed { message } => vec![
             Span::styled("✗ ", Style::default().fg(theme.error)),
             Span::styled(message.clone(), Style::default().fg(theme.error)),
-        ]),
+        ],
     };
     lines.push(Line::from(""));
-    lines.push(footer);
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(theme.border_accent)),
-    );
+    lines.extend(wrap_spans_indented(&footer_spans, content_width, 0));
+
+    let max_inner = (area.height.saturating_mul(MAX_MODAL_INNER_ROWS_PCT) / 100)
+        .saturating_sub(2)
+        .max(MIN_MODAL_INNER_ROWS);
+    let total_rows = lines.len() as u16;
+    let inner_rows = total_rows.clamp(MIN_MODAL_INNER_ROWS, max_inner);
+    // If content overflows the visible rows, scroll so the tail (the end of
+    // the input, where typing happens, plus the footer) stays in view.
+    let scroll_y = total_rows.saturating_sub(inner_rows);
+
+    let popup_h = inner_rows + 2; // + top/bottom borders
+    let x = area.x + (area.width.saturating_sub(pop_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: pop_w,
+        height: popup_h,
+    };
+
+    f.render_widget(Clear, popup);
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(theme.border_accent)),
+        )
+        .scroll((scroll_y, 0));
     f.render_widget(para, popup);
 }
 
@@ -5097,5 +5133,74 @@ mod render_tests {
         )
         .expect("a real change produces an edit");
         assert_eq!(diff_stat(&edit), (1, 1));
+    }
+
+    // ── Steer/append modal sizing ────────────────────────────────────────────
+
+    #[test]
+    fn append_modal_wraps_long_input_across_multiple_rows_and_keeps_tail_visible() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let long_buffer = "word ".repeat(60) + "TAIL";
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_steering_modal(f, area, &long_buffer, &SubmissionState::Editing, true)
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+
+        let mut rows_with_word = 0;
+        let mut tail_visible = false;
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if row.contains("word") {
+                rows_with_word += 1;
+            }
+            if row.contains("TAIL") {
+                tail_visible = true;
+            }
+        }
+        assert!(
+            rows_with_word > 1,
+            "a long append buffer should wrap across multiple visible rows, got {rows_with_word}"
+        );
+        assert!(
+            tail_visible,
+            "the tail of the input (where typing happens) must stay visible, not be clipped or scrolled off"
+        );
+    }
+
+    #[test]
+    fn append_modal_stays_at_minimum_size_for_a_short_buffer() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_steering_modal(f, area, "short append", &SubmissionState::Editing, true)
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+
+        let mut nonblank_rows = 0;
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if !row.trim().is_empty() {
+                nonblank_rows += 1;
+            }
+        }
+        // Popup border rows are always non-blank, plus a handful of content
+        // rows; a short buffer shouldn't balloon the popup to near-fullscreen.
+        assert!(
+            nonblank_rows <= (MIN_MODAL_INNER_ROWS + 2) as usize,
+            "a short buffer should keep the popup at its minimum size, got {nonblank_rows} non-blank rows"
+        );
     }
 }
