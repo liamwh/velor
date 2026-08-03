@@ -1456,6 +1456,9 @@ fn handle_key(
         KeyCode::Char('g') => state.begin_g(),
         // `G` → bottom of this iteration (live tail when viewing the latest).
         KeyCode::Char('G') => state.jump_to_iteration_bottom(),
+        // `B` → absolute bottom (live tail), same as `gB` but a single key
+        // for the common case of "get back to the live feed right now".
+        KeyCode::Char('B') => state.jump_to_absolute_bottom(),
         // Scrolling is anchored to entry ids, so it stays stable while output
         // streams and history is trimmed. Up/k → older, Down/j → newer.
         KeyCode::Up | KeyCode::Char('k') => state.scroll_up_by(1),
@@ -3335,7 +3338,7 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         ("gg", "Jump to the top of the iteration in view"),
         ("G", "Jump to the bottom of the iteration in view"),
         ("gT", "Jump to the absolute start of the chat"),
-        ("gB", "Jump to the absolute bottom (re-enable live)"),
+        ("gB / B", "Jump to the absolute bottom (re-enable live)"),
         ("t", "Toggle display of model thinking/reasoning tokens"),
         (
             "e",
