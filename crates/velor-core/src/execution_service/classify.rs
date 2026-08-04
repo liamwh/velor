@@ -175,6 +175,27 @@ fn classify_text(
     let hay = text.to_ascii_lowercase();
     let retry_after = parse_retry_after(text);
 
+    // Checked first: an unambiguous local OS error (not provider-specific,
+    // but surfaces the same way — a non-zero exit with recognisable text in
+    // the captured output) that would otherwise fall through to a generic,
+    // permanent `UnsuccessfulExit`. `std::io::Error`'s `Display` renders
+    // ENOSPC as "No space left on device (os error 28)" on Unix, which this
+    // also matches.
+    if hay.contains("no space left on device")
+        || hay.contains("enospc")
+        || hay.contains("disk quota exceeded")
+    {
+        return Some(ClassifiedProvider {
+            error: ProviderError::DiskFull,
+            evidence: Classification::new(
+                ProviderErrorKind::DiskFull,
+                source,
+                "disk_full",
+                confidence,
+            ),
+        });
+    }
+
     // Order matters: deterministic/permanent failures before transient ones so a
     // specific signal is not masked by a generic one.
     if hay.contains("prompt is too long")
@@ -403,6 +424,21 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifies_disk_full_from_stderr() {
+        // The exact rendering of an ENOSPC `std::io::Error` on Unix, as would
+        // appear if the agent's own tool execution hit a full disk.
+        let out = make_output(false, "", "Error: No space left on device (os error 28)\n");
+        let c = classify_output(&out, ProviderKind::Claude, None).expect("classified");
+        assert_eq!(c.error.kind(), ProviderErrorKind::DiskFull);
+        assert_eq!(c.evidence.source, ClassificationSource::StderrTail);
+        assert!(
+            c.error.retryability().is_retryable(),
+            "disk-full must be retryable so the auto loop can clean up and retry"
+        );
     }
 
     #[cfg(unix)]

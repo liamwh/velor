@@ -193,6 +193,11 @@ pub enum ProviderErrorKind {
     ContextTooLarge,
     /// The provider rejected the configuration.
     InvalidConfiguration,
+    /// The local filesystem ran out of space (`ENOSPC`/"No space left on
+    /// device"). Not really a *provider* failure, but classified alongside
+    /// them since it surfaces the same way: a non-zero exit with a
+    /// recognisable message in the captured output.
+    DiskFull,
     /// Any other provider failure.
     Other,
 }
@@ -213,6 +218,13 @@ impl ProviderErrorKind {
             },
             Self::Authentication => Retryability::Retryable {
                 floor: Some(Duration::from_secs(30)),
+            },
+            // Retryable: a disk-full exit is only permanent if nothing ever
+            // frees space. The caller (the `auto` retry driver) runs a
+            // cleanup pass before consuming this retry, so a short floor is
+            // enough here — no need to wait out a provider-side condition.
+            Self::DiskFull => Retryability::Retryable {
+                floor: Some(Duration::from_secs(2)),
             },
             Self::ContextTooLarge | Self::InvalidConfiguration | Self::Other => {
                 Retryability::Permanent
@@ -255,6 +267,9 @@ pub enum ProviderError {
     /// The provider rejected the configuration.
     #[error("provider configuration is invalid")]
     InvalidConfiguration,
+    /// The local filesystem ran out of space.
+    #[error("the local filesystem is out of disk space")]
+    DiskFull,
     /// Another provider failure with an explicit retryability decision.
     #[error("provider request failed: {summary}")]
     Other {
@@ -276,6 +291,7 @@ impl ProviderError {
             Self::Authentication => ProviderErrorKind::Authentication,
             Self::ContextTooLarge => ProviderErrorKind::ContextTooLarge,
             Self::InvalidConfiguration => ProviderErrorKind::InvalidConfiguration,
+            Self::DiskFull => ProviderErrorKind::DiskFull,
             Self::Other { .. } => ProviderErrorKind::Other,
         }
     }
@@ -303,6 +319,12 @@ impl ProviderError {
             // Auth is retryable: keys can be renewed, auth endpoints can recover.
             Self::Authentication => Retryability::Retryable {
                 floor: Some(Duration::from_secs(30)),
+            },
+            // The retry driver runs a cleanup pass before consuming this
+            // retry (see `run_disk_cleanup_pass` in the `auto` loop), so a
+            // short floor is enough — no provider-side condition to wait out.
+            Self::DiskFull => Retryability::Retryable {
+                floor: Some(Duration::from_secs(2)),
             },
             Self::ContextTooLarge | Self::InvalidConfiguration => Retryability::Permanent,
             Self::Other { retryability, .. } => *retryability,

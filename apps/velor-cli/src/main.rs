@@ -219,6 +219,12 @@ struct AutoArgs {
     /// Disable the TUI; print agent output to stdout instead.
     #[arg(long)]
     no_tui: bool,
+
+    /// Disable the automatic disk-full self-heal: normally, if an iteration
+    /// fails because the local disk is full, Velor runs one agent pass asking
+    /// it to free up space before retrying the original iteration.
+    #[arg(long)]
+    no_disk_cleanup: bool,
 }
 
 /// Arguments for the `plan` subcommand
@@ -281,6 +287,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "max-retries",
     "base-backoff-ms",
     "no-tui",
+    "no-disk-cleanup",
     "specs-dir",
     "max-iterations",
     "openai-api-key",
@@ -875,6 +882,7 @@ async fn run_interactive_menu(
                     base_backoff_ms: None,
                     no_notify: false,
                     no_tui: false,
+                    no_disk_cleanup: false,
                 },
                 home_cfg,
                 git_root,
@@ -1488,6 +1496,7 @@ async fn run_auto(
         tui_ref,
         tui_command_rx,
         &logger,
+        !args.no_disk_cleanup,
     )
     .await;
 
@@ -2057,6 +2066,7 @@ async fn run_auto_loop(
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
     tui_command_rx: Option<tokio::sync::mpsc::Receiver<streaming_tui::TuiSteeringCommand>>,
     logger: &std::sync::Arc<run_logger::RunLogger>,
+    disk_cleanup_enabled: bool,
 ) -> color_eyre::eyre::Result<AutoLoopResult> {
     let start_time = std::time::Instant::now();
     let mut current_iteration = 1u32;
@@ -2278,6 +2288,7 @@ async fn run_auto_loop(
                     &mut iter_steer_rx,
                     logger,
                     retry_started_at,
+                    disk_cleanup_enabled,
                 ),
                 iter_steer_tx,
                 &mut tui_command_rx,
@@ -2737,6 +2748,99 @@ fn is_attempt_retryable(e: &core::execution_service::error::AgentExecutionError)
     )
 }
 
+/// Whether `e` was classified as the local filesystem running out of space
+/// (see `ProviderErrorKind::DiskFull`). Distinguished from ordinary retryable
+/// errors because passive backoff won't fix it — [`run_disk_cleanup_pass`]
+/// needs to run first.
+fn is_disk_full(e: &core::execution_service::error::AgentExecutionError) -> bool {
+    use core::execution_service::error::{AgentExecutionError, ProviderErrorKind};
+
+    matches!(
+        e,
+        AgentExecutionError::Provider { error, .. } if error.kind() == ProviderErrorKind::DiskFull
+    )
+}
+
+/// Fixed instructions for the one-shot cleanup pass run by
+/// [`run_disk_cleanup_pass`]. Deliberately scoped to *freeing space*, not
+/// resuming the original task — the original prompt is retried separately
+/// afterwards, by the normal retry path.
+const DISK_CLEANUP_PROMPT: &str = "\
+The local disk ran out of space during the previous step, which caused it to fail. \
+Before anything else, free up disk space so the original task can be retried. Look for \
+build artifacts, dependency caches, old logs, and other clearly regenerable or disposable \
+files (for example `target/`, `node_modules` caches, Docker images/build cache, \
+package-manager caches, old rotated logs, or large temp files) and remove enough of them \
+to make meaningful space available. Only delete things you are confident are safe to \
+remove — never delete source code, version-controlled files, or anything that looks like \
+user data. Briefly report what you freed and roughly how much space it recovered, then \
+stop; do not attempt the original task in this pass.";
+
+/// Runs one bounded, non-retried agent pass whose only job is to free local
+/// disk space, invoked when [`is_disk_full`] detects an `ENOSPC`-class
+/// failure. The original iteration is retried normally by the caller
+/// afterwards regardless of whether this pass reports success — even a
+/// partial cleanup may be enough, and if not, the standard retry/backoff
+/// (and eventual exhaustion) below still applies.
+#[allow(clippy::too_many_arguments)]
+async fn run_disk_cleanup_pass(
+    runner: &AgentRunner,
+    binary: &str,
+    permission_mode: &str,
+    cwd: &std::path::Path,
+    timeouts: core::execution_service::supervisor::ProcessTimeouts,
+    cancel_token: &CancellationToken,
+    tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
+    logger: &std::sync::Arc<run_logger::RunLogger>,
+) {
+    emit_status(
+        tui_tx,
+        true,
+        "Disk full detected — asking the agent to free up space before retrying…".to_string(),
+    );
+
+    // Isolated from the main iteration's live-steering channel: this pass is
+    // not meant to be user-steerable, it's a fixed side task.
+    let mut no_steering: Option<tokio::sync::mpsc::Receiver<core::agent::AgentInput>> = None;
+    let result = runner
+        .run_with_events_and_steering(
+            binary,
+            permission_mode,
+            DISK_CLEANUP_PROMPT,
+            "disk_cleanup",
+            cwd,
+            &[],
+            timeouts,
+            cancel_token.clone(),
+            &mut no_steering,
+            {
+                let tui_tx = tui_tx.cloned();
+                let logger = std::sync::Arc::clone(logger);
+                move |event: core::agent::AgentEvent| {
+                    logger.log_agent_event(&event);
+                    if let Some(tx) = &tui_tx
+                        && let Some(entry) = streaming_tui::agent_event_to_tui(&event)
+                    {
+                        let _ = tx.try_send(streaming_tui::TuiMessage::Entry(entry));
+                    }
+                }
+            },
+        )
+        .await;
+
+    match result {
+        Ok(_) => emit_status(tui_tx, false, "Disk cleanup pass completed.".to_string()),
+        Err(e) => {
+            tracing::warn!("disk cleanup pass failed: {e}");
+            emit_status(
+                tui_tx,
+                true,
+                format!("Disk cleanup pass failed ({e}); retrying the original task anyway."),
+            );
+        }
+    }
+}
+
 /// Emits a run-loop status line: as a TUI transcript entry when a TUI is
 /// attached, otherwise a plain `println!`.
 ///
@@ -2785,6 +2889,7 @@ fn short_failure_reason(e: &core::execution_service::error::AgentExecutionError)
             ProviderErrorKind::Authentication => "provider auth failed",
             ProviderErrorKind::ContextTooLarge => "context too large",
             ProviderErrorKind::InvalidConfiguration => "invalid provider config",
+            ProviderErrorKind::DiskFull => "disk full",
             ProviderErrorKind::Other => "provider error",
         },
         AgentExecutionError::Cancelled | AgentExecutionError::Process(ProcessError::Cancelled) => {
@@ -2906,6 +3011,7 @@ async fn execute_with_retry(
     steering: &mut Option<tokio::sync::mpsc::Receiver<core::agent::AgentInput>>,
     logger: &std::sync::Arc<run_logger::RunLogger>,
     retry_started_at: std::time::Instant,
+    disk_cleanup_enabled: bool,
 ) -> Result<core::agent::ClaudeRunResult, RetryError> {
     let mut last_error = String::new();
     let mut last_floor: Option<std::time::Duration> = None;
@@ -3077,6 +3183,28 @@ async fn execute_with_retry(
                     tracing::error!("permanent error detected on iteration {iteration}: {e}");
                     logger.log_permanent_failure(attempt, &e.to_string());
                     return Err(RetryError::Permanent(e.to_string()));
+                }
+
+                // Disk-full is a special case among retryable errors: passive
+                // backoff won't free space by itself, so run one bounded
+                // cleanup pass through the agent before falling into the
+                // normal retry/backoff below. Cancellation during cleanup is
+                // checked immediately after so a Ctrl+C isn't swallowed by it.
+                if disk_cleanup_enabled && is_disk_full(&e) {
+                    run_disk_cleanup_pass(
+                        runner,
+                        binary,
+                        permission_mode,
+                        cwd,
+                        timeouts.clone(),
+                        cancel_token,
+                        tui_tx,
+                        logger,
+                    )
+                    .await;
+                    if cancel_token.is_cancelled() {
+                        return Err(RetryError::Cancelled);
+                    }
                 }
 
                 tracing::warn!(
@@ -3460,5 +3588,54 @@ mod retry_classification_tests {
                 which: velor_core::execution_service::error::TimeoutKind::Idle,
             }
         )));
+    }
+
+    fn provider_err(
+        kind: velor_core::execution_service::error::ProviderErrorKind,
+    ) -> AgentExecutionError {
+        use velor_core::execution_service::classify::{
+            Classification, ClassificationConfidence, ClassificationSource,
+        };
+        use velor_core::execution_service::error::{ProviderError, ProviderErrorKind};
+
+        let evidence = Classification::new(
+            kind,
+            ClassificationSource::StderrTail,
+            "test",
+            ClassificationConfidence::Medium,
+        );
+        let error = match kind {
+            ProviderErrorKind::DiskFull => ProviderError::DiskFull,
+            ProviderErrorKind::Overloaded => ProviderError::Overloaded {
+                status: Some(529),
+                provider_code: None,
+                retry_after: None,
+            },
+            _ => unimplemented!("add a case for {kind:?} if this test helper needs it"),
+        };
+        AgentExecutionError::Provider { error, evidence }
+    }
+
+    #[test]
+    fn disk_full_is_retryable_and_detected_as_disk_full() {
+        use velor_core::execution_service::error::ProviderErrorKind;
+
+        let e = provider_err(ProviderErrorKind::DiskFull);
+        assert!(is_attempt_retryable(&e), "disk-full must be retried");
+        assert!(
+            super::is_disk_full(&e),
+            "a DiskFull provider error must be detected by is_disk_full"
+        );
+    }
+
+    #[test]
+    fn other_retryable_errors_are_not_detected_as_disk_full() {
+        use velor_core::execution_service::error::ProviderErrorKind;
+
+        let e = provider_err(ProviderErrorKind::Overloaded);
+        assert!(
+            !super::is_disk_full(&e),
+            "an unrelated retryable error must not trigger the disk-cleanup pass"
+        );
     }
 }
