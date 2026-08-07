@@ -288,6 +288,11 @@ struct TuiState {
     spinner_idx: usize,
     spinner_verb: &'static str,
     show_thinking: bool,
+    /// Whether tool-result/file-edit content renders inline (toggled by `o`).
+    /// The `ToolCall` invocation itself always renders; this hides only what
+    /// came back from it, distinct from `Ctrl+O`'s collapsed-vs-full toggle
+    /// on the content that *is* shown.
+    show_tool_output: bool,
     open_log: bool,
     /// The active input mode (normal vs. a steering/append editor).
     input_mode: InputMode,
@@ -343,6 +348,18 @@ struct TuiState {
     sticky_todo_expanded: bool,
 }
 
+/// Whether an entry renders in the live log under the current visibility
+/// toggles: `Thinking` gated by `show_thinking` (`t`), tool-result/file-edit
+/// content gated by `show_tool_output` (`o`). The `ToolCall` invocation itself
+/// is never hidden — only what came back from it.
+fn entry_visible(kind: &EntryKind, show_thinking: bool, show_tool_output: bool) -> bool {
+    match kind {
+        EntryKind::Thinking(_) => show_thinking,
+        EntryKind::ToolResult { .. } | EntryKind::FileEdit(_) => show_tool_output,
+        _ => true,
+    }
+}
+
 impl TuiState {
     fn new(limits: TuiLimits) -> Self {
         Self {
@@ -359,6 +376,7 @@ impl TuiState {
             spinner_idx: 0,
             spinner_verb: "starting",
             show_thinking: true,
+            show_tool_output: true,
             open_log: false,
             last_width: 80,
             last_viewport_rows: 10,
@@ -386,8 +404,8 @@ impl TuiState {
     /// Scrolls toward older content by `n` rows; stable under streaming/trimming.
     fn scroll_up_by(&mut self, n: u32) {
         let entries = self.transcript.entries();
-        let show = self.show_thinking;
-        let pred = move |e: &LiveEntry| !matches!(e.kind, EntryKind::Thinking(_)) || show;
+        let (show_thinking, show_tool_output) = (self.show_thinking, self.show_tool_output);
+        let pred = move |e: &LiveEntry| entry_visible(&e.kind, show_thinking, show_tool_output);
         self.scroll = tui_transcript::scroll_up(
             entries,
             &mut self.cache,
@@ -402,8 +420,8 @@ impl TuiState {
     /// Scrolls toward newer content by `n` rows; returns to follow-tail at bottom.
     fn scroll_down_by(&mut self, n: u32) {
         let entries = self.transcript.entries();
-        let show = self.show_thinking;
-        let pred = move |e: &LiveEntry| !matches!(e.kind, EntryKind::Thinking(_)) || show;
+        let (show_thinking, show_tool_output) = (self.show_thinking, self.show_tool_output);
+        let pred = move |e: &LiveEntry| entry_visible(&e.kind, show_thinking, show_tool_output);
         self.scroll = tui_transcript::scroll_down(
             entries,
             &mut self.cache,
@@ -611,6 +629,52 @@ impl TuiState {
             LiveSteeringStatus::Closing => {
                 self.set_transient("The active agent session is closing.");
             }
+        }
+    }
+
+    /// Builds an AI-friendly plain-text transcript export honoring the
+    /// current thinking/tool-output visibility toggles and current todo
+    /// state. `since_last_prompt` scopes the export to the current iteration
+    /// (from the most recent iteration divider onward — i.e. since the
+    /// model's last rendered prompt); falls back to the whole retained
+    /// transcript when no iteration boundary has been recorded yet.
+    fn transcript_export(&self, since_last_prompt: bool) -> String {
+        let entries = self.transcript.entries();
+        let start = if since_last_prompt {
+            self.iteration_starts
+                .last()
+                .and_then(|b| entries.iter().position(|e| e.id == b.id))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        tui_transcript::render_plain_text(
+            &entries[start..],
+            self.sticky_todo.as_deref(),
+            tui_transcript::PlainTextOptions {
+                show_thinking: self.show_thinking,
+                show_tool_output: self.show_tool_output,
+            },
+        )
+    }
+
+    /// Copies the transcript export to the system clipboard (native access
+    /// via `arboard`) and reports the outcome as a transient status line.
+    fn copy_transcript_to_clipboard(&mut self, since_last_prompt: bool) {
+        let text = self.transcript_export(since_last_prompt);
+        if text.trim().is_empty() {
+            self.set_transient("Nothing to copy yet.");
+            return;
+        }
+        let scope = if since_last_prompt {
+            "since last prompt"
+        } else {
+            "entire transcript"
+        };
+        let bytes = text.len();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => self.set_transient(&format!("Copied {scope} ({bytes} bytes) to clipboard.")),
+            Err(e) => self.set_transient(&format!("Clipboard copy failed: {e}")),
         }
     }
 
@@ -1447,10 +1511,26 @@ fn handle_key(
         // Ctrl+O expands every collapsed tool result in place to its full
         // retained output (toggle — pressing again re-collapses), matching
         // the "(Ctrl+O: Expand)" hint. Distinct from `l`: this reveals
-        // content inline rather than leaving the TUI for a pager.
+        // content inline rather than leaving the TUI for a pager. Guarded and
+        // placed before the plain `o` arm below (toggle tool-output
+        // visibility), which would otherwise also match `Char('o')`.
         KeyCode::Char('o' | 'O') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.cache.toggle_expand_output();
         }
+        // `o` hides/shows tool-result and file-edit content entirely (the
+        // `ToolCall` invocation itself stays visible either way). Distinct
+        // from Ctrl+O, which only toggles collapsed vs. full for content that
+        // *is* shown.
+        KeyCode::Char('o') => {
+            state.show_tool_output = !state.show_tool_output;
+        }
+        // `y` copies the transcript since the start of the current iteration
+        // (i.e. since the model's last rendered prompt) to the system
+        // clipboard, in a plain-text form suitable for pasting into another
+        // AI session. `Y` copies the entire retained transcript. Both honor
+        // the current `t`/`o` visibility toggles.
+        KeyCode::Char('y') => state.copy_transcript_to_clipboard(true),
+        KeyCode::Char('Y') => state.copy_transcript_to_clipboard(false),
         // `g` begins a prefix chord: `gg` → top of this iteration,
         // `gT` → absolute top of the chat, `gB` → absolute bottom (live tail).
         KeyCode::Char('g') => state.begin_g(),
@@ -1508,7 +1588,8 @@ fn render(
 
     let entries = state.transcript.entries();
     let show_thinking = state.show_thinking;
-    let pred = move |e: &LiveEntry| !matches!(e.kind, EntryKind::Thinking(_)) || show_thinking;
+    let show_tool_output = state.show_tool_output;
+    let pred = move |e: &LiveEntry| entry_visible(&e.kind, show_thinking, show_tool_output);
 
     // Viewport-only selection: cost ∝ viewport + overscan, not history size.
     let vp = if entries.is_empty() || viewport_rows == 0 {
@@ -1532,7 +1613,7 @@ fn render(
         let end = (vp.start + vp.count).min(entries.len());
         for (rel, i) in (vp.start..end).enumerate() {
             let entry = &entries[i];
-            if matches!(entry.kind, EntryKind::Thinking(_)) && !show_thinking {
+            if !entry_visible(&entry.kind, show_thinking, show_tool_output) {
                 continue;
             }
             let skip = if rel == 0 { vp.top_skip as usize } else { 0 };
@@ -1964,6 +2045,12 @@ fn render_hints(
             } else {
                 " thinking✗  "
             }),
+            key("o"),
+            Span::raw(if state.show_tool_output {
+                " output✓  "
+            } else {
+                " output✗  "
+            }),
             key("e"),
             Span::styled(label, Style::default().fg(color)),
             key("s"),
@@ -1978,6 +2065,8 @@ fn render_hints(
             Span::raw(" steer  "),
             key("a"),
             Span::raw(" append  "),
+            key("y/Y"),
+            Span::raw(" copy  "),
             key("?"),
             Span::raw(" help  "),
             key("↑↓"),
@@ -3391,12 +3480,24 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         ),
         ("l", "Open the JSONL run log in your pager"),
         (
+            "o",
+            "Toggle display of tool-result/file-edit output (calls stay visible)",
+        ),
+        (
             "Ctrl+O",
             "Expand/collapse tool-result output in place (full text vs. head+tail)",
         ),
         (
             "Ctrl+T",
             "Expand/collapse the sticky todo panel (small preview vs. full board)",
+        ),
+        (
+            "y",
+            "Copy the transcript since the last prompt to the clipboard (AI-friendly text)",
+        ),
+        (
+            "Y",
+            "Copy the entire transcript to the clipboard (AI-friendly text)",
         ),
         ("?", "Show this keybindings help"),
         (

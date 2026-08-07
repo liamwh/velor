@@ -44,6 +44,8 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 infer = "0.16"
+# System clipboard access for the streaming TUI's transcript-copy keys.
+arboard = "3"
 
 # Rules system dependencies
 globset = "0.4"

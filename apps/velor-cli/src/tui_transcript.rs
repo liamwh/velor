@@ -509,6 +509,157 @@ fn line_count(s: &str) -> u64 {
     n.max(1)
 }
 
+// ── Plain-text export ────────────────────────────────────────────────────────
+//
+// Builds a clipboard-friendly rendering of the transcript for pasting into
+// another AI session: no ANSI/markup, one section per entry, headers marking
+// tool calls/results/thinking, and file edits as a unified diff.
+
+/// Which entry kinds a plain-text export includes, mirroring the live view's
+/// visibility toggles so a copy matches what's on screen.
+#[derive(Debug, Clone, Copy)]
+pub struct PlainTextOptions {
+    /// Include `Thinking` entries (the `t` toggle).
+    pub show_thinking: bool,
+    /// Include `ToolResult`/`FileEdit` content (the `o` toggle). The
+    /// `ToolCall` invocation itself is always included.
+    pub show_tool_output: bool,
+}
+
+/// Renders `entries` (already sliced to the desired range) as plain text.
+/// `todos`, when non-empty after trimming, is prefixed as the current
+/// todo-board state (open and completed items alike) since that reflects live
+/// run state rather than a transcript entry.
+#[must_use]
+pub fn render_plain_text(
+    entries: &[LiveEntry],
+    todos: Option<&str>,
+    opts: PlainTextOptions,
+) -> String {
+    let mut out = String::new();
+    if let Some(todos) = todos.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("## Current todos\n");
+        out.push_str(todos);
+        out.push_str("\n\n");
+    }
+    for entry in entries {
+        if let Some(section) = render_entry_plain_text(&entry.kind, opts) {
+            out.push_str(&section);
+            out.push_str("\n\n");
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// Renders one entry to a plain-text section, or `None` when the entry is
+/// hidden by `opts` or carries no content worth exporting (e.g. transient
+/// usage, or an empty text run).
+fn render_entry_plain_text(kind: &EntryKind, opts: PlainTextOptions) -> Option<String> {
+    match kind {
+        EntryKind::Text(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        EntryKind::Thinking(s) => {
+            let s = s.trim();
+            (opts.show_thinking && !s.is_empty()).then(|| format!("[Thinking]\n{s}"))
+        }
+        EntryKind::ToolCall { tool, detail, .. } => Some(format!("[Tool call: {tool}] {detail}")),
+        EntryKind::ToolResult {
+            tool,
+            detail,
+            success,
+            ..
+        } => {
+            if !opts.show_tool_output {
+                return None;
+            }
+            let status = if *success == Some(false) {
+                " (failed)"
+            } else {
+                ""
+            };
+            Some(format!("[Tool result: {tool}{status}]\n{detail}"))
+        }
+        EntryKind::FileEdit(edit) => opts
+            .show_tool_output
+            .then(|| render_file_edit_plain_text(edit)),
+        // Errors live in the separate errors modal, never the main log — the
+        // export mirrors that.
+        EntryKind::Error(_) => None,
+        EntryKind::Info(s) => Some(format!("[Info] {s}")),
+        EntryKind::Warning(s) => Some(format!("[Warning] {s}")),
+        EntryKind::IterationDivider { number, maximum } => Some(match maximum {
+            Some(m) => format!("=== Iteration {number}/{m} ==="),
+            None => format!("=== Iteration {number} ==="),
+        }),
+        EntryKind::Usage { .. } => None,
+    }
+}
+
+/// Renders a captured file edit as a unified diff (`--- a/`/`+++ b/` header,
+/// `@@`-hunks, `+`/`-`/` `-prefixed lines).
+fn render_file_edit_plain_text(edit: &velor_core::file_edit::FileEdit) -> String {
+    use velor_core::file_edit::{FileEditKind, LineKind};
+
+    let path = &edit.path;
+    match &edit.kind {
+        FileEditKind::Binary => return format!("[Binary file changed: {path}]"),
+        FileEditKind::CaptureFailed { reason } => {
+            return format!("[File edit (capture failed): {path} — {reason}]");
+        }
+        FileEditKind::Created => {}
+        FileEditKind::Deleted => {}
+        FileEditKind::Modified => {}
+    }
+
+    let header = match &edit.kind {
+        FileEditKind::Created => format!("[File created: {path}]\n"),
+        FileEditKind::Deleted => format!("[File deleted: {path}]\n"),
+        FileEditKind::Modified | FileEditKind::Binary | FileEditKind::CaptureFailed { .. } => {
+            format!("[File edited: {path}]\n")
+        }
+    };
+
+    let mut out = header;
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+    for hunk in &edit.hunks {
+        let old_start = hunk.old_start.unwrap_or(0);
+        let new_start = hunk.new_start.unwrap_or(0);
+        let old_len = hunk
+            .lines
+            .iter()
+            .filter(|l| l.kind != LineKind::Addition)
+            .count();
+        let new_len = hunk
+            .lines
+            .iter()
+            .filter(|l| l.kind != LineKind::Removal)
+            .count();
+        out.push_str(&format!(
+            "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
+        ));
+        for line in &hunk.lines {
+            let prefix = match line.kind {
+                LineKind::Context => ' ',
+                LineKind::Addition => '+',
+                LineKind::Removal => '-',
+            };
+            out.push(prefix);
+            out.push_str(&line.text);
+            out.push('\n');
+        }
+    }
+    if edit.omitted_lines > 0 {
+        out.push_str(&format!(
+            "… {} more diff lines omitted (see run log for the full diff) …\n",
+            edit.omitted_lines
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 // ── Viewport + scroll ────────────────────────────────────────────────────────
 
 /// Yields the wrapped-row count of an entry at a given content width. The layout

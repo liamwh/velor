@@ -591,3 +591,144 @@ fn iteration_divider_trims_as_a_whole_entry() {
         }
     }
 }
+
+// ── Plain-text export ────────────────────────────────────────────────────────
+
+fn plain_opts(show_thinking: bool, show_tool_output: bool) -> PlainTextOptions {
+    PlainTextOptions {
+        show_thinking,
+        show_tool_output,
+    }
+}
+
+fn sample_file_edit() -> velor_core::file_edit::FileEdit {
+    velor_core::file_edit::compute_file_edit(
+        "src/lib.rs",
+        Some(b"fn one() {}\nfn two() {}\nfn three() {}\n"),
+        Some(b"fn one() {}\nfn TWO() {}\nfn three() {}\n"),
+        velor_core::file_edit::DEFAULT_MAX_DIFF_LINES,
+    )
+    .expect("a real change produces an edit")
+}
+
+#[test]
+fn plain_text_includes_text_and_tool_call_by_default() {
+    let mut t = Transcript::new(TuiLimits::default());
+    push_text(&mut t, "hello there");
+    t.ingest(TuiEntry::now(EntryKind::ToolCall {
+        tool: "Bash".to_string(),
+        detail: "ls -la".to_string(),
+        input: serde_json::json!({}),
+    }));
+    let out = render_plain_text(t.entries(), None, plain_opts(true, true));
+    assert!(out.contains("hello there"));
+    assert!(out.contains("[Tool call: Bash] ls -la"));
+}
+
+#[test]
+fn plain_text_hides_thinking_when_toggled_off() {
+    let mut t = Transcript::new(TuiLimits::default());
+    t.ingest(TuiEntry::now(EntryKind::Thinking(
+        "secret reasoning".to_string(),
+    )));
+    push_text(&mut t, "visible answer");
+
+    let shown = render_plain_text(t.entries(), None, plain_opts(true, true));
+    assert!(shown.contains("[Thinking]"));
+    assert!(shown.contains("secret reasoning"));
+
+    let hidden = render_plain_text(t.entries(), None, plain_opts(false, true));
+    assert!(!hidden.contains("secret reasoning"));
+    assert!(hidden.contains("visible answer"));
+}
+
+#[test]
+fn plain_text_hides_tool_result_and_file_edit_but_keeps_tool_call() {
+    let mut t = Transcript::new(TuiLimits::default());
+    t.ingest(TuiEntry::now(EntryKind::ToolCall {
+        tool: "Edit".to_string(),
+        detail: "src/lib.rs".to_string(),
+        input: serde_json::json!({}),
+    }));
+    t.ingest(TuiEntry::now(EntryKind::ToolResult {
+        tool: "Bash".to_string(),
+        detail: "total 0\n".to_string(),
+        success: Some(true),
+        command: None,
+    }));
+    t.ingest(TuiEntry::now(EntryKind::FileEdit(Box::new(
+        sample_file_edit(),
+    ))));
+
+    let hidden = render_plain_text(t.entries(), None, plain_opts(true, false));
+    assert!(hidden.contains("[Tool call: Edit] src/lib.rs"));
+    assert!(!hidden.contains("total 0"));
+    assert!(!hidden.contains("+fn TWO"));
+
+    let shown = render_plain_text(t.entries(), None, plain_opts(true, true));
+    assert!(shown.contains("total 0"));
+    assert!(shown.contains("--- a/src/lib.rs"));
+    assert!(shown.contains("-fn two() {}"));
+    assert!(shown.contains("+fn TWO() {}"));
+}
+
+#[test]
+fn plain_text_marks_failed_tool_results() {
+    let mut t = Transcript::new(TuiLimits::default());
+    t.ingest(TuiEntry::now(EntryKind::ToolResult {
+        tool: "Bash".to_string(),
+        detail: "command not found".to_string(),
+        success: Some(false),
+        command: None,
+    }));
+    let out = render_plain_text(t.entries(), None, plain_opts(true, true));
+    assert!(out.contains("[Tool result: Bash (failed)]"));
+}
+
+#[test]
+fn plain_text_excludes_errors_from_the_export() {
+    let mut t = Transcript::new(TuiLimits::default());
+    t.ingest(TuiEntry::now(EntryKind::Error(
+        "boom, this should stay in the errors modal only".to_string(),
+    )));
+    push_text(&mut t, "the actual answer");
+    let out = render_plain_text(t.entries(), None, plain_opts(true, true));
+    assert!(!out.contains("boom"));
+    assert!(out.contains("the actual answer"));
+}
+
+#[test]
+fn plain_text_prefixes_current_todo_state_when_present() {
+    let t = Transcript::new(TuiLimits::default());
+    let out = render_plain_text(
+        t.entries(),
+        Some("[x] done thing\n[ ] pending thing"),
+        plain_opts(true, true),
+    );
+    assert!(out.starts_with("## Current todos"));
+    assert!(out.contains("[x] done thing"));
+    assert!(out.contains("[ ] pending thing"));
+}
+
+#[test]
+fn plain_text_omits_todo_header_when_absent_or_blank() {
+    let mut t = Transcript::new(TuiLimits::default());
+    push_text(&mut t, "hi");
+    assert!(
+        !render_plain_text(t.entries(), None, plain_opts(true, true)).contains("Current todos")
+    );
+    assert!(
+        !render_plain_text(t.entries(), Some("   "), plain_opts(true, true))
+            .contains("Current todos")
+    );
+}
+
+#[test]
+fn plain_text_renders_iteration_dividers() {
+    let mut t = Transcript::new(TuiLimits::default());
+    push_text(&mut t, "first");
+    push_divider(&mut t, 2, Some(5));
+    push_text(&mut t, "second");
+    let out = render_plain_text(t.entries(), None, plain_opts(true, true));
+    assert!(out.contains("=== Iteration 2/5 ==="));
+}
