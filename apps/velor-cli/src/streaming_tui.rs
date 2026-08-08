@@ -282,6 +282,13 @@ struct TuiState {
     log_path: Option<String>,
     show_prompt: bool,
     show_help: bool,
+    /// Live search query for filtering the `?` help modal's keybinding list
+    /// (`/` starts typing, Enter commits the filter, Esc clears it).
+    help_search: String,
+    /// Whether `/` search is actively capturing keystrokes in the help
+    /// modal — while true, printable keys append to `help_search` instead of
+    /// the usual "any key closes the modal" behavior.
+    help_search_active: bool,
     show_errors: bool,
     prompt_scroll: u16,
     error_scroll: u16,
@@ -370,6 +377,8 @@ impl TuiState {
             log_path: None,
             show_prompt: false,
             show_help: false,
+            help_search: String::new(),
+            help_search_active: false,
             show_errors: false,
             prompt_scroll: 0,
             error_scroll: 0,
@@ -1411,9 +1420,35 @@ fn handle_key(
     if state.handle_modal_key(key) {
         return;
     }
-    // The help modal closes on any key, and swallows the keypress.
+    // While the help modal is open, `/` starts an inline search that filters
+    // the keybinding list live as you type (see `render_help_modal`); Enter
+    // commits it, leaving the filter applied, and Esc clears it. Only once
+    // search isn't being actively typed does an arbitrary key close the
+    // modal, preserving the original "any key closes" behavior.
     if state.show_help {
-        state.show_help = false;
+        if state.help_search_active {
+            match key.code {
+                KeyCode::Esc => {
+                    state.help_search.clear();
+                    state.help_search_active = false;
+                }
+                KeyCode::Enter => {
+                    state.help_search_active = false;
+                }
+                KeyCode::Backspace => {
+                    state.help_search.pop();
+                }
+                KeyCode::Char(c) => {
+                    state.help_search.push(c);
+                }
+                _ => {}
+            }
+        } else if key.code == KeyCode::Char('/') {
+            state.help_search_active = true;
+        } else {
+            state.show_help = false;
+            state.help_search.clear();
+        }
         return;
     }
     if state.show_prompt {
@@ -1700,7 +1735,7 @@ fn render(
         render_transient_status(f, area, msg);
     }
     if state.show_help {
-        render_help_modal(f, area);
+        render_help_modal(f, area, &state.help_search, state.help_search_active);
     }
 }
 
@@ -3485,85 +3520,186 @@ fn render_error_modal(
     f.render_widget(para, popup);
 }
 
-fn render_help_modal(f: &mut Frame, area: Rect) {
+/// The full keybinding reference shown (and searched) by the `?` help modal.
+const HELP_KEYBINDINGS: &[(&str, &str)] = &[
+    ("p", "Show the rendered prompt for this iteration"),
+    (
+        "↑↓ jk / PgUp PgDn",
+        "Scroll the event log (anchored, streaming-safe)",
+    ),
+    ("gg", "Jump to the top of the iteration in view"),
+    ("G", "Jump to the bottom of the iteration in view"),
+    ("gT", "Jump to the absolute start of the chat"),
+    ("gB / B", "Jump to the absolute bottom (re-enable live)"),
+    ("t", "Toggle display of model thinking/reasoning tokens"),
+    (
+        "e",
+        "Open the errors modal (errors are hidden from the main log)",
+    ),
+    ("s", "Toggle stopping after the current iteration completes"),
+    (
+        "c",
+        "Steer the active Claude session with a one-shot message",
+    ),
+    (
+        "a",
+        "Edit the persistent append (folded into every later iteration)",
+    ),
+    ("l", "Open the JSONL run log in your pager"),
+    (
+        "o",
+        "Toggle display of tool-result/file-edit output (calls stay visible)",
+    ),
+    (
+        "Ctrl+O",
+        "Expand/collapse tool-result output in place (full text vs. head+tail)",
+    ),
+    (
+        "Ctrl+T",
+        "Expand/collapse the sticky todo panel (small preview vs. full board)",
+    ),
+    (
+        "y",
+        "Copy the transcript since the last prompt to the clipboard (AI-friendly text)",
+    ),
+    (
+        "Y",
+        "Copy the entire transcript to the clipboard (AI-friendly text)",
+    ),
+    ("?", "Show this keybindings help"),
+    (
+        "/",
+        "Search the keybindings list below (while this help is open)",
+    ),
+    (
+        "q / Ctrl+C×2",
+        "Force stop immediately (Ctrl+C once does nothing)",
+    ),
+];
+
+/// Column width the key name is padded to before the description, matching
+/// the longest entry in [`HELP_KEYBINDINGS`] ("↑↓ jk / PgUp PgDn").
+const HELP_KEY_COLUMN_WIDTH: usize = 18;
+
+/// Whether a `(key, description)` entry matches an already-lowercased search
+/// query — a substring match against either field, case-insensitively. An
+/// empty query matches everything.
+fn help_entry_matches(k: &str, desc: &str, query_lower: &str) -> bool {
+    query_lower.is_empty()
+        || k.to_ascii_lowercase().contains(query_lower)
+        || desc.to_ascii_lowercase().contains(query_lower)
+}
+
+/// Splits `text` into spans, highlighting every case-insensitive occurrence
+/// of `query_lower` (already lowercased) with `match_style` and leaving the
+/// rest in `base_style`. Matching is ASCII-only (`to_ascii_lowercase`) so the
+/// byte offsets found in the lowercased copy stay valid for slicing the
+/// original — a locale-aware `to_lowercase` can change a string's byte
+/// length and silently misalign them; the help text here is plain ASCII.
+fn highlight_matches(
+    text: &str,
+    query_lower: &str,
+    base_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    if query_lower.is_empty() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+    let text_lower = text.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut idx = 0;
+    while let Some(pos) = text_lower[idx..].find(query_lower) {
+        let start = idx + pos;
+        let end = start + query_lower.len();
+        if start > idx {
+            spans.push(Span::styled(text[idx..start].to_string(), base_style));
+        }
+        spans.push(Span::styled(text[start..end].to_string(), match_style));
+        idx = end;
+    }
+    if idx < text.len() {
+        spans.push(Span::styled(text[idx..].to_string(), base_style));
+    }
+    spans
+}
+
+/// Renders the `?` keybindings help modal. `search` is the current filter
+/// query (empty means "show everything"); `search_active` is whether `/` is
+/// actively capturing keystrokes into it, which switches the footer from a
+/// static hint into a live search prompt with a cursor.
+fn render_help_modal(f: &mut Frame, area: Rect, search: &str, search_active: bool) {
     let popup = center_rect(area, 70, 70);
     f.render_widget(Clear, popup);
 
+    let theme = theme::active();
     let key_style = Style::default()
-        .fg(theme::active().accent)
+        .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(theme::active().muted);
+    let desc_style = Style::default().fg(theme.muted);
+    let match_style = Style::default()
+        .fg(theme.warning)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let dim_style = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
 
+    let query_lower = search.to_ascii_lowercase();
     let mut lines: Vec<Line> = Vec::new();
-    for (k, desc) in [
-        ("p", "Show the rendered prompt for this iteration"),
-        (
-            "↑↓ jk / PgUp PgDn",
-            "Scroll the event log (anchored, streaming-safe)",
-        ),
-        ("gg", "Jump to the top of the iteration in view"),
-        ("G", "Jump to the bottom of the iteration in view"),
-        ("gT", "Jump to the absolute start of the chat"),
-        ("gB / B", "Jump to the absolute bottom (re-enable live)"),
-        ("t", "Toggle display of model thinking/reasoning tokens"),
-        (
-            "e",
-            "Open the errors modal (errors are hidden from the main log)",
-        ),
-        ("s", "Toggle stopping after the current iteration completes"),
-        (
-            "c",
-            "Steer the active Claude session with a one-shot message",
-        ),
-        (
-            "a",
-            "Edit the persistent append (folded into every later iteration)",
-        ),
-        ("l", "Open the JSONL run log in your pager"),
-        (
-            "o",
-            "Toggle display of tool-result/file-edit output (calls stay visible)",
-        ),
-        (
-            "Ctrl+O",
-            "Expand/collapse tool-result output in place (full text vs. head+tail)",
-        ),
-        (
-            "Ctrl+T",
-            "Expand/collapse the sticky todo panel (small preview vs. full board)",
-        ),
-        (
-            "y",
-            "Copy the transcript since the last prompt to the clipboard (AI-friendly text)",
-        ),
-        (
-            "Y",
-            "Copy the entire transcript to the clipboard (AI-friendly text)",
-        ),
-        ("?", "Show this keybindings help"),
-        (
-            "q / Ctrl+C×2",
-            "Force stop immediately (Ctrl+C once does nothing)",
-        ),
-    ] {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<15}"), key_style),
-            Span::styled(desc, desc_style),
-        ]));
+    let mut shown = 0usize;
+    for (k, desc) in HELP_KEYBINDINGS {
+        if !help_entry_matches(k, desc, &query_lower) {
+            continue;
+        }
+        shown += 1;
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(highlight_matches(k, &query_lower, key_style, match_style));
+        let pad = HELP_KEY_COLUMN_WIDTH.saturating_sub(UnicodeWidthStr::width(*k));
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.extend(highlight_matches(
+            desc,
+            &query_lower,
+            desc_style,
+            match_style,
+        ));
+        lines.push(Line::from(spans));
+    }
+    if shown == 0 {
+        lines.push(Line::from(Span::styled(
+            format!("No keybindings match \"{search}\"."),
+            dim_style,
+        )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Live view is bounded; the complete transcript is always in the run log.",
-        Style::default()
-            .fg(theme::active().dim)
-            .add_modifier(Modifier::DIM),
-    )));
 
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" ⌨️  Keybindings (any key to close) "),
-    );
+    if search_active {
+        lines.push(Line::from(vec![
+            Span::styled("/", key_style),
+            Span::styled(search.to_string(), key_style),
+            Span::styled("▏", key_style),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "Enter: apply filter · Esc: clear · Backspace: edit",
+            dim_style,
+        )));
+    } else {
+        if !search.is_empty() {
+            let total = HELP_KEYBINDINGS.len();
+            let noun = if shown == 1 { "match" } else { "matches" };
+            lines.push(Line::from(Span::styled(
+                format!("/{search}  ({shown}/{total} {noun})"),
+                dim_style,
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Live view is bounded; the complete transcript is always in the run log.",
+            dim_style,
+        )));
+    }
+
+    let title = if search_active {
+        " ⌨️  Keybindings (Enter=apply search · Esc=clear) "
+    } else {
+        " ⌨️  Keybindings (/ to search · any key to close) "
+    };
+    let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(para, popup);
 }
 
@@ -3623,6 +3759,79 @@ mod render_tests {
             rendered < 80,
             "per-frame renders should be viewport-bounded, got {rendered}"
         );
+    }
+
+    #[test]
+    fn help_modal_search_filters_live_and_esc_clears_it() {
+        let mut state = TuiState::new(TuiLimits::default());
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        state.show_help = true;
+
+        // `/` enters search mode without closing the modal.
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(state.show_help);
+        assert!(state.help_search_active);
+
+        // Typed characters accumulate into the query live.
+        for c in "steer".chars() {
+            handle_key(
+                event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut state,
+                &cancel,
+                &cancel_handler,
+            );
+        }
+        assert_eq!(state.help_search, "steer");
+        assert!(state.show_help, "typing must not close the modal");
+
+        // Enter commits the filter but leaves the modal open.
+        handle_key(
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(!state.help_search_active);
+        assert!(state.show_help);
+        assert_eq!(state.help_search, "steer");
+
+        // With a committed filter, `/` resumes editing rather than closing.
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(state.help_search_active);
+
+        // Esc clears the query and leaves search mode, but keeps the modal open.
+        handle_key(
+            event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(state.show_help);
+        assert!(!state.help_search_active);
+        assert!(state.help_search.is_empty());
+
+        // Once out of search mode, any other key closes the modal (and resets
+        // the search for next time it's opened).
+        state.help_search = "steer".to_string();
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(!state.show_help);
+        assert!(state.help_search.is_empty());
     }
 
     #[test]
@@ -5208,6 +5417,61 @@ mod render_tests {
         assert_eq!(
             window_title(&state),
             "vel auto — Refactor the parser — editing"
+        );
+    }
+
+    #[test]
+    fn highlight_matches_returns_one_span_for_an_empty_query() {
+        let base = Style::default();
+        let hit = Style::default().add_modifier(Modifier::BOLD);
+        let spans = highlight_matches("Toggle stopping", "", base, hit);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "Toggle stopping");
+        assert_eq!(spans[0].style, base);
+    }
+
+    #[test]
+    fn highlight_matches_splits_around_each_match_case_insensitively() {
+        let base = Style::default();
+        let hit = Style::default().add_modifier(Modifier::BOLD);
+        let spans = highlight_matches("Toggle STOP after", "stop", base, hit);
+        let rendered: Vec<(String, bool)> = spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style == hit))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("Toggle ".to_string(), false),
+                ("STOP".to_string(), true),
+                (" after".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_matches_handles_repeated_matches() {
+        let base = Style::default();
+        let hit = Style::default().add_modifier(Modifier::BOLD);
+        let spans = highlight_matches("aXaXa", "a", base, hit);
+        let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(joined, "aXaXa");
+        assert_eq!(spans.iter().filter(|s| s.style == hit).count(), 3);
+    }
+
+    #[test]
+    fn help_entry_matches_checks_both_key_and_description_case_insensitively() {
+        assert!(help_entry_matches("Ctrl+O", "expand output", ""));
+        assert!(help_entry_matches("Ctrl+O", "expand output", "ctrl"));
+        assert!(help_entry_matches("Ctrl+O", "expand output", "expand"));
+        assert!(!help_entry_matches("Ctrl+O", "expand output", "steer"));
+    }
+
+    #[test]
+    fn help_keybindings_cover_the_search_key_itself() {
+        assert!(
+            HELP_KEYBINDINGS.iter().any(|(k, _)| *k == "/"),
+            "the help modal's own search keybinding should be documented in its list"
         );
     }
 
