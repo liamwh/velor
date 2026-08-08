@@ -1216,11 +1216,9 @@ pub async fn run_streaming_tui(
                             {
                                 state.sticky_todo = Some(summary);
                             }
-                            set_title(&format!("vel auto — {}", state.spinner_verb));
                         }
                         EntryKind::ToolResult { tool, detail, .. } => {
                             state.spinner_verb = "thinking";
-                            set_title("vel auto — thinking");
                             // A todo tool's *result* text is the freshest source
                             // for providers that report the full board back
                             // (e.g. omp's "Remaining items… Overall: N/M done…"),
@@ -1233,15 +1231,12 @@ pub async fn run_streaming_tui(
                         }
                         EntryKind::Text(_) => {
                             state.spinner_verb = "generating";
-                            set_title("vel auto — generating");
                         }
                         EntryKind::Thinking(_) => {
                             state.spinner_verb = "reasoning";
-                            set_title("vel auto — reasoning");
                         }
                         EntryKind::Error(_) => {
                             state.spinner_verb = "error";
-                            set_title("vel auto — error");
                         }
                         EntryKind::Usage {
                             input_tokens,
@@ -1265,7 +1260,6 @@ pub async fn run_streaming_tui(
                             // generating". The inline transcript entry carries the
                             // reason (overload / rate-limit / attempt count).
                             state.spinner_verb = "retrying";
-                            set_title("vel auto — retrying");
                         }
                         // File edits render their own header/hunks; the surrounding
                         // ToolCall/ToolResult already drove the spinner verb.
@@ -1274,6 +1268,13 @@ pub async fn run_streaming_tui(
                         // verb or usage payload.
                         EntryKind::IterationDivider { .. } => {}
                     }
+                    // Refresh the terminal's window title after every entry:
+                    // spinner_verb and/or sticky_todo may have just changed
+                    // above, and this is the single place both are known to be
+                    // current (ToolResult updates sticky_todo *after* setting
+                    // spinner_verb, so an inline set_title per-arm would race
+                    // against its own todo update).
+                    set_title(&window_title(&state));
                     // If this is the first entry of a new iteration, emit a
                     // divider immediately before it and index the divider as the
                     // iteration boundary for `gg`/`G` navigation. The divider is a
@@ -1388,6 +1389,16 @@ pub async fn run_streaming_tui(
 
 fn set_title(title: &str) {
     let _ = execute!(io::stdout(), SetTitle(title));
+}
+
+/// Builds the terminal window/tab title, mirroring the on-screen block title
+/// built by [`build_title`]: `vel auto — {task} — {verb}` when a todo item is
+/// in progress, else just `vel auto — {verb}`.
+fn window_title(state: &TuiState) -> String {
+    match current_task_label(state) {
+        Some(task) => format!("vel auto — {task} — {}", state.spinner_verb),
+        None => format!("vel auto — {}", state.spinner_verb),
+    }
 }
 
 fn handle_key(
@@ -1805,13 +1816,20 @@ fn build_title(
     n: usize,
     error_count: usize,
 ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-    let left = vec![
-        Span::styled(" vel auto ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!("› {} ", state.spinner_verb),
-            Style::default().fg(theme::active().muted),
-        ),
-    ];
+    let mut left = vec![Span::styled(
+        " vel auto ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if let Some(task) = current_task_label(state) {
+        left.push(Span::styled(
+            format!("› {task} "),
+            theme::active().text_style(),
+        ));
+    }
+    left.push(Span::styled(
+        format!("› {} ", state.spinner_verb),
+        Style::default().fg(theme::active().muted),
+    ));
 
     let scroll_label = match state.scroll {
         ScrollState::Tail => "live",
@@ -2197,6 +2215,29 @@ fn todo_summary_from_input(input: &serde_json::Value) -> Option<String> {
 fn is_substantial_todo_summary(detail: &str) -> bool {
     let detail = detail.trim();
     !detail.is_empty() && (detail.lines().count() > 1 || detail.len() > 60)
+}
+
+/// Max chars of the current task shown in the block/window titles before
+/// eliding — those have limited real estate, so a long todo line would
+/// otherwise crowd out the spinner verb and status summary next to it.
+const TITLE_TASK_MAX_CHARS: usize = 48;
+
+/// Extracts the in-progress item (`[~] ...`) from the sticky todo board, if
+/// any, as a short label for the block title and terminal window title. This
+/// is what turns "vel auto › thinking" into "vel auto › {task} › thinking" —
+/// otherwise the title only ever says what kind of step is running, never
+/// what it's actually for. Returns `None` before the first todo update, or
+/// once every item is done/pending with nothing `in_progress`.
+fn current_task_label(state: &TuiState) -> Option<String> {
+    let todo = state.sticky_todo.as_deref()?;
+    let line = todo
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("[~]"))?;
+    let task = line.trim();
+    if task.is_empty() {
+        return None;
+    }
+    Some(truncate_str(task, TITLE_TASK_MAX_CHARS))
 }
 
 /// Infers a [`velor_core::file_edit::SyntaxKind`] for a tool result's output
@@ -5131,6 +5172,43 @@ mod render_tests {
         assert!(!is_substantial_todo_summary("Todos updated successfully."));
         assert!(!is_substantial_todo_summary(""));
         assert!(!is_substantial_todo_summary("   "));
+    }
+
+    #[test]
+    fn current_task_label_extracts_the_in_progress_item() {
+        let mut state = TuiState::new(TuiLimits::default());
+        state.sticky_todo = Some("[x] Ship the feature\n[~] Write tests\n[ ] Update docs".into());
+        assert_eq!(current_task_label(&state).as_deref(), Some("Write tests"));
+    }
+
+    #[test]
+    fn current_task_label_is_none_without_an_in_progress_item() {
+        let mut state = TuiState::new(TuiLimits::default());
+        assert!(current_task_label(&state).is_none());
+        state.sticky_todo = Some("[x] Ship the feature\n[ ] Update docs".into());
+        assert!(current_task_label(&state).is_none());
+    }
+
+    #[test]
+    fn current_task_label_truncates_long_tasks() {
+        let mut state = TuiState::new(TuiLimits::default());
+        let long_task = "x".repeat(100);
+        state.sticky_todo = Some(format!("[~] {long_task}"));
+        let label = current_task_label(&state).expect("label present");
+        assert_eq!(label.chars().count(), TITLE_TASK_MAX_CHARS + 1);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn window_title_includes_the_current_task_when_present() {
+        let mut state = TuiState::new(TuiLimits::default());
+        state.spinner_verb = "editing";
+        assert_eq!(window_title(&state), "vel auto — editing");
+        state.sticky_todo = Some("[~] Refactor the parser".into());
+        assert_eq!(
+            window_title(&state),
+            "vel auto — Refactor the parser — editing"
+        );
     }
 
     #[test]
