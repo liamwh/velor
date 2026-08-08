@@ -1413,6 +1413,25 @@ async fn run_auto(
     let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetLogPath(
         logger.path().to_string_lossy().to_string(),
     ));
+    // Tell the TUI the provider/binary/model this run resolved to (for the
+    // 'm' key). Model overrides are only surfaced by Codex/Omp today — the
+    // plain Claude subprocess/ACP paths never set one, so the binary's own
+    // default applies.
+    let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetProviderInfo(
+        streaming_tui::ProviderInfo {
+            provider: match &runner {
+                AgentRunner::ClaudeSubprocess | AgentRunner::ClaudeAcp(_) => "Claude".to_string(),
+                AgentRunner::Codex(_) => "Codex".to_string(),
+                AgentRunner::Omp(_) => "Omp".to_string(),
+            },
+            binary: binary.clone(),
+            model: match &runner {
+                AgentRunner::ClaudeSubprocess | AgentRunner::ClaudeAcp(_) => None,
+                AgentRunner::Codex(cfg) => cfg.model.clone(),
+                AgentRunner::Omp(cfg) => cfg.model.clone(),
+            },
+        },
+    ));
     // Initial live-steering availability + the seeded persistent append.
     {
         use velor_core::execution_service::capabilities::LiveSteeringStatus;

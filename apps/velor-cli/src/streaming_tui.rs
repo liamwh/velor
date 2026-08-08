@@ -138,6 +138,20 @@ const CACHE_CAPACITY: usize = 512;
 /// is cancelled.
 const G_CHORD_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The provider/binary/model this run was launched with, shown by the `m`
+/// modal. Resolved once at startup from config — nothing here changes over
+/// the course of a run.
+#[derive(Debug, Clone)]
+pub struct ProviderInfo {
+    /// Human-readable provider name (e.g. "Claude", "Codex", "Omp").
+    pub provider: String,
+    /// The actual executable invoked (e.g. "claude", "claude-glm", "omp").
+    pub binary: String,
+    /// The configured model override, when the provider supports one and it
+    /// was set; `None` means the binary's own default is in effect.
+    pub model: Option<String>,
+}
+
 // ── Messages ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -145,6 +159,9 @@ pub enum TuiMessage {
     Entry(TuiEntry),
     SetPrompt(String),
     SetLogPath(String),
+    /// Sets the provider/binary/model shown by the `m` modal. Sent once at
+    /// startup.
+    SetProviderInfo(ProviderInfo),
     /// Updates the current/total iteration counter shown in the status line.
     SetIteration {
         current: u32,
@@ -280,8 +297,13 @@ struct TuiState {
     cache: LayoutCache,
     prompt: Option<String>,
     log_path: Option<String>,
+    /// Provider/binary/model this run was launched with, shown by the `m`
+    /// modal. `None` until `SetProviderInfo` arrives (should be immediate).
+    provider_info: Option<ProviderInfo>,
     show_prompt: bool,
     show_help: bool,
+    /// Whether the `m` provider/model info modal is open.
+    show_provider_info: bool,
     /// Live search query for filtering the `?` help modal's keybinding list
     /// (`/` starts typing, Enter commits the filter, Esc clears it).
     help_search: String,
@@ -375,8 +397,10 @@ impl TuiState {
             cache: LayoutCache::new(CACHE_CAPACITY, limits.max_entry_lines),
             prompt: None,
             log_path: None,
+            provider_info: None,
             show_prompt: false,
             show_help: false,
+            show_provider_info: false,
             help_search: String::new(),
             help_search_active: false,
             show_errors: false,
@@ -1315,6 +1339,9 @@ pub async fn run_streaming_tui(
                 TuiMessage::SetLogPath(p) => {
                     state.log_path = Some(p);
                 }
+                TuiMessage::SetProviderInfo(info) => {
+                    state.provider_info = Some(info);
+                }
                 TuiMessage::SetIteration { current, total } => {
                     // An iteration change arms a divider that will be emitted just
                     // before the iteration's first entry, marking the boundary
@@ -1466,6 +1493,11 @@ fn handle_key(
         }
         return;
     }
+    // The provider/model modal closes on any key, and swallows the keypress.
+    if state.show_provider_info {
+        state.show_provider_info = false;
+        return;
+    }
     if state.show_errors {
         match key.code {
             KeyCode::Char('e') | KeyCode::Esc | KeyCode::Enter => state.show_errors = false,
@@ -1549,6 +1581,10 @@ fn handle_key(
         KeyCode::Char('a') => state.open_append_editor(),
         KeyCode::Char('?') => {
             state.show_help = true;
+        }
+        // `m` shows the provider/binary/model this run was launched with.
+        KeyCode::Char('m') => {
+            state.show_provider_info = true;
         }
         // `l` opens the full run log.
         KeyCode::Char('l') => {
@@ -1736,6 +1772,9 @@ fn render(
     }
     if state.show_help {
         render_help_modal(f, area, &state.help_search, state.help_search_active);
+    }
+    if state.show_provider_info {
+        render_provider_info_modal(f, area, state.provider_info.as_ref());
     }
 }
 
@@ -2122,6 +2161,8 @@ fn render_hints(
             Span::raw(" copy  "),
             key("?"),
             Span::raw(" help  "),
+            key("m"),
+            Span::raw(" model  "),
             key("↑↓"),
             Span::raw(" scroll  "),
             key("^C×2"),
@@ -3572,6 +3613,10 @@ const HELP_KEYBINDINGS: &[(&str, &str)] = &[
         "Search the keybindings list below (while this help is open)",
     ),
     (
+        "m",
+        "Show the provider, binary, and model this run is using",
+    ),
+    (
         "q / Ctrl+C×2",
         "Force stop immediately (Ctrl+C once does nothing)",
     ),
@@ -3700,6 +3745,53 @@ fn render_help_modal(f: &mut Frame, area: Rect, search: &str, search_active: boo
         " ⌨️  Keybindings (/ to search · any key to close) "
     };
     let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(para, popup);
+}
+
+/// Renders the `m` modal: the provider/binary/model this run was launched
+/// with. `info` is `None` only in the brief window before `SetProviderInfo`
+/// arrives (sent once, immediately, at startup), which reads as "resolving"
+/// rather than an error.
+fn render_provider_info_modal(f: &mut Frame, area: Rect, info: Option<&ProviderInfo>) {
+    let popup = center_rect(area, 60, 30);
+    f.render_widget(Clear, popup);
+
+    let theme = theme::active();
+    let key_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let value_style = theme.text_style();
+    let dim_style = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
+
+    let mut lines: Vec<Line> = Vec::new();
+    match info {
+        Some(info) => {
+            lines.push(Line::from(vec![
+                Span::styled("  Provider  ", key_style),
+                Span::styled(info.provider.clone(), value_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Binary    ", key_style),
+                Span::styled(info.binary.clone(), value_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Model     ", key_style),
+                match &info.model {
+                    Some(model) => Span::styled(model.clone(), value_style),
+                    None => Span::styled("(binary default)", dim_style),
+                },
+            ]));
+        }
+        None => {
+            lines.push(Line::from(Span::styled("  Resolving…", dim_style)));
+        }
+    }
+
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" 🤖  Provider (any key to close) "),
+    );
     f.render_widget(para, popup);
 }
 
@@ -3832,6 +3924,74 @@ mod render_tests {
         );
         assert!(!state.show_help);
         assert!(state.help_search.is_empty());
+    }
+
+    #[test]
+    fn m_key_opens_the_provider_info_modal_and_any_key_closes_it() {
+        let mut state = TuiState::new(TuiLimits::default());
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+
+        assert!(!state.show_provider_info);
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(state.show_provider_info);
+
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(
+            !state.show_provider_info,
+            "any key should close the provider modal without also acting on it"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "the 'q' that closed the modal must be swallowed, not also trigger quit"
+        );
+    }
+
+    #[test]
+    fn set_provider_info_message_populates_state() {
+        let mut state = TuiState::new(TuiLimits::default());
+        assert!(state.provider_info.is_none());
+        state.provider_info = Some(ProviderInfo {
+            provider: "Codex".to_string(),
+            binary: "codex".to_string(),
+            model: Some("gpt-5.2".to_string()),
+        });
+        let info = state.provider_info.as_ref().expect("set above");
+        assert_eq!(info.provider, "Codex");
+        assert_eq!(info.model.as_deref(), Some("gpt-5.2"));
+    }
+
+    #[test]
+    fn provider_info_modal_renders_without_panicking_when_resolved_and_pending() {
+        let cancel_handler = handler();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let mut state = TuiState::new(TuiLimits::default());
+        state.show_provider_info = true;
+        // Pending (no SetProviderInfo yet).
+        terminal
+            .draw(|f| render(f, &mut state, &cancel_handler))
+            .expect("draw pending");
+
+        state.provider_info = Some(ProviderInfo {
+            provider: "Claude".to_string(),
+            binary: "claude".to_string(),
+            model: None,
+        });
+        terminal
+            .draw(|f| render(f, &mut state, &cancel_handler))
+            .expect("draw resolved");
     }
 
     #[test]
