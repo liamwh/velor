@@ -499,6 +499,54 @@ impl Default for OmpConfig {
     }
 }
 
+/// A named provider/model combination the user can switch to mid-session via
+/// the Model & Session modal. Unlike the startup `[defaults]` (which select one
+/// runner for the whole run), `[[switch_targets]]` is a list of alternative
+/// gears the user can engage without losing context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchTarget {
+    /// Human-readable label shown in the picker (e.g. "Sonnet 5", "GLM 5.2").
+    pub label: String,
+    /// Provider implementation to switch to.
+    pub provider: AgentProvider,
+    /// Protocol (only meaningful when `provider == Claude`).
+    #[serde(default)]
+    pub protocol: Protocol,
+    /// Optional model override. For Omp, this doubles as the CLI `--model`
+    /// flag's value (fuzzy). Tier-1 live switching additionally requires it
+    /// to be in exact `"provider/modelId"` form (e.g.
+    /// `"anthropic/claude-sonnet-5"`); see the plan's Phase 0.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional binary override (e.g. `"omp"`, `"codex"`, `"claude"`).
+    /// Falls back to the same resolution as startup when absent.
+    #[serde(default)]
+    pub binary: Option<String>,
+}
+
+/// Configuration for Velor's OMP session registry — which native OMP sessions
+/// Velor created (and therefore owns cleanup of), their retention, and whether
+/// a startup sweep runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OmpSessionsConfig {
+    /// How long to keep Velor-owned session records (and their on-disk files)
+    /// before pruning. Default: 14 days.
+    pub retention_days: u32,
+    /// Whether to run a reclassify-stale + prune sweep at `vel auto` startup.
+    /// Default: `true`.
+    pub cleanup_on_startup: bool,
+}
+
+impl Default for OmpSessionsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: 14,
+            cleanup_on_startup: true,
+        }
+    }
+}
+
 /// Configuration loaded from the TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileConfig {
@@ -537,6 +585,12 @@ pub struct FileConfig {
     /// Automations configuration.
     #[serde(default)]
     pub automations: AutomationsConfig,
+
+    /// Named provider/model targets for mid-session switching via the Model &
+    /// Session modal. Merge rule: repo config's array, if non-empty, replaces
+    /// home's wholesale (unlike `[vars]`/`[prompts]` which merge per-key).
+    #[serde(default)]
+    pub switch_targets: Vec<SwitchTarget>,
 }
 
 /// Bounds for the streaming TUI's *live* transcript. The complete transcript
@@ -665,6 +719,9 @@ pub struct Defaults {
     #[serde(default)]
     pub omp: OmpConfig,
 
+    /// OMP session registry configuration (retention, startup cleanup).
+    #[serde(default)]
+    pub omp_sessions: OmpSessionsConfig,
     /// Bounds for the streaming TUI live transcript.
     #[serde(default)]
     pub tui: TuiConfig,
@@ -782,6 +839,8 @@ impl Defaults {
             codex: overlay.codex,
             // For omp, overlay takes precedence
             omp: overlay.omp,
+            // OMP sessions: overlay takes precedence.
+            omp_sessions: overlay.omp_sessions,
             // TUI bounds: per-field overlay-wins.
             tui: self.tui.merge(overlay.tui),
         }
@@ -845,6 +904,14 @@ impl FileConfig {
             rules: overlay.rules,
             prompts_config: overlay.prompts_config,
             automations: overlay.automations,
+            // switch_targets: repo's array replaces home's wholesale if
+            // non-empty (no per-key merge for a Vec — differs from
+            // vars/prompts overlay semantics).
+            switch_targets: if overlay.switch_targets.is_empty() {
+                base.switch_targets
+            } else {
+                overlay.switch_targets
+            },
         }
     }
 
@@ -1164,6 +1231,7 @@ mod tests {
             rules: RulesConfig::default(),
             prompts_config: PromptsConfig::default(),
             automations: AutomationsConfig::default(),
+            ..Default::default()
         };
 
         let overlay = FileConfig {
@@ -1200,6 +1268,7 @@ mod tests {
             rules: RulesConfig::default(),
             prompts_config: PromptsConfig::default(),
             automations: AutomationsConfig::default(),
+            ..Default::default()
         };
 
         let result = FileConfig::merge(base, overlay);
@@ -2040,5 +2109,102 @@ persist_adapter = false
             merged.attempt_timeout.unwrap().get(),
             Duration::from_secs(600)
         );
+    }
+
+    // SwitchTarget + OmpSessionsConfig tests
+
+    #[test]
+    fn switch_target_round_trips_through_toml() {
+        let toml_str = r#"
+        [[switch_targets]]
+        label = "Sonnet 5"
+        provider = "omp"
+        model = "anthropic/claude-sonnet-5"
+
+        [[switch_targets]]
+        label = "GLM 5.2"
+        provider = "omp"
+        model = "gpt-5.2"
+
+        [[switch_targets]]
+        label = "Codex"
+        provider = "codex"
+        binary = "codex"
+        "#;
+        let parsed: FileConfig = toml::from_str(toml_str).expect("valid TOML");
+        assert_eq!(parsed.switch_targets.len(), 3);
+        assert_eq!(parsed.switch_targets[0].label, "Sonnet 5");
+        assert_eq!(parsed.switch_targets[0].provider, AgentProvider::Omp);
+        assert_eq!(
+            parsed.switch_targets[0].model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        assert_eq!(parsed.switch_targets[1].label, "GLM 5.2");
+        assert_eq!(parsed.switch_targets[2].provider, AgentProvider::Codex);
+        assert_eq!(parsed.switch_targets[2].binary.as_deref(), Some("codex"));
+        assert!(parsed.switch_targets[2].model.is_none());
+    }
+
+    #[test]
+    fn omp_sessions_config_defaults() {
+        let config = OmpSessionsConfig::default();
+        assert_eq!(config.retention_days, 14);
+        assert!(config.cleanup_on_startup);
+    }
+
+    #[test]
+    fn switch_targets_merge_replaces_wholesale() {
+        // Repo config's switch_targets replaces home's wholesale if non-empty.
+        let base = FileConfig {
+            switch_targets: vec![SwitchTarget {
+                label: "Home target".to_string(),
+                provider: AgentProvider::Claude,
+                protocol: Protocol::Subprocess,
+                model: None,
+                binary: None,
+            }],
+            ..Default::default()
+        };
+        let overlay = FileConfig {
+            switch_targets: vec![
+                SwitchTarget {
+                    label: "Repo A".to_string(),
+                    provider: AgentProvider::Omp,
+                    protocol: Protocol::Subprocess,
+                    model: Some("anthropic/claude-sonnet-5".to_string()),
+                    binary: None,
+                },
+                SwitchTarget {
+                    label: "Repo B".to_string(),
+                    provider: AgentProvider::Omp,
+                    protocol: Protocol::Subprocess,
+                    model: Some("gpt-5.2".to_string()),
+                    binary: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let merged = FileConfig::merge(base, overlay);
+        assert_eq!(merged.switch_targets.len(), 2);
+        assert_eq!(merged.switch_targets[0].label, "Repo A");
+        assert_eq!(merged.switch_targets[1].label, "Repo B");
+    }
+
+    #[test]
+    fn switch_targets_merge_preserves_base_when_overlay_empty() {
+        let base = FileConfig {
+            switch_targets: vec![SwitchTarget {
+                label: "Home only".to_string(),
+                provider: AgentProvider::Claude,
+                protocol: Protocol::Subprocess,
+                model: None,
+                binary: None,
+            }],
+            ..Default::default()
+        };
+        let overlay = FileConfig::default(); // empty switch_targets
+        let merged = FileConfig::merge(base, overlay);
+        assert_eq!(merged.switch_targets.len(), 1);
+        assert_eq!(merged.switch_targets[0].label, "Home only");
     }
 }

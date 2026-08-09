@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2945932b1b2774d3434a67fc3778ea3e0af25c0c663a9b7d8746aac17643e568 # shrinks to vars = {"bnqgzhsp": "]\u{202e}\t.&Ѩ\u{42609}𑘆\u{42dd9}.\u{fe607}\t\u{7f}&\u{10dab4}^t\u{77913}\u{b}�;_X\t\u{d571b}\"`?\\\r\u{7f}", "dmqopfg": "'{\u{10e7be}'\u{519b8}\u{1b}\0濕\u{979ad}\t8\u{866d3}\0\u{93a60}", "idxkukol": "/,\u{5ea04}\u{74bed}/\u{7f}5\u{1}&\u{feff}\t$\0*'`f-\\x<%Ⱥ%.🕴\u{5}", "kg": "\u{7f}ѨÕ\u{84c72}\u{421f5}.\r>$\u{4}Î\u{7f}\\`/g<\\/\r\rd\u{cf50b}\u{4};¥}\u{9df90}|", "krllb": "s\u{b}�𱒅Ѩ?\u{88c43}\t?<`\u{7f}", "llet": "\u{feff}Q\u{3d297}.'\u{feff}<\u{5fad2}:6[`'\\*"}
+cc 2136d81d0cc7ddfc972f8428b0ead3187aafa7ed5e07a4c867336fa7cab33946 # shrinks to output = "�W"
+cc 69a42d9caf1e1e54f9e3b30bb9f46d78fedeca49b6f97c0264a672860726512e # shrinks to vars = {"belva": ">{?\tJ\u{f14f0}", "makjtbut": "/", "mej": "\u{1b}\u{66e3f}𪢙鈷`{\u{61a93}\u{35945}�w\u{79e3a}\\\u{202e}\u{1}k\u{94c54}.:\0=", "oxtlto": "d\u{c447e}nKe\u{b3293}🕴%\u{3f465}\u{feff}=\u{9d671}r\\\u{1b}\"oDȺ`¥'\u{202e}&\u{feff}:\u{1b}¥", "pcfkjnpu": "\u{c20e7}�3'W*d\u{80}\u{f050a}\u{9ef24}Ed=\0Ⱥ\u{82350}🕴\u{81372}\u{6feb1}🕴<2'Ⱥ", "vehjqkxxh": "", "zre": "\u{3}¥\u{9144e}Ѩ;.\u{83fa1}"}

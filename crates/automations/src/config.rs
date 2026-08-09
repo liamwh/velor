@@ -143,9 +143,8 @@ pub async fn load_automations(
 
             // Validate timezone
             if !automation.timezone.is_empty() {
-                // chrono_tz::Tz doesn't have from_str_insensitive in 0.10
-                // Use from_str which requires case-sensitive match
-                automation.timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+                // jiff::tz::TimeZone::get is case-sensitive on the IANA name.
+                jiff::tz::TimeZone::get(&automation.timezone).map_err(|_| {
                     color_eyre::eyre::eyre!("Invalid timezone: {}", automation.timezone)
                 })?;
             }

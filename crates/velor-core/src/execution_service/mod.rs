@@ -20,4 +20,5 @@ pub mod error;
 pub mod output;
 pub mod policy;
 pub mod service;
+pub mod steering;
 pub mod supervisor;

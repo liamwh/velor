@@ -19,8 +19,7 @@ velor-core = { path = "../../../crates/velor-core" }
 velor-automations = { path = "../../../crates/automations" }
 
 # Workspace dependencies
-chrono = { workspace = true }
-chrono-tz = { workspace = true }
+jiff = { workspace = true }
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
 serde = { workspace = true }

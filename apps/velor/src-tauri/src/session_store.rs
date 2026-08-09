@@ -3,9 +3,9 @@
 //! This module provides persistent storage for execution sessions, allowing
 //! the GUI to display historical executions with full input/output capture.
 
-use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool, sqlite::SqliteConnectOptions};
 use std::path::Path;
@@ -271,8 +271,8 @@ impl SessionStore {
         .bind(record.id.as_str())
         .bind(&record.config.prompt_name)
         .bind(record.state.label())
-        .bind(record.started_at.to_rfc3339())
-        .bind(record.ended_at.map(|t| t.to_rfc3339()))
+        .bind(record.started_at.to_string())
+        .bind(record.ended_at.map(|t| t.to_string()))
         .bind(&config_json)
         .bind(&metrics_json)
         .bind(&record.output)
@@ -298,7 +298,7 @@ impl SessionStore {
         let metrics_json = serde_json::to_string(&record.metrics)
             .wrap_err("Failed to serialize ExecutionMetrics")?;
 
-        let ended_at = record.ended_at.map(|t| t.to_rfc3339());
+        let ended_at = record.ended_at.map(|t| t.to_string());
 
         sqlx::query(
             "UPDATE sessions
@@ -686,7 +686,7 @@ impl SessionStore {
         .bind(session_id)
         .bind(event_type)
         .bind(&event_data)
-        .bind(timestamp.to_rfc3339())
+        .bind(timestamp.to_string())
         .execute(&self.pool)
         .await
         .wrap_err("Failed to append event")?;
@@ -729,13 +729,14 @@ impl SessionStore {
         let state = parse_execution_state(&row.state)
             .ok_or_else(|| color_eyre::eyre::eyre!("Invalid execution state: {}", row.state))?;
 
-        let started_at = DateTime::parse_from_rfc3339(&row.started_at)
-            .wrap_err("Invalid started_at RFC3339 format")?
-            .with_timezone(&Utc);
+        let started_at = row
+            .started_at
+            .parse::<Timestamp>()
+            .wrap_err("Invalid started_at RFC3339 format")?;
 
         let ended_at = row
             .ended_at
-            .map(|s| DateTime::parse_from_rfc3339(&s).map(|dt| dt.with_timezone(&Utc)))
+            .map(|s| s.parse::<Timestamp>())
             .transpose()
             .wrap_err("Invalid ended_at RFC3339 format")?;
 
@@ -760,9 +761,10 @@ impl SessionStore {
 
     /// Convert a database row to an ExecutionEvent.
     fn row_to_event(&self, row: EventRow) -> Result<ExecutionEvent> {
-        let timestamp = DateTime::parse_from_rfc3339(&row.timestamp)
-            .wrap_err("Invalid timestamp RFC3339 format")?
-            .with_timezone(&Utc);
+        let timestamp = row
+            .timestamp
+            .parse::<Timestamp>()
+            .wrap_err("Invalid timestamp RFC3339 format")?;
 
         let event = match row.event_type.as_str() {
             "StateChanged" => {
@@ -1085,7 +1087,7 @@ mod tests {
         // Append events
         let state_event = ExecutionEvent::StateChanged {
             state: ExecutionState::Running,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         };
         store
             .append_event(record.id.as_str(), &state_event)
@@ -1094,7 +1096,7 @@ mod tests {
 
         let output_event = ExecutionEvent::OutputChunk {
             text: "Hello, world!".to_string(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         };
         store
             .append_event(record.id.as_str(), &output_event)
@@ -1224,7 +1226,7 @@ mod tests {
         // Append events
         let event = ExecutionEvent::StateChanged {
             state: ExecutionState::Running,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         };
         store
             .append_event(record.id.as_str(), &event)

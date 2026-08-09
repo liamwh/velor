@@ -6,9 +6,9 @@
 //!
 //! The unified store supports migration from legacy databases (sessions.db, automations.db).
 
-use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
+use jiff::{Timestamp, ToSpan};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool, sqlite::SqliteConnectOptions};
 use std::path::Path;
@@ -154,11 +154,11 @@ pub struct AutomationRun {
     /// Name of the automation that was run.
     pub automation_name: String,
     /// When this run was scheduled to occur.
-    pub scheduled_for: DateTime<Utc>,
+    pub scheduled_for: Timestamp,
     /// When this run actually started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When this run completed (if terminal).
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Timestamp>,
     /// The current status of this run.
     pub status: AutomationRunStatus,
     /// Number of iterations completed before termination.
@@ -721,8 +721,8 @@ impl UnifiedStore {
         .bind(record.id.as_str())
         .bind(&record.config.prompt_name)
         .bind(record.state.label())
-        .bind(record.started_at.to_rfc3339())
-        .bind(record.ended_at.map(|t| t.to_rfc3339()))
+        .bind(record.started_at.to_string())
+        .bind(record.ended_at.map(|t| t.to_string()))
         .bind(&config_json)
         .bind(&metrics_json)
         .bind(&record.output)
@@ -748,7 +748,7 @@ impl UnifiedStore {
         let metrics_json = serde_json::to_string(&record.metrics)
             .wrap_err("Failed to serialize ExecutionMetrics")?;
 
-        let ended_at = record.ended_at.map(|t| t.to_rfc3339());
+        let ended_at = record.ended_at.map(|t| t.to_string());
 
         sqlx::query(
             "UPDATE sessions
@@ -990,7 +990,7 @@ impl UnifiedStore {
         .bind(session_id)
         .bind(event_type)
         .bind(&event_data)
-        .bind(timestamp.to_rfc3339())
+        .bind(timestamp.to_string())
         .execute(&self.pool)
         .await
         .wrap_err("Failed to append event")?;
@@ -1033,13 +1033,14 @@ impl UnifiedStore {
         let state = parse_execution_state(&row.state)
             .ok_or_else(|| color_eyre::eyre::eyre!("Invalid execution state: {}", row.state))?;
 
-        let started_at = DateTime::parse_from_rfc3339(&row.started_at)
-            .wrap_err("Invalid started_at RFC3339 format")?
-            .with_timezone(&Utc);
+        let started_at = row
+            .started_at
+            .parse::<Timestamp>()
+            .wrap_err("Invalid started_at RFC3339 format")?;
 
         let ended_at = row
             .ended_at
-            .map(|s| DateTime::parse_from_rfc3339(&s).map(|dt| dt.with_timezone(&Utc)))
+            .map(|s| s.parse::<Timestamp>())
             .transpose()
             .wrap_err("Invalid ended_at RFC3339 format")?;
 
@@ -1063,9 +1064,10 @@ impl UnifiedStore {
 
     /// Convert a database row to an ExecutionEvent.
     fn row_to_event(&self, row: EventRow) -> Result<ExecutionEvent> {
-        let timestamp = DateTime::parse_from_rfc3339(&row.timestamp)
-            .wrap_err("Invalid timestamp RFC3339 format")?
-            .with_timezone(&Utc);
+        let timestamp = row
+            .timestamp
+            .parse::<Timestamp>()
+            .wrap_err("Invalid timestamp RFC3339 format")?;
 
         let event = match row.event_type.as_str() {
             "StateChanged" => {
@@ -1281,16 +1283,16 @@ impl UnifiedStore {
     pub async fn insert_automation_run(
         &self,
         automation_name: &str,
-        scheduled_for: DateTime<Utc>,
-        started_at: DateTime<Utc>,
+        scheduled_for: Timestamp,
+        started_at: Timestamp,
     ) -> Result<i64> {
         let result = sqlx::query(
             "INSERT INTO automation_runs (automation_name, scheduled_for, started_at, status)
              VALUES (?1, ?2, ?3, ?4)",
         )
         .bind(automation_name)
-        .bind(scheduled_for.to_rfc3339())
-        .bind(started_at.to_rfc3339())
+        .bind(scheduled_for.to_string())
+        .bind(started_at.to_string())
         .bind(AutomationRunStatus::Pending)
         .execute(&self.pool)
         .await?;
@@ -1313,7 +1315,7 @@ impl UnifiedStore {
         output: Option<&str>,
         error: Option<&str>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let duration_ms = if status.is_terminal() {
             if let Ok(started_str) = sqlx::query_scalar::<_, String>(
                 "SELECT started_at FROM automation_runs WHERE id = ?1",
@@ -1322,9 +1324,8 @@ impl UnifiedStore {
             .fetch_one(&self.pool)
             .await
             {
-                if let Ok(started) = DateTime::parse_from_rfc3339(&started_str) {
-                    let started = started.with_timezone(&Utc);
-                    Some(now.signed_duration_since(started).num_milliseconds())
+                if let Ok(started) = started_str.parse::<Timestamp>() {
+                    Some(now.duration_since(started).as_millis() as i64)
                 } else {
                     None
                 }
@@ -1336,7 +1337,7 @@ impl UnifiedStore {
         };
 
         let completed_at = if status.is_terminal() {
-            Some(now.to_rfc3339())
+            Some(now.to_string())
         } else {
             None
         };
@@ -1380,7 +1381,7 @@ impl UnifiedStore {
                  ON CONFLICT(automation_name) DO NOTHING",
             )
             .bind(automation_name)
-            .bind(Utc::now().to_rfc3339())
+            .bind(Timestamp::now().to_string())
             .bind(run_id)
             .execute(&self.pool)
             .await?;
@@ -1398,10 +1399,9 @@ impl UnifiedStore {
             .await?;
 
             if let Some(locked_str) = locked_at
-                && let Ok(locked) = DateTime::parse_from_rfc3339(&locked_str)
+                && let Ok(locked) = locked_str.parse::<Timestamp>()
             {
-                let locked = locked.with_timezone(&Utc);
-                let stale_threshold = Utc::now() - chrono::Duration::hours(2);
+                let stale_threshold = Timestamp::now() - 2_i64.hours();
                 if locked < stale_threshold {
                     self.release_automation_lock(automation_name).await?;
                     continue;
@@ -1477,22 +1477,23 @@ impl UnifiedStore {
             }
         };
 
-        let scheduled_for = DateTime::parse_from_rfc3339(&row.scheduled_for)
-            .map_err(|e| color_eyre::eyre::eyre!("Invalid scheduled_for RFC3339: {}", e))?
-            .with_timezone(&Utc);
+        let scheduled_for = row
+            .scheduled_for
+            .parse::<Timestamp>()
+            .map_err(|e| color_eyre::eyre::eyre!("Invalid scheduled_for RFC3339: {}", e))?;
 
-        let started_at = DateTime::parse_from_rfc3339(&row.started_at)
-            .map_err(|e| color_eyre::eyre::eyre!("Invalid started_at RFC3339: {}", e))?
-            .with_timezone(&Utc);
+        let started_at = row
+            .started_at
+            .parse::<Timestamp>()
+            .map_err(|e| color_eyre::eyre::eyre!("Invalid started_at RFC3339: {}", e))?;
 
         let completed_at = row
             .completed_at
             .map(|s| {
-                DateTime::parse_from_rfc3339(&s)
+                s.parse::<Timestamp>()
                     .map_err(|e| color_eyre::eyre::eyre!("Invalid completed_at RFC3339: {}", e))
             })
-            .transpose()?
-            .map(|dt| dt.with_timezone(&Utc));
+            .transpose()?;
 
         Ok(AutomationRun {
             id: row.id,
@@ -1801,8 +1802,8 @@ mod tests {
             .await
             .expect("store should be created");
 
-        let scheduled_for = Utc::now();
-        let started_at = Utc::now();
+        let scheduled_for = Timestamp::now();
+        let started_at = Timestamp::now();
 
         let run_id = store
             .insert_automation_run("test-automation", scheduled_for, started_at)
@@ -1831,7 +1832,7 @@ mod tests {
             .expect("store should be created");
 
         let run_id = store
-            .insert_automation_run("test-automation", Utc::now(), Utc::now())
+            .insert_automation_run("test-automation", Timestamp::now(), Timestamp::now())
             .await
             .expect("insert should succeed");
 
@@ -1908,7 +1909,7 @@ mod tests {
         // Insert 5 runs
         for _ in 0..5 {
             store
-                .insert_automation_run("test-automation", Utc::now(), Utc::now())
+                .insert_automation_run("test-automation", Timestamp::now(), Timestamp::now())
                 .await
                 .expect("insert should succeed");
         }

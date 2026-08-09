@@ -13,7 +13,6 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
 use color_eyre::eyre::WrapErr;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -21,6 +20,7 @@ use crossterm::{
     terminal::SetTitle,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use jiff::Zoned;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -47,17 +47,22 @@ pub use crate::tui_transcript::{EntryKind, TuiEntry};
 // ── Live-steering command/outcome model ─────────────────────────────────────
 
 use velor_core::agent::SteeringDelivery;
-use velor_core::execution_service::adapters::claude_stream::{PersistentAppend, SteeringText};
 use velor_core::execution_service::capabilities::LiveSteeringStatus;
+use velor_core::execution_service::steering::{PersistentAppend, SteeringBehaviour, SteeringText};
 
 /// A steering command sent from the TUI to the run-loop controller, each
 /// carrying an acknowledgement the controller resolves with an explicit outcome.
 #[derive(Debug)]
 pub enum TuiSteeringCommand {
-    /// One-shot live steering (the `c` key): send `text` to the active session.
+    /// One-shot live session input (the `i` steer key or the `f` follow-up
+    /// key): send `text` to the active session with the requested behaviour.
+    /// `i` redirects the active turn now; `f` queues for after it finishes —
+    /// two meaningfully different actions, never overloaded onto one key.
     SendOnce {
-        /// The steering text (validated non-empty by the TUI before submission).
+        /// The text (validated non-empty by the TUI before submission).
         text: SteeringText,
+        /// Whether this steers the active turn or queues a follow-up.
+        behaviour: SteeringBehaviour,
         /// Resolves with the delivery outcome.
         acknowledgement: tokio::sync::oneshot::Sender<Result<SteeringOutcome, TuiSteeringError>>,
     },
@@ -233,10 +238,14 @@ pub fn agent_event_to_tui(event: &velor_core::agent::AgentEvent) -> Option<TuiEn
 enum InputMode {
     /// Normal browsing/scrolling.
     Normal,
-    /// The `c` one-shot steering editor.
+    /// The `i` (steer) / `f` (follow-up) one-shot editor. Same mechanics,
+    /// different semantics — `behaviour` discriminates which RPC command the
+    /// submission ultimately sends.
     Steering {
         /// The text being composed.
         buffer: String,
+        /// Whether this steers the active turn or queues a follow-up.
+        behaviour: SteeringBehaviour,
         /// Current submission state.
         submission: SubmissionState,
     },
@@ -263,6 +272,17 @@ impl InputMode {
             Self::Steering { .. } | Self::EditingPersistentAppend { .. }
         )
     }
+}
+
+/// Which editor modal is open. The live-input modal reuses one renderer for
+/// steer and follow-up (same mechanics, different title/footer/prefix); the
+/// append modal is the other variant.
+#[derive(Debug, Clone, Copy)]
+enum ModalKind {
+    /// A live session input with the given behaviour (`i` steer or `f` follow-up).
+    Live(SteeringBehaviour),
+    /// The `a` persistent-append editor.
+    Append,
 }
 
 /// The submission lifecycle of an editor modal.
@@ -309,7 +329,7 @@ struct TuiState {
     help_search: String,
     /// Whether `/` search is actively capturing keystrokes in the help
     /// modal — while true, printable keys append to `help_search` instead of
-    /// the usual "any key closes the modal" behavior.
+    /// the usual "any key closes the modal" behaviour.
     help_search_active: bool,
     show_errors: bool,
     prompt_scroll: u16,
@@ -327,8 +347,13 @@ struct TuiState {
     input_mode: InputMode,
     /// Sender for steering commands to the run-loop controller.
     steering_tx: Option<tokio::sync::mpsc::Sender<TuiSteeringCommand>>,
-    /// Current live-steering availability (drives whether `c` is offered).
+    /// Current live-steering availability (drives whether `i`/`f` are offered).
     live_steering_status: LiveSteeringStatus,
+    /// Whether the active runner natively supports follow-up (the `f` key).
+    /// Static for the run; derived from `AgentRunner::capabilities()` at
+    /// startup. Steer (`i`) availability rides the dynamic
+    /// `live_steering_status`; follow-up rides this static flag.
+    follow_up_capable: bool,
     /// The controller-owned persistent append (for the indicator + `a` pre-fill).
     persistent_append: Option<PersistentAppend>,
     /// The delivery state of the most recent live send (shown briefly).
@@ -390,7 +415,7 @@ fn entry_visible(kind: &EntryKind, show_thinking: bool, show_tool_output: bool) 
 }
 
 impl TuiState {
-    fn new(limits: TuiLimits) -> Self {
+    fn new(limits: TuiLimits, follow_up_capable: bool) -> Self {
         Self {
             transcript: Transcript::new(limits),
             scroll: ScrollState::Tail,
@@ -411,6 +436,15 @@ impl TuiState {
             show_thinking: true,
             show_tool_output: true,
             open_log: false,
+            input_mode: InputMode::default(),
+            steering_tx: None,
+            live_steering_status: LiveSteeringStatus::Unsupported,
+            follow_up_capable,
+            persistent_append: None,
+            last_delivery: None,
+            pending_ack: None,
+            pending_append_ack: None,
+            transient_status: None,
             last_width: 80,
             last_viewport_rows: 10,
             input_tokens: 0,
@@ -421,14 +455,6 @@ impl TuiState {
             pending_iteration: None,
             pending_g: false,
             g_deadline: None,
-            input_mode: InputMode::default(),
-            steering_tx: None,
-            live_steering_status: LiveSteeringStatus::Unsupported,
-            persistent_append: None,
-            last_delivery: None,
-            pending_ack: None,
-            pending_append_ack: None,
-            transient_status: None,
             sticky_todo: None,
             sticky_todo_expanded: false,
         }
@@ -638,11 +664,29 @@ impl TuiState {
         }
     }
 
-    // ── Live-steering editors ───────────────────────────────────────────────
+    // ── Live-session input editors ─────────────────────────────────────────
 
-    /// Opens the `c` steering editor (only when a session is Ready), or sets a
+    /// Opens the `i` steer editor (only when a session is Ready), or sets a
     /// transient status explaining why it is unavailable.
     fn open_steering(&mut self) {
+        self.open_live_input(SteeringBehaviour::Steer);
+    }
+
+    /// Opens the `f` follow-up editor. Gated on the runner's static
+    /// `follow_up_capable` flag, then on the same dynamic session status as
+    /// steer (a follow-up needs an active session to queue against, just like
+    /// a steer does).
+    fn open_follow_up(&mut self) {
+        if !self.follow_up_capable {
+            self.set_transient("Follow-up is not supported by this provider.");
+            return;
+        }
+        self.open_live_input(SteeringBehaviour::FollowUp);
+    }
+
+    /// Shared open path for steer/follow-up: checks the live session status,
+    /// then enters the editor tagged with `behaviour`.
+    fn open_live_input(&mut self, behaviour: SteeringBehaviour) {
         if self.pending_ack.is_some() {
             return; // already submitting
         }
@@ -650,6 +694,7 @@ impl TuiState {
             LiveSteeringStatus::Ready => {
                 self.input_mode = InputMode::Steering {
                     buffer: String::new(),
+                    behaviour,
                     submission: SubmissionState::Editing,
                 };
             }
@@ -657,7 +702,7 @@ impl TuiState {
                 self.set_transient("Live steering is not supported by this provider.");
             }
             LiveSteeringStatus::Inactive => {
-                self.set_transient("No active agent session is available to steer.");
+                self.set_transient("No active agent session is available.");
             }
             LiveSteeringStatus::Closing => {
                 self.set_transient("The active agent session is closing.");
@@ -744,13 +789,17 @@ impl TuiState {
         }
         // Collect any submit action (Enter) without calling `self` methods inside
         // the `&mut self.input_mode` borrow; dispatch afterwards.
-        // `(is_append, text)`.
-        let mut submit: Option<(bool, String)> = None;
+        // `(is_append, behaviour, text)`.
+        let mut submit: Option<(bool, SteeringBehaviour, String)> = None;
         match &mut self.input_mode {
-            InputMode::Steering { buffer, submission } => match submission {
+            InputMode::Steering {
+                buffer,
+                behaviour,
+                submission,
+            } => match submission {
                 SubmissionState::Submitting => return true, // ignore keys while awaiting ack
                 SubmissionState::Editing | SubmissionState::Failed { .. } => match key.code {
-                    KeyCode::Enter => submit = Some((false, buffer.clone())),
+                    KeyCode::Enter => submit = Some((false, *behaviour, buffer.clone())),
                     KeyCode::Char(c) if c != '\n' => {
                         buffer.push(c);
                         *submission = SubmissionState::Editing;
@@ -765,7 +814,9 @@ impl TuiState {
             InputMode::EditingPersistentAppend { buffer, submission } => match submission {
                 SubmissionState::Submitting => return true,
                 SubmissionState::Editing | SubmissionState::Failed { .. } => match key.code {
-                    KeyCode::Enter => submit = Some((true, buffer.clone())),
+                    KeyCode::Enter => {
+                        submit = Some((true, SteeringBehaviour::Steer, buffer.clone()))
+                    }
                     KeyCode::Char(c) if c != '\n' => {
                         buffer.push(c);
                         *submission = SubmissionState::Editing;
@@ -780,23 +831,24 @@ impl TuiState {
             // Guarded out at the top; kept for exhaustiveness.
             InputMode::Normal => {}
         }
-        if let Some((is_append, text)) = submit {
+        if let Some((is_append, behaviour, text)) = submit {
             if is_append {
                 self.submit_append(text);
             } else {
-                self.submit_steering(text);
+                self.submit_live_input(text, behaviour);
             }
         }
         true
     }
 
-    /// Submits the `c` steering buffer: validates, sends the command on a spawned
-    /// task, and records the pending acknowledgement for polling.
-    fn submit_steering(&mut self, buffer: String) {
+    /// Submits the `i`/`f` editor buffer: validates, sends the command (tagged
+    /// with `behaviour`) on a spawned task, and records the pending
+    /// acknowledgement for polling.
+    fn submit_live_input(&mut self, buffer: String, behaviour: SteeringBehaviour) {
         let text = match SteeringText::new(buffer.clone()) {
             Ok(t) => t,
             Err(_) => {
-                self.set_submission_failed("Steering text must not be empty.");
+                self.set_submission_failed("Input must not be empty.");
                 return;
             }
         };
@@ -807,6 +859,7 @@ impl TuiState {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let cmd = TuiSteeringCommand::SendOnce {
             text,
+            behaviour,
             acknowledgement: ack_tx,
         };
         // Send on a task so a full/closed controller channel cannot stall the
@@ -869,6 +922,10 @@ impl TuiState {
             match ack.try_recv() {
                 Ok(Ok(SteeringOutcome::Sent { delivery })) => {
                     self.last_delivery = Some(delivery);
+                    // A brief, non-noisy confirmation that the instruction was
+                    // submitted and accepted — the modal itself is closing, so
+                    // this is the only visible signal the user gets.
+                    self.set_transient("Steering instruction submitted.");
                     self.input_mode = InputMode::Normal;
                 }
                 Ok(Ok(SteeringOutcome::Unavailable { status })) => {
@@ -899,7 +956,7 @@ impl TuiState {
                     let (delivery, msg) = match &outcome {
                         AppendOutcome::UpdatedAndSent { delivery } => (
                             Some(*delivery),
-                            "Append updated and sent to the active Claude session.",
+                            "Append updated and sent to the active session.",
                         ),
                         AppendOutcome::ClearedAndSent { delivery } => {
                             (Some(*delivery), "Persistent append cleared.")
@@ -1013,7 +1070,7 @@ impl LayoutCache {
                 expand: self.expand_output,
                 max_entry_lines: self.max_entry_lines,
             };
-            let rows = build_layout(&entry.kind, entry.ts, width, &mut self.engine, opts);
+            let rows = build_layout(&entry.kind, &entry.ts, width, &mut self.engine, opts);
             self.insert(key.clone(), CachedLayout { rows });
             self.renders += 1;
         }
@@ -1089,7 +1146,7 @@ impl Default for RenderOpts {
 
 fn build_layout(
     kind: &EntryKind,
-    ts: DateTime<Local>,
+    ts: &Zoned,
     width: u16,
     engine: &mut HighlightEngine,
     opts: RenderOpts,
@@ -1108,7 +1165,7 @@ fn build_layout(
     // to align beneath the source rather than the gutter.
     let hang = entry_hang(kind);
     let ts_span = Span::styled(
-        ts.format("%H:%M:%S ").to_string(),
+        ts.strftime("%H:%M:%S ").to_string(),
         Style::default().fg(theme::active().dim),
     );
     let w = (width as usize).max(1);
@@ -1207,6 +1264,7 @@ pub async fn run_streaming_tui(
     cancel: CancellationToken,
     cancel_handler: crate::cancellation::CancellationHandler,
     limits: TuiLimits,
+    follow_up_capable: bool,
 ) -> color_eyre::eyre::Result<()> {
     enable_raw_mode().wrap_err("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -1215,7 +1273,7 @@ pub async fn run_streaming_tui(
     let mut terminal = Terminal::new(backend).wrap_err("create terminal")?;
     terminal.clear()?;
 
-    let mut state = TuiState::new(limits);
+    let mut state = TuiState::new(limits, follow_up_capable);
     state.steering_tx = steering_tx;
     set_title("vel auto — starting");
 
@@ -1451,7 +1509,7 @@ fn handle_key(
     // the keybinding list live as you type (see `render_help_modal`); Enter
     // commits it, leaving the filter applied, and Esc clears it. Only once
     // search isn't being actively typed does an arbitrary key close the
-    // modal, preserving the original "any key closes" behavior.
+    // modal, preserving the original "any key closes" behaviour.
     if state.show_help {
         if state.help_search_active {
             match key.code {
@@ -1575,8 +1633,13 @@ fn handle_key(
         KeyCode::Char('s') => {
             cancel_handler.toggle_stop_after_iteration();
         }
-        // `c` — one-shot live steering (Ctrl+C is handled above with its guard).
-        KeyCode::Char('c') => state.open_steering(),
+        // `i` — steer the active session with a one-shot redirect that takes
+        // effect at the next safe boundary. `c` remains as an alias. (Ctrl+C
+        // is handled above with its guard.)
+        KeyCode::Char('i') | KeyCode::Char('c') => state.open_steering(),
+        // `f` — queue a follow-up: do this *after* the current turn finishes,
+        // rather than redirecting it now. Distinct from `i`; never overloaded.
+        KeyCode::Char('f') => state.open_follow_up(),
         // `a` — edit the persistent append (always available; cleared when empty).
         KeyCode::Char('a') => state.open_append_editor(),
         KeyCode::Char('?') => {
@@ -1759,12 +1822,14 @@ fn render(
         render_error_modal(f, area, entries, state.error_scroll, omitted);
     }
     match &state.input_mode {
-        InputMode::Steering { buffer, submission } => {
-            render_steering_modal(f, area, buffer, submission, false)
-        }
+        InputMode::Steering {
+            buffer,
+            behaviour,
+            submission,
+        } => render_live_input_modal(f, area, buffer, submission, ModalKind::Live(*behaviour)),
         InputMode::EditingPersistentAppend {
             buffer, submission, ..
-        } => render_steering_modal(f, area, buffer, submission, true),
+        } => render_live_input_modal(f, area, buffer, submission, ModalKind::Append),
         InputMode::Normal => {}
     }
     if let Some((_, msg)) = &state.transient_status {
@@ -1778,25 +1843,36 @@ fn render(
     }
 }
 
-/// Renders the `c` steering / `a` append editor modal.
-/// Minimum/maximum inner (content) rows for the steer/append popup. The
-/// popup grows with the buffer so a long line wraps across visible rows
+/// Minimum/maximum inner (content) rows for the steer/follow-up/append popup.
+/// The popup grows with the buffer so a long line wraps across visible rows
 /// instead of being clipped; past `MAX_MODAL_INNER_ROWS` it scrolls to keep
 /// the tail of the input (where the cursor is) and the footer in view.
 const MIN_MODAL_INNER_ROWS: u16 = 7;
 const MAX_MODAL_INNER_ROWS_PCT: u16 = 70;
 
-fn render_steering_modal(
+fn render_live_input_modal(
     f: &mut Frame,
     area: Rect,
     buffer: &str,
     submission: &SubmissionState,
-    is_append: bool,
+    kind: ModalKind,
 ) {
-    let (title, prefix) = if is_append {
-        (" ✏️  Append (Enter=save · Esc=cancel) ", "append › ")
-    } else {
-        (" 🎯  Steer (Enter=send · Esc=cancel) ", "steer › ")
+    let (title, prefix, edit_help) = match kind {
+        ModalKind::Append => (
+            " ✏️  Append (Enter=save · Esc=cancel) ",
+            "append › ",
+            "Empty clears the append. It is folded into every later iteration.",
+        ),
+        ModalKind::Live(SteeringBehaviour::FollowUp) => (
+            " ➕  Follow-up (Enter=queue · Esc=cancel) ",
+            "follow-up › ",
+            "Queued to run after the current turn finishes. Not replayed in later iterations.",
+        ),
+        ModalKind::Live(SteeringBehaviour::Steer) => (
+            " 🎯  Steer (Enter=send · Esc=cancel) ",
+            "steer › ",
+            "Redirects the active turn at the next safe boundary. Not replayed in later iterations.",
+        ),
     };
     let theme = theme::active();
     let prompt_style = Style::default()
@@ -1816,14 +1892,7 @@ fn render_steering_modal(
     let hang = UnicodeWidthStr::width(prefix);
     let mut lines = wrap_spans_indented(&input_spans, content_width, hang);
     let footer_spans: Vec<Span<'static>> = match submission {
-        SubmissionState::Editing => vec![Span::styled(
-            if is_append {
-                "Empty clears the append. It is folded into every later iteration."
-            } else {
-                "Sends one message to the active session. Not replayed in later iterations."
-            },
-            Style::default().fg(theme.dim),
-        )],
+        SubmissionState::Editing => vec![Span::styled(edit_help, Style::default().fg(theme.dim))],
         SubmissionState::Submitting => vec![Span::styled(
             "Submitting…",
             Style::default().fg(theme.warning),
@@ -2153,8 +2222,29 @@ fn render_hints(
             }),
             key("l"),
             Span::raw(" log  "),
-            key("c"),
-            Span::raw(" steer  "),
+            // Steer/follow-up are only offered when the active runner natively
+            // supports them — the hints must not advertise an action that will
+            // just resolve as "unsupported".
+            if !matches!(state.live_steering_status, LiveSteeringStatus::Unsupported) {
+                key("i")
+            } else {
+                Span::raw("")
+            },
+            if !matches!(state.live_steering_status, LiveSteeringStatus::Unsupported) {
+                Span::raw(" steer  ")
+            } else {
+                Span::raw("")
+            },
+            if state.follow_up_capable {
+                key("f")
+            } else {
+                Span::raw("")
+            },
+            if state.follow_up_capable {
+                Span::raw(" follow-up  ")
+            } else {
+                Span::raw("")
+            },
             key("a"),
             Span::raw(" append  "),
             key("y/Y"),
@@ -3519,7 +3609,7 @@ fn render_error_modal(
         if i > 0 {
             lines.push(Line::from(""));
         }
-        let ts = entry.ts.format("%H:%M:%S").to_string();
+        let ts = entry.ts.strftime("%H:%M:%S").to_string();
         let msg = match &entry.kind {
             EntryKind::Error(m) => m.as_str(),
             _ => unreachable!("filtered to errors above"),
@@ -3579,8 +3669,16 @@ const HELP_KEYBINDINGS: &[(&str, &str)] = &[
     ),
     ("s", "Toggle stopping after the current iteration completes"),
     (
+        "i",
+        "Steer the active session — redirect the current turn at the next safe boundary",
+    ),
+    (
         "c",
-        "Steer the active Claude session with a one-shot message",
+        "Alias for `i` (steer the active session with a one-shot message)",
+    ),
+    (
+        "f",
+        "Queue a follow-up — run after the current turn finishes (omp only)",
     ),
     (
         "a",
@@ -3821,13 +3919,249 @@ mod render_tests {
         crate::cancellation::CancellationHandler::new().0
     }
 
+    // ── Steer (`i`/`c`) / follow-up (`f`) input: open, type, cancel, submit ──
+
+    #[test]
+    fn i_key_opens_steer_input_when_ready_without_leaking_the_key_into_the_buffer() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        match &state.input_mode {
+            InputMode::Steering {
+                buffer, behaviour, ..
+            } => {
+                assert_eq!(*behaviour, SteeringBehaviour::Steer);
+                assert!(
+                    buffer.is_empty(),
+                    "the opening `i` must not land in the buffer"
+                );
+            }
+            other => panic!("expected the steer modal to open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c_key_still_opens_steer_input_preserving_the_existing_binding() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(matches!(
+            state.input_mode,
+            InputMode::Steering {
+                behaviour: SteeringBehaviour::Steer,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn f_key_opens_follow_up_input_when_capable_and_ready() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(matches!(
+            state.input_mode,
+            InputMode::Steering {
+                behaviour: SteeringBehaviour::FollowUp,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn f_key_is_a_no_op_when_the_runner_does_not_support_follow_up() {
+        // A runner without native follow-up support (e.g. Claude) must never
+        // have the affordance emulated — the modal stays closed.
+        let mut state = TuiState::new(TuiLimits::default(), false);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(matches!(state.input_mode, InputMode::Normal));
+        let (_, msg) = state.transient_status.expect("a transient explanation");
+        assert!(msg.to_lowercase().contains("not supported"));
+    }
+
+    #[test]
+    fn typing_appends_to_the_open_steer_buffer() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        state.open_steering();
+        for c in "hi".chars() {
+            handle_key(
+                event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut state,
+                &cancel,
+                &cancel_handler,
+            );
+        }
+        match &state.input_mode {
+            InputMode::Steering { buffer, .. } => assert_eq!(buffer, "hi"),
+            other => panic!("expected the steer modal to stay open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_cancels_the_steer_modal_without_submitting() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        state.open_steering();
+        handle_key(
+            event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        handle_key(
+            event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(matches!(state.input_mode, InputMode::Normal));
+        assert!(
+            state.pending_ack.is_none(),
+            "Esc must never submit anything"
+        );
+    }
+
+    #[test]
+    fn enter_on_an_empty_steer_buffer_fails_without_a_channel_or_submission() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        state.open_steering();
+        handle_key(
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        match &state.input_mode {
+            InputMode::Steering { submission, .. } => {
+                assert!(matches!(submission, SubmissionState::Failed { .. }));
+            }
+            other => panic!("expected the modal to stay open with a failure, got {other:?}"),
+        }
+        assert!(state.pending_ack.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_submits_a_steer_command_carrying_the_steer_behaviour() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TuiSteeringCommand>(1);
+        state.steering_tx = Some(tx);
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        state.open_steering();
+        for c in "don't replace it, extend it".chars() {
+            handle_key(
+                event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut state,
+                &cancel,
+                &cancel_handler,
+            );
+        }
+        handle_key(
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        assert!(matches!(
+            state.input_mode,
+            InputMode::Steering {
+                submission: SubmissionState::Submitting,
+                ..
+            }
+        ));
+        match rx.recv().await.expect("a command reaches the controller") {
+            TuiSteeringCommand::SendOnce {
+                text, behaviour, ..
+            } => {
+                assert_eq!(text.as_str(), "don't replace it, extend it");
+                assert_eq!(behaviour, SteeringBehaviour::Steer);
+            }
+            other => panic!("expected SendOnce, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_submits_a_follow_up_command_carrying_the_follow_up_behaviour() {
+        let mut state = TuiState::new(TuiLimits::default(), true);
+        state.live_steering_status = LiveSteeringStatus::Ready;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TuiSteeringCommand>(1);
+        state.steering_tx = Some(tx);
+        let cancel = CancellationToken::new();
+        let cancel_handler = handler();
+        state.open_follow_up();
+        for c in "also update the docs".chars() {
+            handle_key(
+                event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut state,
+                &cancel,
+                &cancel_handler,
+            );
+        }
+        handle_key(
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &cancel,
+            &cancel_handler,
+        );
+        match rx.recv().await.expect("a command reaches the controller") {
+            TuiSteeringCommand::SendOnce {
+                text, behaviour, ..
+            } => {
+                assert_eq!(text.as_str(), "also update the docs");
+                assert_eq!(behaviour, SteeringBehaviour::FollowUp);
+            }
+            other => panic!("expected SendOnce, got {other:?}"),
+        }
+    }
+
     #[test]
     fn render_lays_out_only_the_viewport_for_a_large_transcript() {
-        let mut state = TuiState::new(TuiLimits {
-            max_entries: 5000,
-            max_bytes: usize::MAX,
-            max_entry_lines: 100,
-        });
+        let mut state = TuiState::new(
+            TuiLimits {
+                max_entries: 5000,
+                max_bytes: usize::MAX,
+                max_entry_lines: 100,
+            },
+            false,
+        );
         for i in 0..3000 {
             state
                 .transcript
@@ -3855,7 +4189,7 @@ mod render_tests {
 
     #[test]
     fn help_modal_search_filters_live_and_esc_clears_it() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         let cancel = CancellationToken::new();
         let cancel_handler = handler();
         state.show_help = true;
@@ -3928,7 +4262,7 @@ mod render_tests {
 
     #[test]
     fn m_key_opens_the_provider_info_modal_and_any_key_closes_it() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         let cancel = CancellationToken::new();
         let cancel_handler = handler();
 
@@ -3959,7 +4293,7 @@ mod render_tests {
 
     #[test]
     fn set_provider_info_message_populates_state() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         assert!(state.provider_info.is_none());
         state.provider_info = Some(ProviderInfo {
             provider: "Codex".to_string(),
@@ -3977,7 +4311,7 @@ mod render_tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         state.show_provider_info = true;
         // Pending (no SetProviderInfo yet).
         terminal
@@ -3998,11 +4332,14 @@ mod render_tests {
     fn memory_bounded_by_limits_under_sustained_streaming() {
         // Coalescing means streamed text becomes one entry; the buffer must cap
         // at max_entries even after far more events than the cap.
-        let mut state = TuiState::new(TuiLimits {
-            max_entries: 500,
-            max_bytes: usize::MAX,
-            max_entry_lines: 100,
-        });
+        let mut state = TuiState::new(
+            TuiLimits {
+                max_entries: 500,
+                max_bytes: usize::MAX,
+                max_entry_lines: 100,
+            },
+            false,
+        );
         for i in 0..50_000 {
             state
                 .transcript
@@ -4018,7 +4355,7 @@ mod render_tests {
 
     #[test]
     fn streamed_chunks_coalesce_to_one_cached_layout() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         for chunk in ["The ", "quick ", "brown ", "fox"] {
             state
                 .transcript
@@ -4082,7 +4419,7 @@ mod render_tests {
 
     #[test]
     fn gg_jumps_to_top_of_iteration_in_view() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         // iter 1 (40) then iter 2 (40).
         start_iteration(&mut state, 1, 2, 40);
         let iter1_start = state.iteration_starts[0].id;
@@ -4124,7 +4461,7 @@ mod render_tests {
 
     #[test]
     fn g_jumps_to_bottom_of_iteration_in_view() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         start_iteration(&mut state, 1, 2, 40);
         start_iteration(&mut state, 2, 2, 40);
         // Copy ids out up front. With dividers, iter1 = divider@0 + infos@1..40
@@ -4164,7 +4501,7 @@ mod render_tests {
 
     #[test]
     fn gg_falls_back_to_absolute_top_without_iteration_boundaries() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         ingest_n(&mut state, 50);
         state.last_viewport_rows = 5;
         state.scroll_up_by(10);
@@ -4182,7 +4519,7 @@ mod render_tests {
 
     #[test]
     fn iteration_divider_is_emitted_and_indexed_as_boundary() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         start_iteration(&mut state, 1, 2, 5);
         start_iteration(&mut state, 2, 2, 5);
         // Two iterations → two indexed boundaries.
@@ -4207,7 +4544,7 @@ mod render_tests {
 
     #[test]
     fn viewing_iteration_tracks_the_scrolled_position() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         // Three iterations, 40 entries each: iter1 = divider@0 + infos@1..40,
         // iter2 = divider@41 + infos@42..81, iter3 = divider@82 + infos@83..122.
         start_iteration(&mut state, 1, 3, 40);
@@ -4253,7 +4590,7 @@ mod render_tests {
 
     #[test]
     fn g_t_jumps_to_absolute_top() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         start_iteration(&mut state, 1, 2, 30);
         start_iteration(&mut state, 2, 2, 30);
         state.last_viewport_rows = 5;
@@ -4272,7 +4609,7 @@ mod render_tests {
 
     #[test]
     fn g_b_jumps_to_absolute_bottom_live_tail() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         start_iteration(&mut state, 1, 2, 30);
         start_iteration(&mut state, 2, 2, 30);
         state.last_viewport_rows = 5;
@@ -4285,7 +4622,7 @@ mod render_tests {
 
     #[test]
     fn pending_g_prefix_cancels_on_non_matching_key() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         ingest_n(&mut state, 50);
         state.begin_g();
         assert!(state.pending_g);
@@ -4296,7 +4633,7 @@ mod render_tests {
 
     #[test]
     fn tick_g_chord_cancels_on_timeout() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         ingest_n(&mut state, 50);
         state.begin_g();
         assert!(state.pending_g);
@@ -4326,7 +4663,7 @@ mod render_tests {
     fn file_edit_layout_has_gutter_syntax_and_diff_styles() {
         let mut engine = crate::highlight::HighlightEngine::new();
         let kind = EntryKind::FileEdit(Box::new(one_line_replacement_edit()));
-        let rows = build_layout(&kind, Local::now(), 80, &mut engine, RenderOpts::default());
+        let rows = build_layout(&kind, &Zoned::now(), 80, &mut engine, RenderOpts::default());
         assert!(!rows.is_empty());
 
         // Flatten spans, checking for ANSI escapes and gathering evidence of
@@ -4392,7 +4729,7 @@ mod render_tests {
         )
         .expect("created edit");
         let kind = EntryKind::FileEdit(Box::new(edit));
-        let rows = build_layout(&kind, Local::now(), 40, &mut engine, RenderOpts::default());
+        let rows = build_layout(&kind, &Zoned::now(), 40, &mut engine, RenderOpts::default());
 
         // rows[0] = header; rows[1] = first (guttered) row of the added line;
         // rows[2..] = wrapped continuation rows.
@@ -4419,7 +4756,7 @@ mod render_tests {
 
     #[test]
     fn file_edit_renders_in_buffer_without_ansi() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         state
             .transcript
             .ingest(TuiEntry::now(EntryKind::FileEdit(Box::new(
@@ -4702,7 +5039,7 @@ mod render_tests {
         let mut engine = crate::highlight::HighlightEngine::new();
         let _rows = build_layout(
             &EntryKind::FileEdit(Box::new(edit)),
-            Local::now(),
+            &Zoned::now(),
             100,
             &mut engine,
             RenderOpts::default(),
@@ -5545,14 +5882,14 @@ mod render_tests {
 
     #[test]
     fn current_task_label_extracts_the_in_progress_item() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         state.sticky_todo = Some("[x] Ship the feature\n[~] Write tests\n[ ] Update docs".into());
         assert_eq!(current_task_label(&state).as_deref(), Some("Write tests"));
     }
 
     #[test]
     fn current_task_label_is_none_without_an_in_progress_item() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         assert!(current_task_label(&state).is_none());
         state.sticky_todo = Some("[x] Ship the feature\n[ ] Update docs".into());
         assert!(current_task_label(&state).is_none());
@@ -5560,7 +5897,7 @@ mod render_tests {
 
     #[test]
     fn current_task_label_truncates_long_tasks() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         let long_task = "x".repeat(100);
         state.sticky_todo = Some(format!("[~] {long_task}"));
         let label = current_task_label(&state).expect("label present");
@@ -5570,7 +5907,7 @@ mod render_tests {
 
     #[test]
     fn window_title_includes_the_current_task_when_present() {
-        let mut state = TuiState::new(TuiLimits::default());
+        let mut state = TuiState::new(TuiLimits::default(), false);
         state.spinner_verb = "editing";
         assert_eq!(window_title(&state), "vel auto — editing");
         state.sticky_todo = Some("[~] Refactor the parser".into());
@@ -5748,7 +6085,13 @@ mod render_tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_steering_modal(f, area, &long_buffer, &SubmissionState::Editing, true)
+                render_live_input_modal(
+                    f,
+                    area,
+                    &long_buffer,
+                    &SubmissionState::Editing,
+                    ModalKind::Append,
+                )
             })
             .expect("draw");
         let buf = terminal.backend().buffer();
@@ -5784,7 +6127,13 @@ mod render_tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_steering_modal(f, area, "short append", &SubmissionState::Editing, true)
+                render_live_input_modal(
+                    f,
+                    area,
+                    "short append",
+                    &SubmissionState::Editing,
+                    ModalKind::Append,
+                )
             })
             .expect("draw");
         let buf = terminal.backend().buffer();

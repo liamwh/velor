@@ -9,11 +9,11 @@ build = "build.rs"
 # Workspace dependencies
 agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 color-eyre = { workspace = true }
+jiff = { workspace = true }
 diffy = { workspace = true }
 dotenvy = { workspace = true }
 ctrlc = { workspace = true }
@@ -58,9 +58,9 @@ secrecy = { workspace = true }
 rpassword = "7.3"
 atty = "0.2"
 
-# Timezone support (for automations, and for rendering provider-supplied
-# retry/reset times in the user's local zone in `auto` mode)
-chrono-tz = { workspace = true }
+# Timezone name detection (for rendering provider-supplied retry/reset
+# times in the user's local zone in `auto` mode); the resolved IANA name
+# feeds jiff::tz::TimeZone::get.
 iana-time-zone = { workspace = true }
 
 [dev-dependencies]

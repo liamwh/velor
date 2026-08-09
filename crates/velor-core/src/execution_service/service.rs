@@ -77,9 +77,12 @@ impl AgentProfile {
         }
     }
 
-    /// Returns the static capabilities advertised by this profile. Claude reports
-    /// live steering only when its streaming path is enabled; Codex, ACP, and omp
-    /// do not support live steering.
+    /// Returns the static capabilities advertised by this profile. Claude
+    /// reports live steering only when its streaming path is enabled; Codex
+    /// and ACP never support live input. Oh My Pi reports its full native
+    /// surface (steer, follow-up, abort, model/session introspection) when its
+    /// streaming path is enabled — the RPC session speaks all of it over the
+    /// same connection.
     #[must_use]
     pub fn capabilities(&self) -> crate::execution_service::capabilities::AgentCapabilities {
         use crate::execution_service::capabilities::AgentCapabilities;
@@ -91,7 +94,14 @@ impl AgentProfile {
                     AgentCapabilities::none()
                 }
             }
-            Self::Codex(_) | Self::Acp(_) | Self::Omp(_) => AgentCapabilities::none(),
+            Self::Omp(p) => {
+                if p.enable_live_steering {
+                    AgentCapabilities::omp()
+                } else {
+                    AgentCapabilities::none()
+                }
+            }
+            Self::Codex(_) | Self::Acp(_) => AgentCapabilities::none(),
         }
     }
 
@@ -370,7 +380,7 @@ impl AgentExecutionService {
         // receiver travels to the adapter on the worker, the sender stays on the
         // handle so callers can submit [`crate::agent::AgentInput`] commands.
         let capabilities = profile.capabilities();
-        let (input_tx, input_rx) = if capabilities.live_steering {
+        let (input_tx, input_rx) = if capabilities.accepts_live_input() {
             let (tx, rx) = mpsc::channel::<crate::agent::AgentInput>(16);
             (Some(tx), Some(rx))
         } else {

@@ -6,12 +6,11 @@ license = "UNLICENSED"
 
 [dependencies]
 # Workspace dependencies
-chrono = { workspace = true }
-chrono-tz = { workspace = true }
 color-eyre = { workspace = true }
-cron = { workspace = true }
 dirs = "5"
 iana-time-zone = { workspace = true }
+jiff = { workspace = true }
+jiff-cron = "0.3"
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

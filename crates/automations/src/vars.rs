@@ -77,7 +77,7 @@ pub fn merge_automation_vars(
     // Apply built-ins (they override everything - prevents user breaking templates)
     merged.insert("git_root".to_string(), git_root.display().to_string());
     merged.insert("cwd".to_string(), cwd.display().to_string());
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     merged.insert("now".to_string(), now.clone());
     merged.insert("timestamp".to_string(), now); // Alias for now
     merged.insert("iteration".to_string(), "0".to_string()); // Current iteration (0 for single-run)
@@ -310,6 +310,6 @@ mod tests {
 
         let now = merged.get("now").expect("now should be present");
         // Should be a valid RFC3339 timestamp
-        assert!(chrono::DateTime::parse_from_rfc3339(now).is_ok());
+        assert!(now.parse::<jiff::Timestamp>().is_ok());
     }
 }

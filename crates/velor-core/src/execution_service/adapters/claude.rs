@@ -160,9 +160,11 @@ impl ClaudeSubprocessAdapter {
                 reason: LiveSteeringUnavailableReason::ProtocolRejected,
             }
         })?;
-        let text = crate::execution_service::adapters::claude_stream::SteeringText::new(prompt_str)
-            .map_err(|_| AgentExecutionError::LiveSteeringUnavailable {
-                reason: LiveSteeringUnavailableReason::ProtocolRejected,
+        let text =
+            crate::execution_service::steering::SteeringText::new(prompt_str).map_err(|_| {
+                AgentExecutionError::LiveSteeringUnavailable {
+                    reason: LiveSteeringUnavailableReason::ProtocolRejected,
+                }
             })?;
         crate::execution_service::adapters::claude_stream::frame_user_message(&text).map_err(|_| {
             AgentExecutionError::LiveSteeringUnavailable {
@@ -250,8 +252,9 @@ async fn forward_steering(
     cancel: CancellationToken,
 ) {
     use crate::agent::{AgentInput, AgentInputError, SteeringDelivery};
-    use crate::execution_service::adapters::claude_stream::{SteeringText, frame_user_message};
+    use crate::execution_service::adapters::claude_stream::frame_user_message;
     use crate::execution_service::error::LiveSteeringUnavailableReason;
+    use crate::execution_service::steering::SteeringText;
 
     loop {
         let input = tokio::select! {
@@ -262,14 +265,26 @@ async fn forward_steering(
                 None => return, // steering sender dropped
             },
         };
-        let AgentInput::UserMessage {
-            text,
-            acknowledgement,
-        } = input;
-        let ack = deliver(&command_tx, &text, &cancel).await;
-        // If the consumer dropped their acknowledgement receiver, the send fails
-        // harmlessly.
-        let _ = acknowledgement.send(ack);
+        match input {
+            AgentInput::UserMessage {
+                text,
+                acknowledgement,
+                ..
+            } => {
+                let ack = deliver(&command_tx, &text, &cancel).await;
+                // If the consumer dropped their acknowledgement receiver, the
+                // send fails harmlessly.
+                let _ = acknowledgement.send(ack);
+            }
+            // Claude's subprocess adapter has no native abort — only a hard
+            // process kill (handled generically by the caller's cancellation
+            // path). Resolve explicitly rather than silently dropping it.
+            AgentInput::Abort { acknowledgement } => {
+                let _ = acknowledgement.send(Err(AgentInputError::Unavailable {
+                    reason: LiveSteeringUnavailableReason::Unsupported,
+                }));
+            }
+        }
     }
 
     async fn deliver(

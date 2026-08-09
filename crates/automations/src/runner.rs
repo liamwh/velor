@@ -3,10 +3,10 @@
 use crate::config::Automation;
 use crate::file_config::AutomationFile;
 use crate::store::{AutomationRunStatus, AutomationStore};
-use chrono::Utc;
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use color_eyre::eyre::eyre;
+use jiff::Timestamp;
 use secrecy::ExposeSecret;
 use std::path::Path;
 use std::process::Stdio;
@@ -334,12 +334,12 @@ impl AutomationRunner {
     pub async fn run_automation(
         &self,
         automation: &Automation,
-        scheduled_for: chrono::DateTime<Utc>,
+        scheduled_for: Timestamp,
         cancel_token: &CancellationToken,
     ) -> Result<AutomationResult> {
         let _permit = self.semaphore.acquire().await?;
 
-        let started_at = Utc::now();
+        let started_at = Timestamp::now();
 
         // Create run record
         let run_id = self
@@ -492,12 +492,12 @@ impl AutomationRunner {
     pub async fn run_file_automation(
         &self,
         automation: &AutomationFile,
-        scheduled_for: chrono::DateTime<Utc>,
+        scheduled_for: Timestamp,
         cancel_token: &CancellationToken,
     ) -> Result<AutomationResult> {
         let _permit = self.semaphore.acquire().await?;
 
-        let started_at = Utc::now();
+        let started_at = Timestamp::now();
 
         // Create run record
         let run_id = self
@@ -663,7 +663,7 @@ impl AutomationRunner {
         let wt_name = format!(
             "automation-{}-{}",
             automation.name,
-            Utc::now().format("%Y%m%d-%H%M%S")
+            Timestamp::now().strftime("%Y%m%d-%H%M%S")
         );
 
         // Put worktree in a sibling directory to git_root
@@ -1181,8 +1181,8 @@ mod tests {
             name: "test".to_string(),
             description: "Test automation".to_string(),
             schedule_raw: "0 * * * * *".to_string(),
-            schedule: cron::Schedule::from_str("0 * * * * *").unwrap(),
-            timezone: chrono_tz::UTC,
+            schedule: jiff_cron::Schedule::from_str("0 * * * * *").unwrap(),
+            timezone: jiff::tz::TimeZone::UTC,
             prompt_source: crate::file_config::PromptSource::Inline("test prompt".to_string()),
             worktree: false,
             project: None,
@@ -1279,8 +1279,8 @@ mod tests {
             name: "test-worktree".to_string(),
             description: "Test automation".to_string(),
             schedule_raw: "0 * * * * *".to_string(),
-            schedule: cron::Schedule::from_str("0 * * * * *").unwrap(),
-            timezone: chrono_tz::UTC,
+            schedule: jiff_cron::Schedule::from_str("0 * * * * *").unwrap(),
+            timezone: jiff::tz::TimeZone::UTC,
             prompt_source: crate::file_config::PromptSource::Inline("test prompt".to_string()),
             worktree: false,
             project: None,

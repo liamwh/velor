@@ -9,6 +9,7 @@
 //! - System: System utilities
 
 use color_eyre::eyre::WrapErr;
+use jiff::{Timestamp, ToSpan};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -232,7 +233,7 @@ pub struct GeneratePlanRequest {
 }
 
 /// Helper to extract timestamp from an event.
-fn event_timestamp(event: &ExecutionEvent) -> chrono::DateTime<chrono::Utc> {
+fn event_timestamp(event: &ExecutionEvent) -> Timestamp {
     match event {
         ExecutionEvent::StateChanged { timestamp, .. }
         | ExecutionEvent::OutputChunk { timestamp, .. }
@@ -331,8 +332,8 @@ fn to_execution_status_response(
         is_cancelled,
         events: record.events.clone(),
         metrics: record.metrics.clone(),
-        started_at: record.started_at.to_rfc3339(),
-        completed_at: record.ended_at.map(|t| t.to_rfc3339()),
+        started_at: record.started_at.to_string(),
+        completed_at: record.ended_at.map(|t| t.to_string()),
         error: record.error.clone(),
         name: record.name.clone(),
         pinned: record.pinned,
@@ -666,6 +667,7 @@ async fn run_execution_task(
             &[],
             attempt_timeouts,
             tokio_util::sync::CancellationToken::new(),
+            &velor_core::agent::ResumeHandle::default(),
             move |event| {
                 let _ = event_tx_for_runner.send(event);
             },
@@ -1041,7 +1043,7 @@ pub async fn get_automation(
             Ok(runs) => {
                 let recent = runs
                     .iter()
-                    .filter(|r| r.started_at + chrono::Duration::hours(24) > chrono::Utc::now())
+                    .filter(|r| r.started_at + 24_i64.hours() > Timestamp::now())
                     .count() as u32;
 
                 let last_status = runs.first().map(|r| r.status.as_str().to_string());
@@ -2117,7 +2119,7 @@ mod tests {
             is_cancelled: false,
             events: vec![],
             metrics: ExecutionMetrics::default(),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: Timestamp::now().to_string(),
             completed_at: None,
             error: None,
             name: None,

@@ -12,7 +12,7 @@
 
 use std::cmp;
 
-use chrono::{DateTime, Local};
+use jiff::Zoned;
 
 // ── Entry model ──────────────────────────────────────────────────────────────
 
@@ -90,7 +90,7 @@ pub enum EntryKind {
 /// whether to store, coalesce, or drop it.
 #[derive(Debug, Clone)]
 pub struct TuiEntry {
-    pub ts: DateTime<Local>,
+    pub ts: Zoned,
     pub kind: EntryKind,
 }
 
@@ -99,7 +99,7 @@ impl TuiEntry {
     #[must_use]
     pub fn now(kind: EntryKind) -> Self {
         Self {
-            ts: Local::now(),
+            ts: Zoned::now(),
             kind,
         }
     }
@@ -124,7 +124,7 @@ impl EntryId {
 #[derive(Debug, Clone)]
 pub struct LiveEntry {
     pub id: EntryId,
-    pub ts: DateTime<Local>,
+    pub ts: Zoned,
     pub kind: EntryKind,
     /// Increments on each streaming append; part of the layout-cache key.
     pub rev: u64,

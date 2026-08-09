@@ -736,7 +736,7 @@ prompt = "once"
         // The raw schedule should be preserved
         assert_eq!(automations["test"].automation.schedule_raw, "0 9 * * *");
         // But the parsed schedule should work
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let next = automations["test"].automation.next_after(now);
         // Next run should be in the future
         assert!(next > now);

@@ -133,15 +133,46 @@ pub enum AgentInputError {
 /// agent-runner side; adapters forward these to the supervisor's streaming stdin.
 #[derive(Debug)]
 pub enum AgentInput {
-    /// A one-shot user message steering the active session. The acknowledgement
-    /// resolves with the message's [`SteeringDelivery`] (or an
-    /// [`AgentInputError`] if it could not be delivered).
+    /// A one-shot user message: either redirects the active turn now or
+    /// queues a follow-up for after it finishes (see
+    /// [`crate::execution_service::steering::SteeringBehaviour`]). The
+    /// acknowledgement resolves with the message's [`SteeringDelivery`] (or
+    /// an [`AgentInputError`] if it could not be delivered).
     UserMessage {
-        /// The steering text.
-        text: crate::execution_service::adapters::claude_stream::SteeringText,
+        /// The message text.
+        text: crate::execution_service::steering::SteeringText,
+        /// Whether this redirects the active turn or queues after it.
+        behaviour: crate::execution_service::steering::SteeringBehaviour,
         /// Resolves once the message's delivery state is known.
         acknowledgement: oneshot::Sender<Result<SteeringDelivery, AgentInputError>>,
     },
+    /// Natively abort the active turn. Distinct from steering: this carries no
+    /// redirect instruction, it stops the turn. Only forwarded to adapters
+    /// that advertise
+    /// [`crate::execution_service::capabilities::AgentCapabilities::native_abort`].
+    Abort {
+        /// Resolves once the abort's delivery state is known.
+        acknowledgement: oneshot::Sender<Result<SteeringDelivery, AgentInputError>>,
+    },
+}
+
+impl AgentInput {
+    /// Resolves this input's acknowledgement with an `Unavailable` outcome for
+    /// `reason`. Used when the input cannot be delivered at all (no sender, or
+    /// the writer went away) — every variant's acknowledgement has the same
+    /// shape, so this avoids duplicating the match at each call site.
+    fn resolve_unavailable(
+        self,
+        reason: crate::execution_service::error::LiveSteeringUnavailableReason,
+    ) {
+        let ack = match self {
+            Self::UserMessage {
+                acknowledgement, ..
+            } => acknowledgement,
+            Self::Abort { acknowledgement } => acknowledgement,
+        };
+        let _ = ack.send(Err(reason.into()));
+    }
 }
 
 /// Agent runner abstraction across supported providers.
@@ -156,6 +187,51 @@ pub enum AgentRunner {
     /// Oh My Pi CLI via `omp --mode rpc`.
     Omp(OmpConfig),
 }
+
+/// Identity-only mirror of [`AgentRunner`], `Copy` so it can be used as a
+/// cheap key in `HashMap<AgentRunnerKind, String>` for native-session tracking
+/// across a `vel auto` run. The extensibility point for model-switching: a 5th
+/// runner adds one arm to each method below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentRunnerKind {
+    /// Claude subprocess with stream-json.
+    ClaudeSubprocess,
+    /// Claude ACP.
+    ClaudeAcp,
+    /// Codex CLI.
+    Codex,
+    /// Oh My Pi CLI.
+    Omp,
+}
+
+/// A handle to a provider-native session that can be resumed by id. Passed as
+/// a trailing parameter to `build_profile`/`run`/`run_with_events`/
+/// `run_with_events_and_steering` so the caller can carry a session id across
+/// retries or provider switches. `None` (the default) means a fresh session.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeHandle {
+    /// The provider-native session id to resume (Claude `--resume`, Codex
+    /// `resume`, Oh My Pi `--resume`).
+    pub session_id: Option<String>,
+}
+
+impl ResumeHandle {
+    /// Creates a handle from an optional session id.
+    #[must_use]
+    pub fn new(session_id: Option<String>) -> Self {
+        Self { session_id }
+    }
+
+    /// Creates a handle that starts a fresh session (no resume).
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self { session_id: None }
+    }
+}
+
+/// Grace window for a best-effort native abort (e.g. Oh My Pi's `abort` RPC
+/// command) to be acknowledged before falling back to a hard process kill.
+const NATIVE_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl AgentRunner {
     /// Creates a new runner from provider + protocol configuration.
@@ -213,6 +289,62 @@ impl AgentRunner {
         matches!(self, Self::Omp(_))
     }
 
+    /// Returns the static session-operation capabilities this runner
+    /// supports, independent of whether any particular call wires a live-
+    /// input channel. Drives whether the TUI offers steer/follow-up/native-
+    /// abort affordances at all — [`Self::run`]/[`Self::run_with_events`]
+    /// never enable live input regardless of this; only
+    /// [`Self::run_with_events_and_steering`] does, and only when the caller
+    /// passes a receiver.
+    #[must_use]
+    pub const fn capabilities(&self) -> crate::execution_service::capabilities::AgentCapabilities {
+        use crate::execution_service::capabilities::AgentCapabilities;
+        match self {
+            Self::ClaudeSubprocess => AgentCapabilities::with_live_steering(),
+            Self::Omp(_) => AgentCapabilities::omp(),
+            // Codex supports native resume (`resume` subcommand) but no live
+            // steering/persistent session.
+            Self::Codex(_) => AgentCapabilities {
+                native_resume: true,
+                ..AgentCapabilities::none()
+            },
+            Self::ClaudeAcp(_) => AgentCapabilities::none(),
+        }
+    }
+
+    /// Returns the [`AgentRunnerKind`] identity of this runner, `Copy` so it
+    /// can be used as a cheap `HashMap` key or match discriminant without
+    /// cloning the full config.
+    #[must_use]
+    pub const fn kind(&self) -> AgentRunnerKind {
+        match self {
+            Self::ClaudeSubprocess => AgentRunnerKind::ClaudeSubprocess,
+            Self::ClaudeAcp(_) => AgentRunnerKind::ClaudeAcp,
+            Self::Codex(_) => AgentRunnerKind::Codex,
+            Self::Omp(_) => AgentRunnerKind::Omp,
+        }
+    }
+
+    /// Returns `true` if this runner's provider supports resuming a previously
+    /// created native session by id (Claude `--resume`, Codex `resume`,
+    /// Oh My Pi `--resume`). ACP does not.
+    #[must_use]
+    pub const fn supports_native_resume(&self) -> bool {
+        self.capabilities().native_resume
+    }
+
+    /// Returns the configured model override for this runner, if any. Omp and
+    /// Codex carry one in their config structs; Claude subprocess and ACP do
+    /// not (the binary's own default applies).
+    #[must_use]
+    pub fn configured_model(&self) -> Option<&str> {
+        match self {
+            Self::Omp(cfg) => cfg.model.as_deref(),
+            Self::Codex(cfg) => cfg.model.as_deref(),
+            Self::ClaudeSubprocess | Self::ClaudeAcp(_) => None,
+        }
+    }
+
     /// Builds the execution profile for this runner variant.
     #[allow(clippy::too_many_arguments)]
     fn build_profile(
@@ -226,6 +358,7 @@ impl AgentRunner {
         timeouts: ProcessTimeouts,
         cancellation: CancellationToken,
         enable_live_steering: bool,
+        resume: &ResumeHandle,
     ) -> AgentProfile {
         match self {
             Self::ClaudeSubprocess => AgentProfile::Claude(ClaudeParams {
@@ -234,7 +367,7 @@ impl AgentRunner {
                 prompt: Bytes::copy_from_slice(prompt.as_bytes()),
                 working_directory: cwd.to_path_buf(),
                 model: None,
-                resume_session: None,
+                resume_session: resume.session_id.clone(),
                 extra_args: Vec::new(),
                 extra_env: Vec::new(),
                 timeouts,
@@ -247,7 +380,7 @@ impl AgentRunner {
                 working_directory: cwd.to_path_buf(),
                 config: config.clone(),
                 images: images.to_vec(),
-                resume_session: None,
+                resume_session: resume.session_id.clone(),
                 extra_args: Vec::new(),
                 extra_env: Vec::new(),
                 timeouts,
@@ -266,10 +399,12 @@ impl AgentRunner {
                 prompt: Bytes::copy_from_slice(prompt.as_bytes()),
                 working_directory: cwd.to_path_buf(),
                 config: config.clone(),
+                resume_session: resume.session_id.clone(),
                 extra_args: Vec::new(),
                 extra_env: Vec::new(),
                 timeouts,
                 cancellation,
+                enable_live_steering,
             }),
         }
     }
@@ -283,8 +418,6 @@ impl AgentRunner {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentExecutionError`] on any failure (process, protocol,
-    /// provider, cancellation, deadline).
     pub async fn run(
         &self,
         binary: &str,
@@ -294,6 +427,7 @@ impl AgentRunner {
         cwd: &Path,
         timeouts: ProcessTimeouts,
         cancellation: CancellationToken,
+        resume: &ResumeHandle,
     ) -> Result<ClaudeRunResult, AgentExecutionError> {
         let profile = self.build_profile(
             binary,
@@ -305,6 +439,7 @@ impl AgentRunner {
             timeouts,
             cancellation,
             false,
+            resume,
         );
         let execution = shared_service().execute(profile).await?;
         let report = execution.complete().await?;
@@ -319,8 +454,6 @@ impl AgentRunner {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentExecutionError`] if provider execution fails.
-    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_events<F>(
         &self,
         binary: &str,
@@ -331,6 +464,7 @@ impl AgentRunner {
         images: &[PathBuf],
         timeouts: ProcessTimeouts,
         cancellation: CancellationToken,
+        resume: &ResumeHandle,
         mut on_event: F,
     ) -> Result<AgentRunResult, AgentExecutionError>
     where
@@ -346,6 +480,7 @@ impl AgentRunner {
             timeouts,
             cancellation,
             false,
+            resume,
         );
         let mut execution = shared_service().execute(profile).await?;
         while let Some(event) = execution.next_event().await {
@@ -366,8 +501,6 @@ impl AgentRunner {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentExecutionError`] if provider execution fails.
-    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_events_and_steering<F>(
         &self,
         binary: &str,
@@ -379,6 +512,7 @@ impl AgentRunner {
         timeouts: ProcessTimeouts,
         cancellation: CancellationToken,
         steering: &mut Option<tokio::sync::mpsc::Receiver<AgentInput>>,
+        resume: &ResumeHandle,
         mut on_event: F,
     ) -> Result<AgentRunResult, AgentExecutionError>
     where
@@ -398,6 +532,7 @@ impl AgentRunner {
             timeouts,
             cancellation.clone(),
             enable_live_steering,
+            resume,
         );
         let mut execution = shared_service().execute(profile).await?;
         let capabilities = execution.capabilities();
@@ -409,6 +544,25 @@ impl AgentRunner {
                 biased;
 
                 _ = cancellation.cancelled() => {
+                    // Best-effort: ask the provider to natively abort the
+                    // active turn before falling back to a hard process kill.
+                    // Bounded so a wedged provider can never block shutdown —
+                    // `execution.cancel()` below is the guaranteed fallback
+                    // regardless of whether this succeeds or even runs.
+                    if capabilities.native_abort
+                        && let Some(tx) = input_tx.clone()
+                    {
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        if tx
+                            .send(AgentInput::Abort {
+                                acknowledgement: ack_tx,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            let _ = tokio::time::timeout(NATIVE_ABORT_GRACE, ack_rx).await;
+                        }
+                    }
                     let report = execution.cancel().await?;
                     return Ok(report.result);
                 }
@@ -421,7 +575,7 @@ impl AgentRunner {
                         Some(rx) => rx.recv().await,
                         None => None,
                     }
-                }, if steering_open && capabilities.live_steering => {
+                }, if steering_open && capabilities.accepts_live_input() => {
                     match input {
                         Some(agent_input) => {
                             // Relay on a separate task so a slow/full input
@@ -456,27 +610,16 @@ impl AgentRunner {
 async fn relay_steering(input: AgentInput, sender: Option<tokio::sync::mpsc::Sender<AgentInput>>) {
     use crate::execution_service::error::LiveSteeringUnavailableReason;
     match sender {
-        Some(tx) => match tx.send(input).await {
-            Ok(()) => {} // the adapter resolves the acknowledgement.
-            Err(err) => {
+        Some(tx) => {
+            if let Err(err) = tx.send(input).await {
                 // The writer is gone (process closing/terminated). Recover the
                 // input and resolve its acknowledgement ourselves.
-                let AgentInput::UserMessage {
-                    acknowledgement, ..
-                } = err.0;
-                let _ = acknowledgement.send(Err(AgentInputError::Unavailable {
-                    reason: LiveSteeringUnavailableReason::StdinClosed,
-                }));
+                err.0
+                    .resolve_unavailable(LiveSteeringUnavailableReason::StdinClosed);
             }
-        },
-        None => {
-            let AgentInput::UserMessage {
-                acknowledgement, ..
-            } = input;
-            let _ = acknowledgement.send(Err(AgentInputError::Unavailable {
-                reason: LiveSteeringUnavailableReason::Inactive,
-            }));
+            // On success the adapter resolves the acknowledgement.
         }
+        None => input.resolve_unavailable(LiveSteeringUnavailableReason::Inactive),
     }
 }
 
@@ -604,8 +747,8 @@ mod tests {
     async fn relay_resolves_inactive_when_no_sender() {
         let (ack_tx, ack_rx) = oneshot::channel();
         let input = AgentInput::UserMessage {
-            text: crate::execution_service::adapters::claude_stream::SteeringText::new("hi")
-                .unwrap(),
+            text: crate::execution_service::steering::SteeringText::new("hi").unwrap(),
+            behaviour: crate::execution_service::steering::SteeringBehaviour::Steer,
             acknowledgement: ack_tx,
         };
         relay_steering(input, None).await;
@@ -624,8 +767,28 @@ mod tests {
         drop(rx); // the adapter's receiver is gone → send fails
         let (ack_tx, ack_rx) = oneshot::channel();
         let input = AgentInput::UserMessage {
-            text: crate::execution_service::adapters::claude_stream::SteeringText::new("hi")
-                .unwrap(),
+            text: crate::execution_service::steering::SteeringText::new("hi").unwrap(),
+            behaviour: crate::execution_service::steering::SteeringBehaviour::Steer,
+            acknowledgement: ack_tx,
+        };
+        relay_steering(input, Some(tx)).await;
+        let result = ack_rx.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(AgentInputError::Unavailable {
+                reason: crate::execution_service::error::LiveSteeringUnavailableReason::StdinClosed
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_resolves_abort_stdin_closed_when_writer_dropped() {
+        // Abort shares the same delivery plumbing as UserMessage — verify it
+        // is not silently dropped or mismatched to the wrong ack.
+        let (tx, rx) = tokio::sync::mpsc::channel::<AgentInput>(1);
+        drop(rx);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let input = AgentInput::Abort {
             acknowledgement: ack_tx,
         };
         relay_steering(input, Some(tx)).await;
@@ -643,17 +806,59 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentInput>(1);
         let (ack_tx, mut ack_rx) = oneshot::channel();
         let input = AgentInput::UserMessage {
-            text: crate::execution_service::adapters::claude_stream::SteeringText::new("hi")
-                .unwrap(),
+            text: crate::execution_service::steering::SteeringText::new("hi").unwrap(),
+            behaviour: crate::execution_service::steering::SteeringBehaviour::FollowUp,
             acknowledgement: ack_tx,
         };
         relay_steering(input, Some(tx)).await;
         // The input reaches the receiver; the relay does not resolve the ack on
         // success (the adapter owns that).
-        assert!(matches!(
-            rx.recv().await.unwrap(),
-            AgentInput::UserMessage { .. }
-        ));
+        match rx.recv().await.unwrap() {
+            AgentInput::UserMessage { behaviour, .. } => assert_eq!(
+                behaviour,
+                crate::execution_service::steering::SteeringBehaviour::FollowUp
+            ),
+            AgentInput::Abort { .. } => panic!("expected UserMessage, got Abort"),
+        }
         assert!(ack_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn capabilities_reflect_only_natively_supported_operations() {
+        use crate::execution_service::capabilities::AgentCapabilities;
+
+        assert_eq!(
+            AgentRunner::ClaudeSubprocess.capabilities(),
+            AgentCapabilities::with_live_steering()
+        );
+        assert_eq!(
+            AgentRunner::Omp(OmpConfig::default()).capabilities(),
+            AgentCapabilities::omp()
+        );
+        // Codex supports native resume but not live steering/persistent session.
+        let codex_caps = AgentRunner::Codex(CodexConfig::default()).capabilities();
+        assert!(codex_caps.native_resume, "Codex supports native resume");
+        assert!(!codex_caps.live_steering);
+        assert!(!codex_caps.persistent_session);
+        assert_eq!(
+            AgentRunner::ClaudeAcp(AcpConfig::default()).capabilities(),
+            AgentCapabilities::none()
+        );
+    }
+
+    #[test]
+    fn omp_capabilities_advertise_steer_follow_up_and_native_abort_distinctly() {
+        let caps = AgentRunner::Omp(OmpConfig::default()).capabilities();
+        assert!(caps.live_steering, "omp supports steering");
+        assert!(caps.follow_up, "omp supports follow-up, unlike Claude");
+        assert!(
+            caps.native_abort,
+            "omp supports native abort, unlike Claude"
+        );
+        // Claude's streaming path never advertises follow-up or native abort —
+        // a provider without native support must not be falsely emulated.
+        let claude_caps = AgentRunner::ClaudeSubprocess.capabilities();
+        assert!(!claude_caps.follow_up);
+        assert!(!claude_caps.native_abort);
     }
 }

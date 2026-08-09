@@ -7,10 +7,10 @@
 //! - Structured lifecycle replies back to Telegram (interaction layer)
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use clap::{ArgAction, Args};
 use color_eyre::eyre::{WrapErr, eyre};
 use dirs::home_dir;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -554,7 +554,7 @@ struct ServeContext {
     session_store: Arc<Mutex<SessionResumeStore>>,
     session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     active_runs: Arc<Mutex<ActiveRunRegistry>>,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 }
 
 /// In-memory replay protection cache keyed by Telegram update ID.
@@ -621,7 +621,7 @@ struct ActiveRunEntry {
     session: Option<RunnerSessionHandle>,
     message_ids: HashSet<i32>,
     abort_handle: AbortHandle,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -710,7 +710,7 @@ impl ActiveRunRegistry {
         entry.abort_handle.abort();
         self.remove_request(&entry.request_id);
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         ActiveRunReplyResolution::Interrupted(ActiveRunInterrupt {
             interrupted_request_id: entry.request_id.clone(),
             binding: SessionMessageBinding {
@@ -813,7 +813,7 @@ impl SessionResumeStore {
             return Ok(0);
         }
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         for message_id in message_ids {
             let key = SessionMessageKey {
                 chat_id: template.chat_id,
@@ -894,7 +894,7 @@ struct ExecutionSource {
 #[derive(Debug, Clone)]
 struct ExecutionRequest {
     request_id: String,
-    received_at: DateTime<Utc>,
+    received_at: Timestamp,
     source: ExecutionSource,
     runner_name: String,
     mode: ExecutionMode,
@@ -1052,8 +1052,8 @@ struct SessionMessageBinding {
     invocation: RunnerInvocationMetadata,
     request_id: String,
     source_user_message_id: Option<i32>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
 }
 
 /// Durable on-disk file format for session bindings.
@@ -1157,7 +1157,7 @@ struct ExecutionRawRequestMetadata {
     runner_kind: RunnerKind,
     mode: &'static str,
     attachment_count: usize,
-    received_at: DateTime<Utc>,
+    received_at: Timestamp,
 }
 
 /// Optional diagnostic details for operator debugging.
@@ -1190,7 +1190,7 @@ struct ExecutionResultSummary {
 /// Timestamped runner progress event retained for raw logs and semantic summary building.
 #[derive(Debug, Clone, Serialize)]
 struct RunnerProgressEventRecord {
-    at: DateTime<Utc>,
+    at: Timestamp,
     event: RunnerProgressEvent,
 }
 
@@ -1209,7 +1209,7 @@ struct ExecutionResultCollector {
 impl ExecutionResultCollector {
     fn ingest(&mut self, event: &RunnerProgressEvent) {
         self.events.push(RunnerProgressEventRecord {
-            at: Utc::now(),
+            at: Timestamp::now(),
             event: event.clone(),
         });
 
@@ -2007,7 +2007,7 @@ pub async fn run_serve(
         session_store: Arc::new(Mutex::new(session_store)),
         session_locks: Arc::new(Mutex::new(HashMap::new())),
         active_runs: Arc::new(Mutex::new(ActiveRunRegistry::default())),
-        started_at: Utc::now(),
+        started_at: Timestamp::now(),
     });
 
     info!(
@@ -2779,7 +2779,7 @@ async fn handle_update(ctx: Arc<ServeContext>, update: Update) -> color_eyre::ey
                     session: initial_session,
                     message_ids: HashSet::new(),
                     abort_handle,
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                 });
             }
             Ok(())
@@ -2876,11 +2876,15 @@ fn build_execution_request(
     inbound: &InboundMessage,
     execution: PendingExecution,
 ) -> ExecutionRequest {
-    let request_id = format!("tg-{}-{}", inbound.update_id, Utc::now().timestamp_millis());
+    let request_id = format!(
+        "tg-{}-{}",
+        inbound.update_id,
+        Timestamp::now().as_millisecond()
+    );
 
     ExecutionRequest {
         request_id,
-        received_at: Utc::now(),
+        received_at: Timestamp::now(),
         source: ExecutionSource {
             transport: "telegram",
             chat_id: inbound.chat_id,
@@ -3103,8 +3107,8 @@ async fn process_execution_request(
         outcome
     };
 
-    let elapsed = Utc::now() - request.received_at;
-    let elapsed_secs = elapsed.num_seconds().max(0) as u64;
+    let elapsed = Timestamp::now().duration_since(request.received_at);
+    let elapsed_secs = elapsed.as_secs().max(0) as u64;
     let after_git = capture_git_snapshot(&ctx.cwd);
 
     let mut completed_execution: Option<RunnerExecution> = None;
@@ -4406,7 +4410,7 @@ async fn persist_session_bindings_for_run(
         return Ok(());
     }
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let binding_template = SessionMessageBinding {
         chat_id: request.source.chat_id,
         message_id: message_ids[0],
@@ -4555,10 +4559,10 @@ fn build_models_message(cfg: &ServeResolvedConfig) -> String {
 }
 
 async fn build_status_message(ctx: &ServeContext) -> String {
-    let uptime = Utc::now() - ctx.started_at;
+    let uptime = Timestamp::now().duration_since(ctx.started_at);
     let mut lines = Vec::new();
     lines.push("Service status:".to_string());
-    lines.push(format!("- uptime: {}s", uptime.num_seconds().max(0)));
+    lines.push(format!("- uptime: {}s", uptime.as_secs().max(0)));
     lines.push(format!("- cwd: {}", ctx.cwd.display()));
     lines.push(format!(
         "- allowed chats: {}",
@@ -5640,7 +5644,7 @@ mod tests {
                 runner_kind: RunnerKind::Codex,
                 mode: "new",
                 attachment_count: 0,
-                received_at: Utc::now(),
+                received_at: Timestamp::now(),
             },
             diagnostics: Some(ExecutionDiagnostics {
                 first_error: if status == ExecutionSummaryStatus::Completed {
@@ -6060,7 +6064,7 @@ mod tests {
                 runner_kind: RunnerKind::Codex,
                 mode: "new",
                 attachment_count: 0,
-                received_at: Utc::now(),
+                received_at: Timestamp::now(),
             },
             runner_description: "test".to_string(),
             terminal_state: RunTerminalState::Completed,
@@ -6068,7 +6072,7 @@ mod tests {
             prompt: "hello".to_string(),
             attachments: Vec::new(),
             progress_events: vec![RunnerProgressEventRecord {
-                at: Utc::now(),
+                at: Timestamp::now(),
                 event: RunnerProgressEvent::SessionBound {
                     session: RunnerSessionHandle::Codex {
                         session_id: "thread-1".to_string(),
@@ -6248,8 +6252,8 @@ mod tests {
             },
             request_id: "r1".to_string(),
             source_user_message_id: Some(10),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         let msg = InboundMessage {
             update_id: 1,
@@ -6306,8 +6310,8 @@ mod tests {
             },
             request_id: "r2".to_string(),
             source_user_message_id: Some(10),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         let msg = InboundMessage {
             update_id: 1,
@@ -6406,7 +6410,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let abort_handle = task.abort_handle();
-        let started_at = Utc::now();
+        let started_at = Timestamp::now();
 
         registry.register(ActiveRunEntry {
             request_id: "active-1".to_string(),
@@ -6469,7 +6473,7 @@ mod tests {
             session: None,
             message_ids: HashSet::new(),
             abort_handle,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
         });
         registry.sync_messages("active-2", &[333]);
 
@@ -6490,7 +6494,7 @@ mod tests {
     fn validate_resume_rejects_unresumable_runner() {
         let request = ExecutionRequest {
             request_id: "r3".to_string(),
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             source: ExecutionSource {
                 transport: "telegram",
                 chat_id: 1,
@@ -6517,8 +6521,8 @@ mod tests {
                     },
                     request_id: "seed".to_string(),
                     source_user_message_id: Some(100),
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
                 },
             },
             prompt: "continue".to_string(),
@@ -6560,7 +6564,7 @@ mod tests {
         let path = temp.path().join("session-store.json");
         let mut store =
             SessionResumeStore::load(path.clone(), 100).expect("session store should initialize");
-        let now = Utc::now();
+        let now = Timestamp::now();
         let template = SessionMessageBinding {
             chat_id: -100,
             message_id: 1,
@@ -6642,7 +6646,7 @@ printf '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}\n
 
         let request = ExecutionRequest {
             request_id: "r1".to_string(),
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             source: ExecutionSource {
                 transport: "telegram",
                 chat_id: 1,
@@ -6738,7 +6742,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"resumed-
 
         let request = ExecutionRequest {
             request_id: "r1-resume".to_string(),
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             source: ExecutionSource {
                 transport: "telegram",
                 chat_id: 1,
@@ -6765,8 +6769,8 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"resumed-
                     },
                     request_id: "seed".to_string(),
                     source_user_message_id: Some(1),
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
                 },
             },
             prompt: "resume this".to_string(),
@@ -6841,7 +6845,7 @@ exit 42
 
         let request = ExecutionRequest {
             request_id: "r1-expired".to_string(),
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             source: ExecutionSource {
                 transport: "telegram",
                 chat_id: 1,
@@ -6868,8 +6872,8 @@ exit 42
                     },
                     request_id: "seed".to_string(),
                     source_user_message_id: Some(1),
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
                 },
             },
             prompt: "resume this".to_string(),
@@ -6942,7 +6946,7 @@ printf '{"type":"content_block_delta","delta":{"text":"claude-ok"}}\n'
 
         let request = ExecutionRequest {
             request_id: "r2".to_string(),
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             source: ExecutionSource {
                 transport: "telegram",
                 chat_id: 1,
@@ -7032,7 +7036,7 @@ printf '{"type":"content_block_delta","delta":{"text":"resumed-claude-ok"}}\n'
 
         let request = ExecutionRequest {
             request_id: "r2-resume".to_string(),
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             source: ExecutionSource {
                 transport: "telegram",
                 chat_id: 1,
@@ -7059,8 +7063,8 @@ printf '{"type":"content_block_delta","delta":{"text":"resumed-claude-ok"}}\n'
                     },
                     request_id: "seed".to_string(),
                     source_user_message_id: Some(1),
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
                 },
             },
             prompt: "resume this".to_string(),

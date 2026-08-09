@@ -154,7 +154,10 @@ pub async fn run_list(
         );
         println!("  Description: {}", entry.automation.description);
         println!("  Schedule: {}", entry.automation.schedule_raw);
-        println!("  Timezone: {}", entry.automation.timezone);
+        println!(
+            "  Timezone: {}",
+            entry.automation.timezone.iana_name().unwrap_or("unknown")
+        );
         println!(
             "  Status: {}",
             if entry.automation.enabled {
@@ -336,7 +339,7 @@ pub async fn run_run(
     );
 
     // Use current time as scheduled_for (since we're running immediately)
-    let scheduled_for = chrono::Utc::now();
+    let scheduled_for = jiff::Timestamp::now();
 
     // Get the cancel token
     let (_cancel_handler, cancel_token) = crate::cancellation::CancellationHandler::new();
@@ -346,7 +349,12 @@ pub async fn run_run(
         name: entry.automation.name.clone(),
         description: entry.automation.description.clone(),
         schedule: entry.automation.schedule_raw.clone(),
-        timezone: entry.automation.timezone.to_string(),
+        timezone: entry
+            .automation
+            .timezone
+            .iana_name()
+            .unwrap_or("UTC")
+            .to_string(),
         prompt: prompt_content.clone(), // Use resolved prompt content
         enabled: entry.automation.enabled,
         vars: merged_vars,
@@ -447,14 +455,17 @@ pub async fn run_status(
         println!("  Automation: {}", run.automation_name);
         println!(
             "  Scheduled: {}",
-            run.scheduled_for.format("%Y-%m-%d %H:%M:%S UTC")
+            run.scheduled_for.strftime("%Y-%m-%d %H:%M:%S UTC")
         );
         println!(
             "  Started: {}",
-            run.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+            run.started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
         );
         if let Some(completed) = run.completed_at {
-            println!("  Completed: {}", completed.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!(
+                "  Completed: {}",
+                completed.strftime("%Y-%m-%d %H:%M:%S UTC")
+            );
         }
         println!("  Status: {}", run.status.as_str());
         println!("  Iterations: {}", run.iterations_completed);
@@ -552,11 +563,11 @@ pub async fn run_tick(home_cfg: FileConfig, _git_root: PathBuf) -> color_eyre::e
                 .collect()
         };
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let project_count = projects.len();
     tracing::info!(
         "Tick started at {} for {} project(s)",
-        now.format("%Y-%m-%d %H:%M:%S UTC"),
+        now.strftime("%Y-%m-%d %H:%M:%S UTC"),
         project_count
     );
 
@@ -605,7 +616,7 @@ async fn process_project_tick(
     project: &velor_automations::ProjectEntry,
     global_cfg: &FileConfig,
     home_cfg: &FileConfig,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> color_eyre::eyre::Result<()> {
     let git_root = &project.path;
 
@@ -784,12 +795,12 @@ pub async fn run_daemon(
         }
 
         tick_count += 1;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         println!(
             "🕐 Tick #{} at {}",
             tick_count,
-            now.format("%Y-%m-%d %H:%M:%S UTC")
+            now.strftime("%Y-%m-%d %H:%M:%S UTC")
         );
 
         // Process all automations using shared tick logic
@@ -833,7 +844,7 @@ async fn process_automations_tick(
     cancel_token: &tokio_util::sync::CancellationToken,
     home_cfg: &FileConfig,
     git_root: &Path,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> color_eyre::eyre::Result<()> {
     for entry in enabled_automations {
         // Get last run time for this automation
@@ -842,7 +853,7 @@ async fn process_automations_tick(
         // Calculate next scheduled time (timezone is already Tz)
         match velor_automations::Scheduler::new(
             &entry.automation.schedule_raw,
-            entry.automation.timezone,
+            entry.automation.timezone.clone(),
         ) {
             Ok(scheduler) => {
                 // Determine which runs to execute based on catch-up policy
@@ -876,7 +887,7 @@ async fn process_automations_tick(
                     tracing::debug!(
                         "  ⏸️  Skipping '{}' (next run at {})",
                         entry.automation.name,
-                        scheduler.next_after(last_run).format("%Y-%m-%d %H:%M:%S")
+                        scheduler.next_after(last_run).strftime("%Y-%m-%d %H:%M:%S")
                     );
                     continue;
                 }
@@ -927,7 +938,12 @@ async fn process_automations_tick(
                     name: entry.automation.name.clone(),
                     description: entry.automation.description.clone(),
                     schedule: entry.automation.schedule_raw.clone(),
-                    timezone: entry.automation.timezone.to_string(),
+                    timezone: entry
+                        .automation
+                        .timezone
+                        .iana_name()
+                        .unwrap_or("UTC")
+                        .to_string(),
                     prompt: prompt_content,
                     enabled: entry.automation.enabled,
                     vars: merged_vars,
@@ -940,7 +956,10 @@ async fn process_automations_tick(
 
                 // Execute each scheduled run
                 for scheduled_for in runs_to_execute {
-                    println!("      - Scheduled for {}", scheduled_for.format("%H:%M:%S"));
+                    println!(
+                        "      - Scheduled for {}",
+                        scheduled_for.strftime("%H:%M:%S")
+                    );
 
                     match runner
                         .run_automation(&automation, scheduled_for, cancel_token)
@@ -980,8 +999,8 @@ async fn process_automations_tick(
 async fn get_last_run_time(
     store: &AutomationStore,
     automation_name: &str,
-    default: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
+    default: jiff::Timestamp,
+) -> jiff::Timestamp {
     // Query the store for the most recent run
     match store.get_runs(Some(automation_name), 1).await {
         Ok(runs) if !runs.is_empty() => {

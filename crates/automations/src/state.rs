@@ -5,10 +5,10 @@
 //! that the same scheduled run can never be executed twice, even if tick is invoked
 //! concurrently or the process crashes mid-execution.
 
-use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use color_eyre::eyre::eyre;
+use jiff::{Span, Timestamp};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use std::path::Path;
 use std::str::FromStr;
@@ -152,12 +152,12 @@ impl AutomationState {
     pub async fn try_start_run(
         &self,
         name: &str,
-        scheduled_for: DateTime<Utc>,
-        stale_timeout: chrono::Duration,
+        scheduled_for: Timestamp,
+        stale_timeout: Span,
     ) -> Result<i64> {
-        let scheduled_str = scheduled_for.to_rfc3339();
-        let started_at = Utc::now().to_rfc3339();
-        let now = Utc::now();
+        let scheduled_str = scheduled_for.to_string();
+        let started_at = Timestamp::now().to_string();
+        let now = Timestamp::now();
         let stale_cutoff = now - stale_timeout;
 
         // Try to insert - UNIQUE constraint prevents duplicates
@@ -178,9 +178,8 @@ impl AutomationState {
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // Check if there's a stale running run
                 if let Some((id, started_at_str)) = self.get_run_info(name, scheduled_for).await?
-                    && let Ok(started) = DateTime::parse_from_rfc3339(&started_at_str)
+                    && let Ok(started) = started_at_str.parse::<Timestamp>()
                 {
-                    let started = started.with_timezone(&Utc);
                     if started < stale_cutoff {
                         // Stale run - allow retry by updating it
                         sqlx::query(
@@ -214,7 +213,7 @@ impl AutomationState {
     ///
     /// Returns an error if the database operation fails.
     pub async fn complete_run(&self, id: i64) -> Result<()> {
-        let finished_at = Utc::now().to_rfc3339();
+        let finished_at = Timestamp::now().to_string();
         sqlx::query("UPDATE runs SET status = ?1, finished_at = ?2 WHERE id = ?3")
             .bind(RunStatus::Completed.as_str())
             .bind(&finished_at)
@@ -231,7 +230,7 @@ impl AutomationState {
     ///
     /// Returns an error if the database operation fails.
     pub async fn fail_run(&self, id: i64, error: &str) -> Result<()> {
-        let finished_at = Utc::now().to_rfc3339();
+        let finished_at = Timestamp::now().to_string();
         sqlx::query(
             "UPDATE runs SET status = ?1, finished_at = ?2, error_message = ?3 WHERE id = ?4",
         )
@@ -252,7 +251,7 @@ impl AutomationState {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub async fn get_last_completed_run(&self, name: &str) -> Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_completed_run(&self, name: &str) -> Result<Option<Timestamp>> {
         let row = sqlx::query_as::<_, (String,)>(
             "SELECT scheduled_for FROM runs
              WHERE automation_name = ?1 AND status = ?2
@@ -267,10 +266,10 @@ impl AutomationState {
 
         match row {
             Some((s,)) => {
-                let dt = DateTime::parse_from_rfc3339(&s)
-                    .wrap_err("Failed to parse scheduled_for timestamp")?
-                    .with_timezone(&Utc);
-                Ok(Some(dt))
+                let ts = s
+                    .parse::<Timestamp>()
+                    .wrap_err("Failed to parse scheduled_for timestamp")?;
+                Ok(Some(ts))
             }
             None => Ok(None),
         }
@@ -286,9 +285,9 @@ impl AutomationState {
     async fn get_run_info(
         &self,
         name: &str,
-        scheduled_for: DateTime<Utc>,
+        scheduled_for: Timestamp,
     ) -> Result<Option<(i64, String)>> {
-        let scheduled_str = scheduled_for.to_rfc3339();
+        let scheduled_str = scheduled_for.to_string();
 
         let row = sqlx::query_as::<_, (i64, String)>(
             "SELECT id, started_at FROM runs
@@ -307,6 +306,7 @@ impl AutomationState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::ToSpan;
     use sqlx::Row;
 
     #[test]
@@ -354,10 +354,10 @@ mod tests {
         let state = AutomationState::open(&db_path)
             .await
             .expect("state should be created");
-        let scheduled_for = Utc::now();
+        let scheduled_for = Timestamp::now();
 
         let result = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await
             .expect("start_run should succeed");
 
@@ -372,14 +372,14 @@ mod tests {
         let state = AutomationState::open(&db_path)
             .await
             .expect("state should be created");
-        let scheduled_for = Utc::now();
+        let scheduled_for = Timestamp::now();
 
         let result1 = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await
             .expect("first start_run should succeed");
         let result2 = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await;
 
         assert!(result1 > 0);
@@ -394,18 +394,18 @@ mod tests {
         let state = AutomationState::open(&db_path)
             .await
             .expect("state should be created");
-        let scheduled_for = Utc::now();
+        let scheduled_for = Timestamp::now();
 
         // Start a run
         let id1 = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await
             .expect("first start_run should succeed");
 
         // Manually set started_at to be in the past (stale)
-        let stale_time = Utc::now() - chrono::Duration::hours(3);
+        let stale_time = Timestamp::now() - 3_i64.hours();
         sqlx::query("UPDATE runs SET started_at = ?1 WHERE id = ?2")
-            .bind(stale_time.to_rfc3339())
+            .bind(stale_time.to_string())
             .bind(id1)
             .execute(&state.pool)
             .await
@@ -413,7 +413,7 @@ mod tests {
 
         // Try to start again - should succeed due to stale run
         let id2 = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await
             .expect("second start_run should succeed with stale retry");
 
@@ -429,10 +429,10 @@ mod tests {
         let state = AutomationState::open(&db_path)
             .await
             .expect("state should be created");
-        let scheduled_for = Utc::now();
+        let scheduled_for = Timestamp::now();
 
         let id = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await
             .expect("start_run should succeed");
 
@@ -474,10 +474,10 @@ mod tests {
         let state = AutomationState::open(&db_path)
             .await
             .expect("state should be created");
-        let scheduled_for = Utc::now();
+        let scheduled_for = Timestamp::now();
 
         let id = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await
             .expect("start_run should succeed");
 
@@ -538,20 +538,20 @@ mod tests {
             .expect("state should be created");
 
         // Create multiple runs at different times
-        let scheduled1 = Utc::now() - chrono::Duration::hours(3);
-        let scheduled2 = Utc::now() - chrono::Duration::hours(2);
-        let scheduled3 = Utc::now() - chrono::Duration::hours(1);
+        let scheduled1 = Timestamp::now() - 3_i64.hours();
+        let scheduled2 = Timestamp::now() - 2_i64.hours();
+        let scheduled3 = Timestamp::now() - 1_i64.hours();
 
         let id1 = state
-            .try_start_run("test-automation", scheduled1, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled1, 2_i64.hours())
             .await
             .expect("start_run should succeed");
         let _id2 = state
-            .try_start_run("test-automation", scheduled2, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled2, 2_i64.hours())
             .await
             .expect("start_run should succeed");
         let _id3 = state
-            .try_start_run("test-automation", scheduled3, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled3, 2_i64.hours())
             .await
             .expect("start_run should succeed");
 
@@ -578,11 +578,11 @@ mod tests {
         let state = AutomationState::open(&db_path)
             .await
             .expect("state should be created");
-        let scheduled_for = Utc::now();
+        let scheduled_for = Timestamp::now();
 
         // First run should succeed
         state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await
             .expect("first start_run should succeed");
 
@@ -602,7 +602,7 @@ mod tests {
 
         // Try to start the same run again - should fail due to UNIQUE constraint
         let result = state
-            .try_start_run("test-automation", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled_for, 2_i64.hours())
             .await;
 
         assert!(result.is_err());
@@ -616,15 +616,15 @@ mod tests {
         let state = AutomationState::open(&db_path)
             .await
             .expect("state should be created");
-        let scheduled_for = Utc::now();
+        let scheduled_for = Timestamp::now();
 
         // Two different automations at the same time should both succeed
         let id1 = state
-            .try_start_run("automation-1", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("automation-1", scheduled_for, 2_i64.hours())
             .await
             .expect("first start_run should succeed");
         let id2 = state
-            .try_start_run("automation-2", scheduled_for, chrono::Duration::hours(2))
+            .try_start_run("automation-2", scheduled_for, 2_i64.hours())
             .await
             .expect("second start_run should succeed");
 
@@ -640,16 +640,16 @@ mod tests {
             .await
             .expect("state should be created");
 
-        let scheduled1 = Utc::now();
-        let scheduled2 = Utc::now() + chrono::Duration::hours(1);
+        let scheduled1 = Timestamp::now();
+        let scheduled2 = Timestamp::now() + 1_i64.hours();
 
         // Same automation at different times should both succeed
         let id1 = state
-            .try_start_run("test-automation", scheduled1, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled1, 2_i64.hours())
             .await
             .expect("first start_run should succeed");
         let id2 = state
-            .try_start_run("test-automation", scheduled2, chrono::Duration::hours(2))
+            .try_start_run("test-automation", scheduled2, 2_i64.hours())
             .await
             .expect("second start_run should succeed");
 

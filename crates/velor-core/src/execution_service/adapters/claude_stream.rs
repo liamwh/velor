@@ -8,14 +8,18 @@
 //!
 //! Responsibilities:
 //!
-//! - **Input framing** ([`frame_user_message`]): turn a [`SteeringText`] into
-//!   exactly one compact JSON object followed by one newline.
-//! - **Semantic text types** ([`SteeringText`], [`PersistentAppend`]): naked
-//!   strings are never accepted where a semantically meaningful input is
-//!   required, so empty/whitespace-only values cannot slip through.
+//! - **Input framing** ([`frame_user_message`]): turn a
+//!   [`crate::execution_service::steering::SteeringText`] into exactly one
+//!   compact JSON object followed by one newline.
 //! - **Output parsing** ([`parse_output_event`]): a tolerant envelope that keeps
 //!   the session running when Claude Code emits a new, unknown-but-valid event
 //!   type, while still surfacing genuine protocol errors.
+//!
+//! The semantically-validated input text types
+//! ([`crate::execution_service::steering::SteeringText`],
+//! [`crate::execution_service::steering::PersistentAppend`]) are provider-
+//! neutral and live in [`crate::execution_service::steering`] — Oh My Pi's RPC
+//! adapter frames the same `SteeringText` onto a different wire shape.
 //!
 //! This module is internal and version-sensitive: the wire types here mirror a
 //! specific Claude Code schema and may need adjustment when that schema changes.
@@ -23,68 +27,7 @@
 use bytes::Bytes;
 use serde_json::Value;
 
-// ── Semantic text types ─────────────────────────────────────────────────────
-
-/// One-shot live-steering text sent to the active Claude session. Empty or
-/// whitespace-only text is invalid (it would steer the agent with nothing), so
-/// construction is fallible.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SteeringText(String);
-
-impl SteeringText {
-    /// Creates steering text from any string-like input.
-    ///
-    /// # Errors
-    /// Returns [`SteeringTextError::Empty`] if `value` is empty or
-    /// whitespace-only.
-    pub fn new(value: impl Into<String>) -> Result<Self, SteeringTextError> {
-        let s = value.into();
-        if s.trim().is_empty() {
-            return Err(SteeringTextError::Empty);
-        }
-        Ok(Self(s))
-    }
-
-    /// Returns the steering text as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Error constructing [`SteeringText`].
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum SteeringTextError {
-    /// The supplied text was empty or whitespace-only.
-    #[error("steering text must not be empty or whitespace-only")]
-    Empty,
-}
-
-/// The persistent append — extra user instructions folded into the end of every
-/// subsequent iteration prompt. Unlike [`SteeringText`], an empty value is
-/// meaningful here: it clears the append. Construction therefore returns
-/// `Option`, where `None` means "empty → clear".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PersistentAppend(String);
-
-impl PersistentAppend {
-    /// Creates a persistent append. Returns `None` for empty/whitespace-only
-    /// input, signalling that the append should be cleared rather than stored.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Option<Self> {
-        let s = value.into();
-        if s.trim().is_empty() {
-            return None;
-        }
-        Some(Self(s))
-    }
-
-    /// Returns the append text as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+use crate::execution_service::steering::SteeringText;
 
 // ── Input framing ───────────────────────────────────────────────────────────
 
@@ -372,22 +315,6 @@ mod tests {
         assert_eq!(s.lines().count(), 1);
         let value: Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(value["message"]["content"][0]["text"], "a\"b\nc\\d");
-    }
-
-    #[test]
-    fn empty_steering_text_is_rejected() {
-        assert!(SteeringText::new("").is_err());
-        assert!(SteeringText::new("   ").is_err());
-        assert!(SteeringText::new("\n\t").is_err());
-        assert!(SteeringText::new("real").is_ok());
-    }
-
-    #[test]
-    fn persistent_append_clears_on_empty() {
-        assert!(PersistentAppend::new("").is_none());
-        assert!(PersistentAppend::new("  \n").is_none());
-        let append = PersistentAppend::new("do the thing").unwrap();
-        assert_eq!(append.as_str(), "do the thing");
     }
 
     #[test]

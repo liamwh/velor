@@ -3,7 +3,6 @@
 //! A command-line interface for running autonomous coding agents.
 //! Supports template-based prompts, variable substitution, and iterative execution.
 
-use chrono::Utc;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use color_eyre::eyre::WrapErr;
 use std::collections::BTreeMap;
@@ -1116,6 +1115,7 @@ async fn run_once(
             &cwd,
             process_timeouts_from_defaults(&file_cfg.defaults),
             CancellationToken::new(),
+            &core::agent::ResumeHandle::default(),
         )
         .await?;
     Ok(())
@@ -1432,17 +1432,21 @@ async fn run_auto(
             },
         },
     ));
-    // Initial live-steering availability + the seeded persistent append.
+    // Initial live-steering/follow-up availability + the seeded persistent
+    // append. Derived from the runner's static capabilities rather than a
+    // hardcoded provider match, so a future capable runner needs no changes
+    // here.
+    let runner_capabilities = runner.capabilities();
     {
         use velor_core::execution_service::capabilities::LiveSteeringStatus;
-        let status = if runner.is_subprocess() {
+        let status = if runner_capabilities.live_steering {
             LiveSteeringStatus::Inactive
         } else {
             LiveSteeringStatus::Unsupported
         };
         let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetLiveSteeringStatus(status));
         let _ = tui_tx.try_send(streaming_tui::TuiMessage::SetPersistentAppend(
-            velor_core::execution_service::adapters::claude_stream::PersistentAppend::new(
+            velor_core::execution_service::steering::PersistentAppend::new(
                 common.append.clone().unwrap_or_default(),
             ),
         ));
@@ -1481,6 +1485,7 @@ async fn run_auto(
             tui_cancel,
             cancel_handler.clone(),
             tui_limits,
+            runner_capabilities.follow_up,
         )))
     };
     let tui_ref = if no_tui { None } else { Some(&tui_tx) };
@@ -1693,7 +1698,7 @@ fn build_runtime_vars(
     mode: &RunMode,
     config_path: &Path,
 ) -> Vec<(String, String)> {
-    let now = Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let mode_str = match mode {
         RunMode::Once => "once",
         RunMode::Auto => "auto",
@@ -1898,13 +1903,15 @@ async fn run_auto_iteration_with_session(
 /// and returns its delivery outcome.
 async fn send_live_once(
     tx: &tokio::sync::mpsc::Sender<core::agent::AgentInput>,
-    text: core::execution_service::adapters::claude_stream::SteeringText,
+    text: core::execution_service::steering::SteeringText,
+    behaviour: core::execution_service::steering::SteeringBehaviour,
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
 ) -> streaming_tui::SteeringOutcome {
     use core::execution_service::capabilities::LiveSteeringStatus;
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let input = core::agent::AgentInput::UserMessage {
         text,
+        behaviour,
         acknowledgement: ack_tx,
     };
     if tx.send(input).await.is_err() {
@@ -1932,32 +1939,43 @@ async fn send_live_once(
 #[allow(clippy::too_many_arguments)]
 async fn handle_steering_command(
     cmd: streaming_tui::TuiSteeringCommand,
-    persistent_append: &mut Option<
-        core::execution_service::adapters::claude_stream::PersistentAppend,
-    >,
+    persistent_append: &mut Option<core::execution_service::steering::PersistentAppend>,
     iter_steer_tx: Option<&tokio::sync::mpsc::Sender<core::agent::AgentInput>>,
     live_capable: bool,
+    follow_up_capable: bool,
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
 ) {
-    use core::execution_service::adapters::claude_stream::SteeringText;
     use core::execution_service::capabilities::LiveSteeringStatus;
+    use core::execution_service::steering::{SteeringBehaviour, SteeringText};
     use streaming_tui::{AppendOutcome, SteeringOutcome};
 
-    let idle_status = if live_capable {
-        LiveSteeringStatus::Inactive
-    } else {
-        LiveSteeringStatus::Unsupported
+    let status_for = |capable: bool| {
+        if capable {
+            LiveSteeringStatus::Inactive
+        } else {
+            LiveSteeringStatus::Unsupported
+        }
     };
+    let idle_status = status_for(live_capable);
 
     match cmd {
         streaming_tui::TuiSteeringCommand::SendOnce {
             text,
+            behaviour,
             acknowledgement,
         } => {
-            let outcome = match (live_capable, iter_steer_tx) {
-                (true, Some(tx)) => send_live_once(tx, text, tui_tx).await,
+            // `i` (steer) and `f` (follow-up) are gated on the capability that
+            // actually matches the requested behaviour — a provider can
+            // support one without the other, and the TUI must never fall back
+            // to emulating the missing one.
+            let capable = match behaviour {
+                SteeringBehaviour::Steer => live_capable,
+                SteeringBehaviour::FollowUp => follow_up_capable,
+            };
+            let outcome = match (capable, iter_steer_tx) {
+                (true, Some(tx)) => send_live_once(tx, text, behaviour, tui_tx).await,
                 _ => SteeringOutcome::Unavailable {
-                    status: idle_status,
+                    status: status_for(capable),
                 },
             };
             let _ = acknowledgement.send(Ok(outcome));
@@ -1975,13 +1993,16 @@ async fn handle_steering_command(
                 let _ = t.try_send(streaming_tui::TuiMessage::SetPersistentAppend(append));
             }
             let outcome = if send_live_when_available && live_capable && iter_steer_tx.is_some() {
-                let live = persistent_append
-                    .as_ref()
-                    .and_then(|a| SteeringText::new(a.as_str()).ok())
-                    .map(|text| {
-                        let tx = iter_steer_tx.unwrap();
-                        async move { send_live_once(tx, text, tui_tx).await }
-                    });
+                let live =
+                    persistent_append
+                        .as_ref()
+                        .and_then(|a| SteeringText::new(a.as_str()).ok())
+                        .map(|text| {
+                            let tx = iter_steer_tx.unwrap();
+                            async move {
+                                send_live_once(tx, text, SteeringBehaviour::Steer, tui_tx).await
+                            }
+                        });
                 match live {
                     Some(fut) => match fut.await {
                         SteeringOutcome::Sent { delivery } => {
@@ -2022,17 +2043,17 @@ fn append_only(
 }
 
 /// Runs an iteration future while concurrently processing steering commands
-/// from the TUI. When `iter_steer_tx` is `Some`, `c`/`a` messages are forwarded
-/// to the active session; otherwise they resolve as unavailable. The iteration
-/// future is polled to completion regardless.
-async fn steer_during<F: std::future::Future>(
+/// from the TUI. When `iter_steer_tx` is `Some`, `i`/`f`/`a` messages are
+/// forwarded to the active session; otherwise they resolve as unavailable. The
+/// iteration future is polled to completion regardless.
+#[allow(clippy::too_many_arguments)]
+async fn steer_during<F: Future>(
     iter_fut: F,
     iter_steer_tx: Option<tokio::sync::mpsc::Sender<core::agent::AgentInput>>,
     tui_command_rx: &mut Option<tokio::sync::mpsc::Receiver<streaming_tui::TuiSteeringCommand>>,
-    persistent_append: &mut Option<
-        core::execution_service::adapters::claude_stream::PersistentAppend,
-    >,
+    persistent_append: &mut Option<core::execution_service::steering::PersistentAppend>,
     live_capable: bool,
+    follow_up_capable: bool,
     tui_tx: Option<&tokio::sync::mpsc::Sender<streaming_tui::TuiMessage>>,
 ) -> F::Output {
     tokio::pin!(iter_fut);
@@ -2052,6 +2073,7 @@ async fn steer_during<F: std::future::Future>(
                     persistent_append,
                     iter_steer_tx.as_ref(),
                     live_capable,
+                    follow_up_capable,
                     tui_tx,
                 )
                 .await,
@@ -2116,13 +2138,15 @@ async fn run_auto_loop(
     let empty_output_limit = retry_config.max_retries.max(3);
     let mut empty_backoff_jitter = core::retry::SystemJitter;
     // The single controller-owned persistent-append cell, seeded from --append.
-    let mut persistent_append: Option<
-        velor_core::execution_service::adapters::claude_stream::PersistentAppend,
-    > = velor_core::execution_service::adapters::claude_stream::PersistentAppend::new(
-        append.unwrap_or(""),
-    );
-    // Live steering is only supported by the Claude subprocess adapter.
-    let live_capable = runner.is_subprocess();
+    let mut persistent_append: Option<velor_core::execution_service::steering::PersistentAppend> =
+        velor_core::execution_service::steering::PersistentAppend::new(append.unwrap_or(""));
+    // Which runtime session operations this runner supports natively. Drives
+    // whether the `i` (steer) / `f` (follow-up) affordances forward to a live
+    // session at all; a runner without the capability resolves its command as
+    // unavailable rather than emulating it.
+    let runner_capabilities = runner.capabilities();
+    let live_capable = runner_capabilities.live_steering;
+    let follow_up_capable = runner_capabilities.follow_up;
     let mut tui_command_rx = tui_command_rx;
 
     // Create persistent RulesState across iterations for glob-based rule tracking
@@ -2221,6 +2245,7 @@ async fn run_auto_loop(
                 &mut tui_command_rx,
                 &mut persistent_append,
                 live_capable,
+                follow_up_capable,
                 tui_tx,
             )
             .await
@@ -2274,7 +2299,7 @@ async fn run_auto_loop(
             // the iteration runs. The streaming path is enabled only when a TUI
             // is connected AND the adapter supports steering — otherwise the
             // proven one-shot text path is used (e.g. `--no-tui`).
-            let steering_enabled = live_capable && tui_command_rx.is_some();
+            let steering_enabled = (live_capable || follow_up_capable) && tui_command_rx.is_some();
             let (iter_steer_tx, mut iter_steer_rx) = if steering_enabled {
                 let (tx, rx) = tokio::sync::mpsc::channel::<core::agent::AgentInput>(16);
                 (Some(tx), Some(rx))
@@ -2313,6 +2338,7 @@ async fn run_auto_loop(
                 &mut tui_command_rx,
                 &mut persistent_append,
                 live_capable,
+                follow_up_capable,
                 tui_tx,
             )
             .await;
@@ -2495,8 +2521,15 @@ async fn run_auto_loop(
         // updates the persistent append (folded into the next iteration's prompt).
         if let Some(rx) = tui_command_rx.as_mut() {
             while let Ok(cmd) = rx.try_recv() {
-                handle_steering_command(cmd, &mut persistent_append, None, live_capable, tui_tx)
-                    .await;
+                handle_steering_command(
+                    cmd,
+                    &mut persistent_append,
+                    None,
+                    live_capable,
+                    follow_up_capable,
+                    tui_tx,
+                )
+                .await;
             }
         }
 
@@ -2832,6 +2865,7 @@ async fn run_disk_cleanup_pass(
             timeouts,
             cancel_token.clone(),
             &mut no_steering,
+            &core::agent::ResumeHandle::default(),
             {
                 let tui_tx = tui_tx.cloned();
                 let logger = std::sync::Arc::clone(logger);
@@ -2932,15 +2966,15 @@ fn short_failure_reason(e: &core::execution_service::error::AgentExecutionError)
 /// numeric UTC offset if the zone can't be resolved (e.g. `TZ` unset in a
 /// minimal container).
 fn format_resume_eta(wait: std::time::Duration) -> String {
-    let target = chrono::Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default();
+    let target = jiff::Timestamp::now() + wait;
     let clock = iana_time_zone::get_timezone()
         .ok()
-        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
-        .map(|tz| target.with_timezone(&tz).format("%H:%M:%S %Z").to_string())
+        .and_then(|name| jiff::tz::TimeZone::get(&name).ok())
+        .map(|tz| target.to_zoned(tz).strftime("%H:%M:%S %Z").to_string())
         .unwrap_or_else(|| {
             target
-                .with_timezone(&chrono::Local)
-                .format("%H:%M:%S %z")
+                .to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%H:%M:%S %z")
                 .to_string()
         });
     format!("{clock} ({})", humanize_duration(wait))
@@ -3105,6 +3139,7 @@ async fn execute_with_retry(
                 timeouts.clone(),
                 cancel_token.clone(),
                 steering,
+                &core::agent::ResumeHandle::default(),
                 {
                     let tui_tx = tui_tx.map(|tx| tx.clone());
                     let logger = std::sync::Arc::clone(logger);

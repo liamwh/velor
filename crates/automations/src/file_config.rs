@@ -10,7 +10,9 @@
 use crate::config::CatchUpPolicy;
 use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, eyre};
-use cron::Schedule;
+use jiff::tz::TimeZone;
+use jiff::{Span, Timestamp};
+use jiff_cron::Schedule;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -92,7 +94,7 @@ pub struct AutomationFile {
     /// Parsed cron schedule for next-run calculation.
     pub schedule: Schedule,
     /// Timezone for schedule interpretation.
-    pub timezone: chrono_tz::Tz,
+    pub timezone: TimeZone,
     /// Source of the prompt content.
     pub prompt_source: PromptSource,
     /// Whether to run in a dedicated worktree.
@@ -167,11 +169,11 @@ fn default_true() -> bool {
 }
 
 /// Get system local timezone.
-fn get_local_timezone() -> chrono_tz::Tz {
+fn get_local_timezone() -> TimeZone {
     iana_time_zone::get_timezone()
         .ok()
-        .and_then(|tz| tz.parse().ok())
-        .unwrap_or(chrono_tz::UTC)
+        .and_then(|tz| TimeZone::get(&tz).ok())
+        .unwrap_or(TimeZone::UTC)
 }
 
 /// Normalize cron expression to 6-field format (seconds minutes hours day month weekday).
@@ -307,9 +309,7 @@ impl AutomationFile {
                     "timezone cannot be an empty string; omit the field or use a valid IANA timezone"
                 ));
             }
-            Some(tz) => tz
-                .parse::<chrono_tz::Tz>()
-                .map_err(|_| eyre!("Invalid timezone: '{}'", tz))?,
+            Some(tz) => TimeZone::get(&tz).map_err(|_| eyre!("Invalid timezone: '{}'", tz))?,
         };
 
         // Normalize and parse cron expression
@@ -348,38 +348,35 @@ impl AutomationFile {
     ///
     /// IMPORTANT: The cron crate evaluates schedules in the target timezone.
     /// DST transitions are handled by the crate's timezone-aware scheduling.
-    pub fn next_after(
-        &self,
-        after: chrono::DateTime<chrono::Utc>,
-    ) -> chrono::DateTime<chrono::Utc> {
+    pub fn next_after(&self, after: Timestamp) -> Timestamp {
         // Convert to target timezone, evaluate schedule, convert back to UTC
-        let after_tz = after.with_timezone(&self.timezone);
-        let next = self.schedule.after(&after_tz).next();
-        next.unwrap().with_timezone(&chrono::Utc)
+        let after_tz = after.to_zoned(self.timezone.clone());
+        let next = self.schedule.after(after_tz).next();
+        next.unwrap().timestamp()
     }
 
     /// Get missed runs since a given time (up to max_count).
     pub fn missed_runs_since(
         &self,
-        since: chrono::DateTime<chrono::Utc>,
-        before: chrono::DateTime<chrono::Utc>,
+        since: Timestamp,
+        before: Timestamp,
         max_count: u32,
-    ) -> Vec<chrono::DateTime<chrono::Utc>> {
-        let since_tz = since.with_timezone(&self.timezone);
+    ) -> Vec<Timestamp> {
+        let since_tz = since.to_zoned(self.timezone.clone());
         self.schedule
-            .after(&since_tz)
+            .after(since_tz)
             .take(max_count as usize)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .take_while(|&dt| dt < before)
+            .map(|zdt| zdt.timestamp())
+            .take_while(|&ts| ts < before)
             .collect()
     }
 
     /// Get stale-run timeout based on automation's configured timeout.
-    pub fn stale_run_timeout(&self) -> chrono::Duration {
+    pub fn stale_run_timeout(&self) -> Span {
         let timeout_secs = self.timeout_seconds.unwrap_or(3600);
         // Use 2x the automation timeout, minimum 15 minutes
         let secs = (timeout_secs * 2).max(900);
-        chrono::Duration::seconds(secs as i64)
+        Span::new().seconds(secs as i64)
     }
 
     /// Validate secret declarations at load time.
@@ -399,7 +396,6 @@ impl AutomationFile {
 #[cfg(test)]
 mod dst_tests {
     use super::*;
-    use chrono::Timelike;
 
     /// Helper to create a minimal raw automation for testing.
     fn make_test_raw_automation(schedule: &str, timezone: &str) -> AutomationFileRaw {
@@ -434,9 +430,7 @@ mod dst_tests {
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
         // Check time before DST transition
-        let before_dst = "2024-03-30T02:30:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let before_dst: Timestamp = "2024-03-30T02:30:00Z".parse().unwrap();
         let next = automation.next_after(before_dst);
 
         // Should schedule the next run after the non-existent 02:30 time
@@ -456,9 +450,7 @@ mod dst_tests {
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
         // Check time around DST transition
-        let before_fall_back = "2024-10-26T02:30:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let before_fall_back: Timestamp = "2024-10-26T02:30:00Z".parse().unwrap();
         let next = automation.next_after(before_fall_back);
 
         // Should schedule the next run
@@ -476,24 +468,20 @@ mod dst_tests {
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
         // Check a Monday in March (before spring forward)
-        let march_monday = "2024-03-11T14:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let march_monday: Timestamp = "2024-03-11T14:00:00Z".parse().unwrap();
         let next_march = automation.next_after(march_monday);
 
         // Convert to local time to verify it's 09:00
-        let local_march = next_march.with_timezone(&automation.timezone);
+        let local_march = next_march.to_zoned(automation.timezone.clone());
         assert_eq!(local_march.hour(), 9);
         assert_eq!(local_march.minute(), 0);
 
         // Check a Monday in November (after fall back)
-        let november_monday = "2024-11-11T14:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let november_monday: Timestamp = "2024-11-11T14:00:00Z".parse().unwrap();
         let next_november = automation.next_after(november_monday);
 
         // Convert to local time to verify it's still 09:00
-        let local_november = next_november.with_timezone(&automation.timezone);
+        let local_november = next_november.to_zoned(automation.timezone.clone());
         assert_eq!(local_november.hour(), 9);
         assert_eq!(local_november.minute(), 0);
     }
@@ -502,6 +490,7 @@ mod dst_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::ToSpan;
 
     fn make_test_raw_automation() -> AutomationFileRaw {
         AutomationFileRaw {
@@ -654,7 +643,7 @@ mod tests {
         let raw = make_test_raw_automation();
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let next = automation.next_after(now);
 
         assert!(next > now);
@@ -665,8 +654,8 @@ mod tests {
         let raw = make_test_raw_automation();
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
-        let since = chrono::Utc::now() - chrono::Duration::hours(2);
-        let before = chrono::Utc::now();
+        let since = Timestamp::now() - 2_i64.hours();
+        let before = Timestamp::now();
 
         let missed = automation.missed_runs_since(since, before, 10);
 
@@ -682,7 +671,7 @@ mod tests {
 
         let timeout = automation.stale_run_timeout();
         // timeout_seconds = 60, 2x = 120, but minimum is 900
-        assert_eq!(timeout.num_seconds(), 900);
+        assert_eq!(timeout.get_seconds(), 900);
     }
 
     #[test]
@@ -692,7 +681,7 @@ mod tests {
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
         let timeout = automation.stale_run_timeout();
-        assert_eq!(timeout.num_seconds(), 7200); // 2x 3600 seconds (default)
+        assert_eq!(timeout.get_seconds(), 7200); // 2x 3600 seconds (default)
     }
 
     #[test]
@@ -702,7 +691,7 @@ mod tests {
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
         let timeout = automation.stale_run_timeout();
-        assert_eq!(timeout.num_seconds(), 900); // Minimum 15 minutes
+        assert_eq!(timeout.get_seconds(), 900); // Minimum 15 minutes
     }
 
     #[test]
@@ -712,15 +701,15 @@ mod tests {
         let automation = AutomationFile::from_raw("test".to_string(), raw).unwrap();
 
         let timeout = automation.stale_run_timeout();
-        assert_eq!(timeout.num_seconds(), 2000); // 2x 1000 seconds
+        assert_eq!(timeout.get_seconds(), 2000); // 2x 1000 seconds
     }
 
     #[test]
     fn test_get_local_timezone() {
         let tz = get_local_timezone();
         // Should return a valid timezone
-        let now = chrono::Utc::now();
-        let _local = now.with_timezone(&tz);
+        let now = Timestamp::now();
+        let _local = now.to_zoned(tz);
     }
 
     #[test]

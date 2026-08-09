@@ -58,8 +58,8 @@ impl ConversationHistory {
     pub fn add(&mut self, iteration: u32, prompt: &str, output: &str) {
         self.entries.push(HistoryEntry {
             iteration,
-            timestamp: chrono::Utc::now()
-                .format("%Y-%m-%d %H:%M:%S UTC")
+            timestamp: jiff::Timestamp::now()
+                .strftime("%Y-%m-%d %H:%M:%S UTC")
                 .to_string(),
             prompt: prompt.to_string(),
             output: output.to_string(),

@@ -25,8 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use velor_core::execution_service::adapter::LineDecoder;
 use velor_core::execution_service::adapters::claude_stream::{
-    ClaudeOutputEvent, SteeringText, frame_user_message, parse_output_event,
+    ClaudeOutputEvent, frame_user_message, parse_output_event,
 };
+use velor_core::execution_service::steering::SteeringText;
 use velor_core::execution_service::supervisor::{
     ProcessEvent, ProcessInput, ProcessInputCommand, ProcessSpec, ProcessTimeouts, spawn,
 };

@@ -16,8 +16,8 @@ bytes = "1"
 # Process-group management for the agent execution supervisor (Unix + Windows).
 command-group = { version = "1.0", features = ["with-tokio"] }
 libc = "0.2"
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+jiff = { version = "0.2", features = ["serde"] }
+jiff-cron = "0.3"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 dotenvy = "0.15"
@@ -55,11 +55,10 @@ regex = "1.10"
 dirs = "5"
 diffy = "0.4"
 fs2 = "0.4"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 syntect = "5"
 tui-markdown = "0.3"
 unicode-width = "0.2"
-cron = "0.12"
 
 # Tree-sitter: high-quality highlighting for composite languages (Svelte) that
 # syntect's grammar engine cannot load (modern Svelte .sublime-syntax relies on

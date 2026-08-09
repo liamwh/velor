@@ -4,8 +4,8 @@
 //! that are due to run based on their cron schedules. It executes these
 //! automations and emits events to the frontend for real-time updates.
 
-use chrono::{DateTime, Utc};
 use color_eyre::Result;
+use jiff::Timestamp;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ pub struct BackgroundDaemon {
     /// Merged configuration (for automation directory, etc.).
     config: Arc<RwLock<Option<velor_core::FileConfig>>>,
     /// Last run time for each automation (name -> timestamp).
-    last_run_times: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
+    last_run_times: Arc<RwLock<HashMap<String, Timestamp>>>,
     /// Tick interval for checking automations.
     tick_interval: Duration,
     /// Velor binary path for executing automations.
@@ -231,7 +231,7 @@ impl BackgroundDaemon {
             // Update last run time before execution to prevent double-runs
             {
                 let mut last_runs = self.last_run_times.write().await;
-                last_runs.insert(automation_name.clone(), Utc::now());
+                last_runs.insert(automation_name.clone(), Timestamp::now());
             }
 
             match runner
@@ -279,10 +279,10 @@ impl BackgroundDaemon {
     async fn check_if_due(
         &self,
         automation: &Automation,
-        last_runs: &HashMap<String, DateTime<Utc>>,
+        last_runs: &HashMap<String, Timestamp>,
         store: &velor_automations::AutomationStore,
-    ) -> Result<Option<DateTime<Utc>>> {
-        let now = Utc::now();
+    ) -> Result<Option<Timestamp>> {
+        let now = Timestamp::now();
 
         // Get the last run time from our tracking
         let last_run = *last_runs.get(&automation.name).unwrap_or(&now);
@@ -303,7 +303,7 @@ impl BackgroundDaemon {
             .unwrap_or(last_run);
 
         // Parse timezone
-        let tz: chrono_tz::Tz = automation.timezone.parse().unwrap_or(chrono_tz::UTC);
+        let tz = jiff::tz::TimeZone::get(&automation.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
 
         // Create scheduler
         let scheduler = Scheduler::new(&automation.schedule, tz)?;
@@ -380,13 +380,13 @@ impl BackgroundDaemon {
 
     /// Returns the last run time for an automation.
     #[must_use]
-    pub async fn last_run_time(&self, name: &str) -> Option<DateTime<Utc>> {
+    pub async fn last_run_time(&self, name: &str) -> Option<Timestamp> {
         self.last_run_times.read().await.get(name).copied()
     }
 
     /// Returns all tracked last run times.
     #[must_use]
-    pub async fn all_last_run_times(&self) -> HashMap<String, DateTime<Utc>> {
+    pub async fn all_last_run_times(&self) -> HashMap<String, Timestamp> {
         self.last_run_times.read().await.clone()
     }
 
@@ -650,7 +650,7 @@ enabled = false
     #[tokio::test]
     async fn test_all_last_run_times() {
         let daemon = BackgroundDaemon::new();
-        let _now = Utc::now();
+        let _now = Timestamp::now();
 
         // Initially empty
         assert!(daemon.all_last_run_times().await.is_empty());

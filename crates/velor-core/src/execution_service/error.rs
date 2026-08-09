@@ -402,6 +402,14 @@ pub enum LiveSteeringUnavailableReason {
     /// The provider rejected the stream-json input schema.
     #[error("the provider rejected the stream-json input schema")]
     ProtocolRejected,
+    /// The provider's RPC explicitly rejected the command (a `success: false`
+    /// response on the correlated request id).
+    #[error("the provider rejected the command")]
+    Rejected,
+    /// The provider did not acknowledge the command within the response
+    /// window (e.g. the RPC process wedged or exited mid-flight).
+    #[error("the provider did not acknowledge the command in time")]
+    NoResponse,
 }
 
 /// The unified, layered error for agent execution. Provenance is preserved:

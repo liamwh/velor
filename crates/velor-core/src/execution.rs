@@ -3,7 +3,7 @@
 //! This module provides the state machine and event types needed for the GUI
 //! to track and display the progress of agent executions.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -101,14 +101,14 @@ pub enum ExecutionEvent {
         /// New state.
         state: ExecutionState,
         /// Timestamp of the change.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
     /// A chunk of output was received from the agent.
     OutputChunk {
         /// Text content.
         text: String,
         /// Timestamp of the chunk.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
     /// An error occurred.
     Error {
@@ -117,7 +117,7 @@ pub enum ExecutionEvent {
         /// Whether this is a retryable error.
         retryable: bool,
         /// Timestamp of the error.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
     /// An iteration completed.
     IterationCompleted {
@@ -126,21 +126,21 @@ pub enum ExecutionEvent {
         /// Completion status.
         completed: bool,
         /// Timestamp of completion.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
     /// Execution metrics were updated.
     MetricsUpdated {
         /// Updated metrics.
         metrics: ExecutionMetrics,
         /// Timestamp of the update.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
     /// Provider activity update (status/tool/progress/usage).
     Activity {
         /// Structured activity payload.
         activity: ExecutionActivity,
         /// Timestamp of the activity.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
 }
 
@@ -320,9 +320,9 @@ pub struct ExecutionRecord {
     /// Error message if failed.
     pub error: Option<String>,
     /// When the execution started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When the execution ended (if terminal).
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<Timestamp>,
     /// Events log.
     pub events: Vec<ExecutionEvent>,
     /// User-editable session name (optional, defaults to prompt_name).
@@ -337,7 +337,7 @@ impl ExecutionRecord {
     /// Creates a new execution record.
     #[must_use]
     pub fn new(config: ExecutionConfig) -> Self {
-        let started_at = Utc::now();
+        let started_at = Timestamp::now();
         let id = ExecutionId::new();
         let initial_event = ExecutionEvent::StateChanged {
             state: ExecutionState::Pending,
@@ -361,7 +361,7 @@ impl ExecutionRecord {
 
     /// Records a state change.
     pub fn set_state(&mut self, state: ExecutionState) {
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         self.events
             .push(ExecutionEvent::StateChanged { state, timestamp });
         self.state = state;
@@ -372,7 +372,7 @@ impl ExecutionRecord {
 
     /// Appends output text.
     pub fn append_output(&mut self, text: &str) {
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         self.events.push(ExecutionEvent::OutputChunk {
             text: text.to_string(),
             timestamp,
@@ -382,7 +382,7 @@ impl ExecutionRecord {
 
     /// Records an error.
     pub fn record_error(&mut self, message: String, retryable: bool) {
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         self.events.push(ExecutionEvent::Error {
             message: message.clone(),
             retryable,
@@ -395,7 +395,7 @@ impl ExecutionRecord {
 
     /// Records an iteration completion.
     pub fn complete_iteration(&mut self, iteration: u32, completed: bool) {
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         self.events.push(ExecutionEvent::IterationCompleted {
             iteration,
             completed,
@@ -405,7 +405,7 @@ impl ExecutionRecord {
 
     /// Updates metrics.
     pub fn update_metrics(&mut self, metrics: ExecutionMetrics) {
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         self.events.push(ExecutionEvent::MetricsUpdated {
             metrics: metrics.clone(),
             timestamp,
@@ -415,7 +415,7 @@ impl ExecutionRecord {
 
     /// Records a provider activity event.
     pub fn record_activity(&mut self, activity: ExecutionActivity) {
-        let timestamp = Utc::now();
+        let timestamp = Timestamp::now();
         self.events.push(ExecutionEvent::Activity {
             activity,
             timestamp,
@@ -425,10 +425,8 @@ impl ExecutionRecord {
     /// Returns the duration of the execution so far.
     #[must_use]
     pub fn duration(&self) -> Duration {
-        let end = self.ended_at.unwrap_or_else(Utc::now);
-        end.signed_duration_since(self.started_at)
-            .to_std()
-            .unwrap_or(Duration::ZERO)
+        let end = self.ended_at.unwrap_or_else(jiff::Timestamp::now);
+        Duration::try_from(end.duration_since(self.started_at)).unwrap_or(Duration::ZERO)
     }
 
     /// Returns true if the execution is complete (detected completion token).

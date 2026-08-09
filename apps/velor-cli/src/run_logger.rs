@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::json;
 
@@ -27,7 +27,7 @@ pub struct RunLogger {
 
 #[derive(Serialize)]
 struct LogEntry {
-    ts: chrono::DateTime<Utc>,
+    ts: Timestamp,
     run_id: String,
     #[serde(flatten)]
     data: serde_json::Value,
@@ -42,7 +42,7 @@ impl RunLogger {
         let _ = fs::create_dir_all(&log_dir);
         rotate_logs(&log_dir);
 
-        let ts = Utc::now().format("%Y%m%dT%H%M%S");
+        let ts = Timestamp::now().strftime("%Y%m%dT%H%M%S");
         let safe_name =
             prompt_name.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
         let filename = format!("{ts}-{safe_name}.jsonl");
@@ -81,7 +81,7 @@ impl RunLogger {
             merged = json!({ "category": category, "data": merged });
         }
         let entry = LogEntry {
-            ts: Utc::now(),
+            ts: Timestamp::now(),
             run_id: self.run_id.clone(),
             data: merged,
         };
