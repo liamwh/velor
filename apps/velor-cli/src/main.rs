@@ -1972,13 +1972,29 @@ async fn handle_steering_command(
                 SteeringBehaviour::Steer => live_capable,
                 SteeringBehaviour::FollowUp => follow_up_capable,
             };
-            let outcome = match (capable, iter_steer_tx) {
-                (true, Some(tx)) => send_live_once(tx, text, behaviour, tui_tx).await,
-                _ => SteeringOutcome::Unavailable {
-                    status: status_for(capable),
-                },
-            };
-            let _ = acknowledgement.send(Ok(outcome));
+            match (capable, iter_steer_tx) {
+                (true, Some(tx)) => {
+                    // Send + await the adapter ack on a SEPARATE task, not
+                    // inline. If we awaited here, steer_during's select loop
+                    // would block on this future and stop polling iter_fut —
+                    // but iter_fut contains run_with_events_and_steering's
+                    // select loop, which is what relays the AgentInput to the
+                    // adapter in the first place. Blocking here deadlocks:
+                    // the input sits in the channel, never relayed, the ack
+                    // never resolves, and the TUI is stuck on "Submitting…".
+                    let tx = tx.clone();
+                    let tui_tx = tui_tx.cloned();
+                    tokio::spawn(async move {
+                        let outcome = send_live_once(&tx, text, behaviour, tui_tx.as_ref()).await;
+                        let _ = acknowledgement.send(Ok(outcome));
+                    });
+                }
+                _ => {
+                    let _ = acknowledgement.send(Ok(SteeringOutcome::Unavailable {
+                        status: status_for(capable),
+                    }));
+                }
+            }
         }
         streaming_tui::TuiSteeringCommand::ReplacePersistent {
             append,
@@ -1992,40 +2008,55 @@ async fn handle_steering_command(
             if let Some(t) = tui_tx {
                 let _ = t.try_send(streaming_tui::TuiMessage::SetPersistentAppend(append));
             }
-            let outcome = if send_live_when_available && live_capable && iter_steer_tx.is_some() {
-                let live =
-                    persistent_append
-                        .as_ref()
-                        .and_then(|a| SteeringText::new(a.as_str()).ok())
-                        .map(|text| {
-                            let tx = iter_steer_tx.unwrap();
-                            async move {
-                                send_live_once(tx, text, SteeringBehaviour::Steer, tui_tx).await
-                            }
+            if send_live_when_available
+                && live_capable
+                && let Some(tx) = iter_steer_tx
+            {
+                // Same deadlock fix as SendOnce: the live send must not block
+                // steer_during's select loop. Spawn it on a separate task so
+                // iter_fut (which relays the input to the adapter) keeps being
+                // polled while we wait for the delivery ack.
+                let live_text = persistent_append
+                    .as_ref()
+                    .and_then(|a| SteeringText::new(a.as_str()).ok());
+                match live_text {
+                    Some(text) => {
+                        let tx = tx.clone();
+                        let tui_tx = tui_tx.cloned();
+                        tokio::spawn(async move {
+                            let outcome = send_live_once(
+                                &tx,
+                                text,
+                                SteeringBehaviour::Steer,
+                                tui_tx.as_ref(),
+                            )
+                            .await;
+                            let mapped = match outcome {
+                                SteeringOutcome::Sent { delivery } => {
+                                    if cleared {
+                                        AppendOutcome::ClearedAndSent { delivery }
+                                    } else {
+                                        AppendOutcome::UpdatedAndSent { delivery }
+                                    }
+                                }
+                                SteeringOutcome::Unavailable { status } => {
+                                    if cleared {
+                                        AppendOutcome::ClearedOnly { status }
+                                    } else {
+                                        AppendOutcome::UpdatedOnly { status }
+                                    }
+                                }
+                            };
+                            let _ = acknowledgement.send(Ok(mapped));
                         });
-                match live {
-                    Some(fut) => match fut.await {
-                        SteeringOutcome::Sent { delivery } => {
-                            if cleared {
-                                AppendOutcome::ClearedAndSent { delivery }
-                            } else {
-                                AppendOutcome::UpdatedAndSent { delivery }
-                            }
-                        }
-                        SteeringOutcome::Unavailable { status } => {
-                            if cleared {
-                                AppendOutcome::ClearedOnly { status }
-                            } else {
-                                AppendOutcome::UpdatedOnly { status }
-                            }
-                        }
-                    },
-                    None => append_only(cleared, idle_status),
+                    }
+                    None => {
+                        let _ = acknowledgement.send(Ok(append_only(cleared, idle_status)));
+                    }
                 }
             } else {
-                append_only(cleared, idle_status)
-            };
-            let _ = acknowledgement.send(Ok(outcome));
+                let _ = acknowledgement.send(Ok(append_only(cleared, idle_status)));
+            }
         }
     }
 }

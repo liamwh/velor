@@ -200,18 +200,26 @@ pub(crate) fn frame_set_interrupt_mode_immediate() -> Bytes {
     Bytes::from(bytes)
 }
 
-/// Frames one `steer` or `follow_up` RPC command carrying `message`.
-/// Infallible: the shape is fixed and always serialises.
+/// Frames a live steer or follow-up as a `prompt` command with the matching
+/// `streamingBehavior`. Per `omp://rpc.md`, during active streaming the
+/// dedicated `steer`/`follow_up` command types do not receive a response —
+/// only `prompt` with `streamingBehavior` is acknowledged. Without this, a
+/// mid-turn steer hangs waiting for a response that never arrives.
 pub(crate) fn frame_live_message_command(
     id: &str,
     behaviour: SteeringBehaviour,
     message: &str,
 ) -> Bytes {
-    let kind = match behaviour {
+    let streaming_behavior = match behaviour {
         SteeringBehaviour::Steer => "steer",
-        SteeringBehaviour::FollowUp => "follow_up",
+        SteeringBehaviour::FollowUp => "followUp",
     };
-    let frame = serde_json::json!({ "id": id, "type": kind, "message": message });
+    let frame = serde_json::json!({
+        "id": id,
+        "type": "prompt",
+        "message": message,
+        "streamingBehavior": streaming_behavior,
+    });
     let mut bytes = serde_json::to_vec(&frame).expect("static shape always serialises");
     bytes.push(b'\n');
     Bytes::from(bytes)
