@@ -166,7 +166,7 @@ just install       # build + install vel to ~/bin
 
 Velor was my primary autonomous-coding harness for about seven months of daily use — including using Velor to develop Velor. That era produced the features above and hardened the crash-recovery and supervision paths the hard way.
 
-I've since moved most of my day-to-day work to [Oh My Pi](https://github.com/oh-my-pi/omp) with my own extensions covering the parts of Velor I relied on, which buys me a maintained UI and upstream improvements for free. In the professional space, [Xirp](https://xirp.spotify.com/) from Spotify is pointing at a similar problem — agentic development grounded in real organisational context. Both are, in different ways, successors to what Velor was for me.
+I've since moved most of my day-to-day work to [Oh My Pi](https://omp.sh/) with my own extensions covering the parts of Velor I relied on, which buys me a maintained UI and upstream improvements for free. In the professional space, [Xirp](https://xirp.spotify.com/) from Spotify is pointing at a similar problem — agentic development grounded in real organisational context. Both are, in different ways, successors to what Velor was for me.
 
 Velor is published as a working record of that period: a real, self-hosted agent harness that ran production-personal workloads every day. It remains experimental and is not under active feature development.
 
