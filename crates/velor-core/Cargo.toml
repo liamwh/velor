@@ -60,9 +60,9 @@ serial_test = { workspace = true }
 # Product-surface note: this target is NOT a dependency of the `vel` CLI or the
 # Tauri app and is never referenced by production code (verified by grep). It is
 # only built by `cargo test`/`cargo build -p velor-core` and is not installed or
-# distributed. velor-core is an internal, UNLICENSED crate and is not published,
-# so the fixture does not ship on crates.io. If velor-core is ever made
-# publishable, gate this behind `required-features` or move it out first.
+# distributed. velor-core is licensed PolyForm-Noncommercial-1.0.0 and is not
+# published, so the fixture does not ship on crates.io. If velor-core is ever
+# made publishable, gate this behind `required-features` or move it out first.
 [[bin]]
 name = "velor-test-agent"
 path = "tests/fixtures/velor_test_agent.rs"
