@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+  width="520" height="130" viewBox="0 0 520 130"
+  fill="none" role="img" aria-label="Velor">
+  <defs>
+    <linearGradient id="leftRibbon" x1="0.05" y1="0" x2="0.95" y2="1">
+      <stop offset="0%" stop-color="#B58AFF"/>
+      <stop offset="48%" stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#6657F7"/>
+    </linearGradient>
+    <linearGradient id="rightRibbon" x1="0.95" y1="0" x2="0.05" y2="1">
+      <stop offset="0%" stop-color="#7C6CFF"/>
+      <stop offset="50%" stop-color="#6C5CF8"/>
+      <stop offset="100%" stop-color="#5B4BEA"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(8,8) scale(.95)">
+    <path d="M110 24 L79 36 L60 69 L76 82 L89 58 Z" fill="url(#rightRibbon)"/>
+    <path d="M18 24 L50 36 L76 82 L64 100 L39 58 Z" fill="url(#leftRibbon)"/>
+  </g>
+  <text x="150" y="89" fill="#F8F6F8"
+    font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    font-size="76" font-weight="560" letter-spacing="-3">Velor</text>
+</svg>

@@ -47,4 +47,12 @@ package.json
 test_acp.js
 .velor/velor-acp-test.toml
 
+# Local artifacts that must never be committed (secrets live in .env)
+/velor
+/CLAUDE.md
+/mobile-onboarding-fix.patch
+*.patch.local
+
+# Environment / secrets — never commit
 .env
+.env.*

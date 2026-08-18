@@ -2,9 +2,10 @@
 name = "velor"
 version = "0.1.0"
 description = "Velor - Tauri GUI for autonomous AI agents"
-authors = ["liam"]
+authors = ["Liam Woodleigh-Hardinge"]
 edition = "2024"
-license = "UNLICENSED"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/liamwh/velor"
 
 [lib]
 name = "velor_lib"

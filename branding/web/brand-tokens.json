@@ -1,0 +1,24 @@
+{
+  "name": "Velor",
+  "colours": {
+    "purple": "#7C5CFF",
+    "violet": "#A78BFA",
+    "indigo": "#6366F1",
+    "void": "#080F14",
+    "mist": "#F8F6F8",
+    "steel": "#1E293B",
+    "slate": "#334155"
+  },
+  "mark": {
+    "left": [
+      "#B58AFF",
+      "#8B5CF6",
+      "#6657F7"
+    ],
+    "right": [
+      "#7C6CFF",
+      "#6C5CF8",
+      "#5B4BEA"
+    ]
+  }
+}

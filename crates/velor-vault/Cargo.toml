@@ -3,8 +3,8 @@ name = "velor-vault"
 version = "0.1.0"
 edition = "2021"
 description = "Encrypted secrets storage for Velor automations"
-license = "MIT"
-repository = "https://github.com/user/velor"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/liamwh/velor"
 
 [dependencies]
 # Crypto dependencies

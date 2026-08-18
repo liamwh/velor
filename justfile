@@ -50,13 +50,17 @@ lint:
     cargo clippy -- -D warnings
 
 # Run all checks (fmt, clippy, tests)
-check: format-rust lint-rust lint-typescript
+check: check-license format-rust lint-rust lint-typescript
 
 lint-rust:
     cargo clippy --all-targets --all-features --workspace --quiet --no-deps
 
 lint-typescript:
     cd apps/velor && bunx svelte-kit sync && bunx svelte-check --tsconfig ./tsconfig.json --diagnostic-sources "js,svelte" && bunx eslint .
+
+# Verify license metadata consistency (LICENSE, README, manifests)
+check-license:
+    @scripts/check-license.sh
 
 # Install velor CLI to ~/bin (backs up existing binary with timestamp)
 install:
