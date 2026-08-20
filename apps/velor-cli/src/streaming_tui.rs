@@ -400,6 +400,16 @@ struct TuiState {
     /// Whether the sticky todo panel renders at its expanded height (showing
     /// the whole board) or its small default preview. Toggled by `Ctrl+T`.
     sticky_todo_expanded: bool,
+    /// Persistent system-clipboard handle for the `y`/`Y` copy keys.
+    ///
+    /// On Linux (X11 and Wayland), clipboard content is served by whichever
+    /// process last set it; the moment that process's `Clipboard` handle
+    /// drops, other applications can no longer paste it. Opening a fresh,
+    /// short-lived `Clipboard` per keypress (the previous behaviour) meant
+    /// the copy was released almost immediately. Keeping one instance alive
+    /// for the life of the TUI keeps pasted content available for as long
+    /// as this session runs.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 /// Whether an entry renders in the live log under the current visibility
@@ -457,6 +467,7 @@ impl TuiState {
             g_deadline: None,
             sticky_todo: None,
             sticky_todo_expanded: false,
+            clipboard: None,
         }
     }
 
@@ -738,6 +749,12 @@ impl TuiState {
 
     /// Copies the transcript export to the system clipboard (native access
     /// via `arboard`) and reports the outcome as a transient status line.
+    ///
+    /// Reuses `self.clipboard` rather than opening-and-dropping a fresh
+    /// handle per call: on Linux, dropping the last `Clipboard` releases
+    /// ownership of the selection, which made copies unreadable by other
+    /// applications almost instantly. Keeping the handle alive for the
+    /// session's lifetime lets the copy stay pasteable elsewhere.
     fn copy_transcript_to_clipboard(&mut self, since_last_prompt: bool) {
         let text = self.transcript_export(since_last_prompt);
         if text.trim().is_empty() {
@@ -750,7 +767,20 @@ impl TuiState {
             "entire transcript"
         };
         let bytes = text.len();
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    self.set_transient(&format!("Clipboard unavailable: {e}"));
+                    return;
+                }
+            }
+        }
+        let clipboard = self
+            .clipboard
+            .as_mut()
+            .expect("clipboard initialised above");
+        match clipboard.set_text(text) {
             Ok(()) => self.set_transient(&format!("Copied {scope} ({bytes} bytes) to clipboard.")),
             Err(e) => self.set_transient(&format!("Clipboard copy failed: {e}")),
         }

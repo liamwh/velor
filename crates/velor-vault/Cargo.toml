@@ -37,7 +37,7 @@ tracing = { workspace = true }
 security-framework = "2.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-secret-service = "4"
+secret-service = { version = "4", features = ["rt-async-io-crypto-rust"] }
 zbus = "4"
 
 [dev-dependencies]

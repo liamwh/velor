@@ -3,7 +3,7 @@
 //! This module provides integration with the Linux Secret Service (e.g., GNOME Keyring,
 //! KDE Wallet) for secure storage of vault master keys.
 
-use secrecy::SecretVec;
+use secrecy::{ExposeSecret, SecretVec};
 use secret_service::blocking::SecretService;
 use secret_service::EncryptionType;
 
@@ -28,18 +28,6 @@ impl SecretServiceBackend {
 
         Ok(Self { service })
     }
-
-    /// Get the collection path for the default keyring.
-    fn collection_path(&self) -> Result<String> {
-        let collection = self.service.get_default_collection().map_err(|e| {
-            VaultError::SecretService(format!("Failed to get default collection: {e}"))
-        })?;
-
-        collection
-            .get_path()
-            .map(|p| p.to_string())
-            .map_err(|e| VaultError::SecretService(format!("Failed to get collection path: {e}")))
-    }
 }
 
 impl std::fmt::Debug for SecretServiceBackend {
@@ -55,18 +43,18 @@ impl KeyringBackend for SecretServiceBackend {
             VaultError::SecretService(format!("Failed to get default collection: {e}"))
         })?;
 
-        let attributes = [
+        let account_name = scope.account_name();
+        let attributes = std::collections::HashMap::from([
             ("service", scope.service_name()),
-            ("account", &scope.account_name()),
-        ];
+            ("account", account_name.as_str()),
+        ]);
 
         // Try to delete any existing item first
-        let _ = collection.search_items(&attributes).and_then(|items| {
+        if let Ok(items) = collection.search_items(attributes.clone()) {
             for item in items {
                 let _ = item.delete();
             }
-            Ok(())
-        });
+        }
 
         // Create new item
         collection
@@ -93,13 +81,14 @@ impl KeyringBackend for SecretServiceBackend {
             VaultError::SecretService(format!("Failed to get default collection: {e}"))
         })?;
 
-        let attributes = [
+        let account_name = scope.account_name();
+        let attributes = std::collections::HashMap::from([
             ("service", scope.service_name()),
-            ("account", &scope.account_name()),
-        ];
+            ("account", account_name.as_str()),
+        ]);
 
         let items = collection
-            .search_items(&attributes)
+            .search_items(attributes)
             .map_err(|e| VaultError::SecretService(format!("Failed to search for key: {e}")))?;
 
         let item = items.into_iter().next().ok_or_else(|| {
@@ -127,13 +116,14 @@ impl KeyringBackend for SecretServiceBackend {
             VaultError::SecretService(format!("Failed to get default collection: {e}"))
         })?;
 
-        let attributes = [
+        let account_name = scope.account_name();
+        let attributes = std::collections::HashMap::from([
             ("service", scope.service_name()),
-            ("account", &scope.account_name()),
-        ];
+            ("account", account_name.as_str()),
+        ]);
 
         let items = collection
-            .search_items(&attributes)
+            .search_items(attributes)
             .map_err(|e| VaultError::SecretService(format!("Failed to search for key: {e}")))?;
 
         let item = items.into_iter().next().ok_or_else(|| {

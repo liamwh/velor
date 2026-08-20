@@ -45,7 +45,12 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 infer = "0.16"
 # System clipboard access for the streaming TUI's transcript-copy keys.
-arboard = "3"
+# `wayland-data-control` makes it speak the native Wayland clipboard
+# protocol (zwlr_data_control_manager_v1, auto-detected via
+# $WAYLAND_DISPLAY at runtime, falling back to X11 otherwise) instead of
+# only ever going through XWayland, whose X11 selection isn't reliably
+# bridged to native Wayland paste targets on every compositor.
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 # Rules system dependencies
 globset = "0.4"
